@@ -7,42 +7,7 @@ import pickle
 import cv2
 from copy import deepcopy
 
-
-class DatasetInstanceInfo:
-    """
-    Encapsulates hierarchical information about a dataset instance.
-    
-    Attributes:
-        mapping (tuple): (layer_index, mask_id) in layers tensor
-        parent (int or None): Parent instance ID
-        children (list): List of child instance IDs
-        node_level (int): Depth in hierarchy
-    """
-    def __init__(self, mapping=None, parent=None, children=None, node_level=0):
-        self.mapping = mapping
-        self.parent = parent
-        self.children = children if children is not None else []
-        self.node_level = node_level
-
-    def to_dict(self):
-        """Converts the instance info to a dictionary."""
-        return {
-            'mapping': self.mapping,
-            'parent': self.parent,
-            'children': self.children,
-            'node_level': self.node_level
-        }
-
-    @classmethod
-    def from_dict(cls, data):
-        """Creates an instance from a dictionary."""
-        return cls(
-            mapping=data.get('mapping'),
-            parent=data.get('parent'),
-            children=data.get('children', []),
-            node_level=data.get('node_level', 0)
-        )
-
+from datasets.instance_info import InstanceInfo
 
 class LvisDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path, split='train', img_split='train2017', stuff_prob=0.0,
@@ -121,12 +86,12 @@ class LvisDataset(torch.utils.data.Dataset):
         instances_info = {}
         for inst_id, inst_info in deepcopy(sample['hierarchy']).items():
             if inst_info is None:
-                instances_info[inst_id] = DatasetInstanceInfo(
+                instances_info[inst_id] = InstanceInfo(
                     mapping=objs_mapping[inst_id],
                     node_level=0
                 )
             else:
-                instances_info[inst_id] = DatasetInstanceInfo(
+                instances_info[inst_id] = InstanceInfo(
                     mapping=objs_mapping[inst_id],
                     parent=inst_info.get('parent'),
                     children=inst_info.get('children', []),
@@ -137,7 +102,7 @@ class LvisDataset(torch.utils.data.Dataset):
         if self.stuff_prob > 0 and np.random.random() < self.stuff_prob:
             # Keep background objects
             for inst_id in range(sample['num_instance_masks'], len(objs_mapping)):
-                instances_info[inst_id] = DatasetInstanceInfo(
+                instances_info[inst_id] = InstanceInfo(
                     mapping=objs_mapping[inst_id]
                 )
         else:

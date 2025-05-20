@@ -6,6 +6,8 @@ from pathlib import Path
 from PIL import Image
 import os
 import argparse
+import cv2
+from datasets.instance_info import InstanceInfo
 
 class HQSeg44KTrainDataset(torch.utils.data.Dataset):
     def __init__(self, data_root='datasets/sam-hq', transform=None):
@@ -54,6 +56,11 @@ class HQSeg44KTrainDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = self.data_list[idx]
         
+        # 加载图像
+        with Image.open(item['img_path']) as img:
+            img = img.convert('RGB')  # 确保图像为RGB格式
+            img = np.array(img)  # 形状为 (H, W, 3)
+        
         # 加载掩码
         with Image.open(item['mask_path']) as mask:
             mask = np.array(mask)
@@ -61,25 +68,30 @@ class HQSeg44KTrainDataset(torch.utils.data.Dataset):
         # 确保掩码是二值的
         if len(mask.shape) == 3:
             mask = mask[..., 0]
-        mask = (mask > 0).astype(np.float32)
+        mask = (mask > 0).astype(np.float32)  # 形状为 (H, W)
         
-        # 转换为PIL图像
-        mask = Image.fromarray(mask)
+        # 裁剪最大正方形区域（图像和掩码同步裁剪）
+        size = min(img.shape[0], img.shape[1])  # 获取最小边长
+        img = img[:size, :size, :]  # 裁剪图像
+        mask = mask[:size, :size]  # 裁剪掩码
         
-        # 裁剪最大正方形区域
-        size = min(mask.size)
-        mask = transforms.functional.crop(mask, 0, 0, size, size)
+        # 缩放到256x256（图像和掩码同步缩放）
+        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_LINEAR)  # 形状为 (256, 256, 3)
+        mask = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_NEAREST)  # 形状为 (256, 256)
+
+        mask = np.expand_dims(mask, axis=-1)  # 形状为 (256, 256, 1)
         
-        # 缩放到256x256
-        mask = transforms.functional.resize(mask, (256, 256), antialias=True)
-        
-        # 转换为张量
-        mask = transforms.ToTensor()(mask)
-        
-        # 归一化
-        mask = transforms.Normalize(mean=[0.5], std=[0.5])(mask)
-        
-        return mask  # 返回单通道掩码图像，形状为[1, 512, 512]
+        # 包装返回值以匹配 coco_lvis.py 的格式
+        # 视为只有一个实例，实例ID为0
+        instances_info = {
+            0: InstanceInfo(
+                mapping=(0, 1),  # 掩码在第0层，掩码ID为1
+                parent=None,      # 无父实例
+                children=[],      # 无子实例
+                node_level=0      # 实例层级
+            )
+        }
+        return img, mask, instances_info  # 格式: (image, layers, instances_info)
     
 class HQSeg44KTestDataset(torch.utils.data.Dataset):
     def __init__(self, data_root='datasets/sam-hq'):
@@ -141,29 +153,39 @@ class HQSeg44KTestDataset(torch.utils.data.Dataset):
         """
         item = self.data_list[idx]
         
+        # 加载图像
+        with Image.open(item['img_path']) as img:
+            img = img.convert('RGB')  # 确保图像为RGB格式
+            img = np.array(img)  # 形状为 (H, W, 3)
+        
         # 加载掩码
         with Image.open(item['mask_path']) as mask:
             mask = np.array(mask)
         
         # 确保掩码是二值的
-        if len(mask.shape) == 3:
-            mask = mask[..., 0]
-        mask = (mask > 0).astype(np.float32)
+        # if len(mask.shape) == 3:
+        #     mask = mask[..., 0]
+        mask = (mask > 0).astype(np.float32)  # 形状为 (H, W)
         
-        # 转换为PIL图像
-        mask = Image.fromarray(mask)
+        # 裁剪最大正方形区域（图像和掩码同步裁剪）
+        size = min(img.shape[0], img.shape[1])  # 获取最小边长
+        img = img[:size, :size, :]  # 裁剪图像
+        mask = mask[:size, :size]  # 裁剪掩码
         
-        # 裁剪最大正方形区域
-        size = min(mask.size)
-        mask = transforms.functional.crop(mask, 0, 0, size, size)
+        # 缩放到256x256（图像和掩码同步缩放）
+        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_LINEAR)  # 形状为 (256, 256, 3)
+        mask = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_NEAREST)  # 形状为 (256, 256)
+
+        mask = np.expand_dims(mask, axis=-1)  # 形状为 (256, 256, 1)
         
-        # 缩放到256x256
-        mask = transforms.functional.resize(mask, (256, 256), antialias=True)
-        
-        # 转换为张量
-        mask = transforms.ToTensor()(mask)
-        
-        # 归一化
-        mask = transforms.Normalize(mean=[0.5], std=[0.5])(mask)
-        
-        return mask  # 返回单通道掩码图像，形状为 [1, 256, 256]
+        # 包装返回值以匹配 coco_lvis.py 的格式
+        # 视为只有一个实例，实例ID为0
+        instances_info = {
+            0: InstanceInfo(
+                mapping=(0, 1),  # 掩码在第0层，掩码ID为1
+                parent=None,      # 无父实例
+                children=[],      # 无子实例
+                node_level=0      # 实例层级
+            )
+        }
+        return img, mask, instances_info  # 格式: (image, layers, instances_info)

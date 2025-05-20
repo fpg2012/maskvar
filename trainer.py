@@ -1,201 +1,235 @@
-import time
-from typing import List, Optional, Tuple, Union
-
+from typing import List, Tuple
 import torch
-import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import cv2
 
-import dist
-from models import VAR, VQVAE, VectorQuantizer2
-from utils.amp_sc import AmpOptimizer
-from utils.misc import MetricLogger, TensorboardLogger
+from models.maskseg import MaskSeg
 
-Ten = torch.Tensor
-FTen = torch.Tensor
-ITen = torch.LongTensor
-BTen = torch.BoolTensor
+class Clicker:
 
+    def __init__(self, num_random_clicks: int = 2):
+        self.click_list: List[Tuple[int, int, int]] = []
+        # gt_mask: (H, W)
+        self.gt_mask = None
+        self.not_ignore_mask = None # ignore pixels that are -1
+        self.not_clicked_map = None # mask out clicked pixels
+        self.num_random_clicks = num_random_clicks
 
-class VARTrainer(object):
-    def __init__(
-        self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
-        vae_local: VQVAE, var_wo_ddp: VAR, var: DDP,
-        var_opt: AmpOptimizer, label_smooth: float,
-    ):
-        super(VARTrainer, self).__init__()
-        
-        self.var, self.vae_local, self.quantize_local = var, vae_local, vae_local.quantize
-        self.quantize_local: VectorQuantizer2
-        self.var_wo_ddp: VAR = var_wo_ddp  # after torch.compile
-        self.var_opt = var_opt
-        
-        del self.var_wo_ddp.rng
-        self.var_wo_ddp.rng = torch.Generator(device=device)
-        
-        self.label_smooth = label_smooth
-        self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')
-        self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')
-        self.L = sum(pn * pn for pn in patch_nums)
-        self.last_l = patch_nums[-1] * patch_nums[-1]
-        self.loss_weight = torch.ones(1, self.L, device=device) / self.L
-        
-        self.patch_nums, self.resos = patch_nums, resos
-        self.begin_ends = []
-        cur = 0
-        for i, pn in enumerate(patch_nums):
-            self.begin_ends.append((cur, cur + pn * pn))
-            cur += pn*pn
-        
-        self.prog_it = 0
-        self.last_prog_si = -1
-        self.first_prog = True
-    
-    @torch.no_grad()
-    def eval_ep(self, ld_val: DataLoader):
-        tot = 0
-        L_mean, L_tail, acc_mean, acc_tail = 0, 0, 0, 0
-        stt = time.time()
-        training = self.var_wo_ddp.training
-        self.var_wo_ddp.eval()
-        for inp_B3HW, label_B in ld_val:
-            B, V = label_B.shape[0], self.vae_local.vocab_size
-            inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
-            label_B = label_B.to(dist.get_device(), non_blocking=True)
+    def init_clicks(self) -> List[Tuple[int, int, int]]:
+        """
+        random sample some clickes predict initial clicks
+        """
+        for _ in range(self.num_random_clicks):
+            # Erode the mask to get points away from edges
+            kernel = np.ones((3, 3), np.uint8)
+            eroded_mask = cv2.erode(self.gt_mask.astype(np.uint8), kernel, iterations=1)
             
-            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
-            gt_BL = torch.cat(gt_idx_Bl, dim=1)
-            x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+            # pad eroded_mask with 1 pixel
+            eroded_mask = np.pad(eroded_mask, ((1, 1), (1, 1)), mode='constant', constant_values=0)
+
+            # Compute distance transform - points closer to center have higher values
+            dt = cv2.distanceTransform(eroded_mask, cv2.DIST_L2, 3)
+
+            # unpad dt
+            dt = dt[1:-1, 1:-1]
+
+            # Sample a point based on the probability map
+            flat_probs = ((dt*self.not_clicked_map)**2).flatten()
+            flat_probs = flat_probs / flat_probs.sum()  # Normalize to probabilities
+            idx = np.random.choice(len(flat_probs), p=flat_probs)
+            y, x = np.unravel_index(idx, dt.shape)
             
-            self.var_wo_ddp.forward
-            logits_BLV = self.var_wo_ddp(label_B, x_BLCv_wo_first_l)
-            L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
-            L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
-            acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
-            acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL[:, -self.last_l:]).sum() * (100 / self.last_l)
-            tot += B
-        self.var_wo_ddp.train(training)
-        
-        stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), tot])
-        dist.allreduce(stats)
-        tot = round(stats[-1].item())
-        stats /= tot
-        L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
-        return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
+            # Add random click (1 for positive since sampling from gt_mask)
+            self.click_list.append((y, x, 1))
+            self.not_clicked_map[y, x] = False
+
+        return self.click_list, eroded_mask, dt
     
-    def train_step(
-        self, it: int, g_it: int, stepping: bool, metric_lg: MetricLogger, tb_lg: TensorboardLogger,
-        inp_B3HW: FTen, label_B: Union[ITen, FTen], prog_si: int, prog_wp_it: float,
-    ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
-        # if progressive training
-        self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = prog_si
-        if self.last_prog_si != prog_si:
-            if self.last_prog_si != -1: self.first_prog = False
-            self.last_prog_si = prog_si
-            self.prog_it = 0
-        self.prog_it += 1
-        prog_wp = max(min(self.prog_it / prog_wp_it, 1), 0.01)
-        if self.first_prog: prog_wp = 1    # no prog warmup at first prog stage, as it's already solved in wp
-        if prog_si == len(self.patch_nums) - 1: prog_si = -1    # max prog, as if no prog
+    def set_gt_mask(self, gt_mask):
+        """
+        gt_mask: (H, W)
+        """
+        assert gt_mask.ndim == 2
+        self.gt_mask = gt_mask == 1
+        self.not_ignore_mask = gt_mask != -1
+        self.not_clicked_map = np.ones_like(self.gt_mask, dtype=bool)
+
+    def predict_next_click(self, pred_mask) -> Tuple[int, int, int]:
+        """
+        predict next click and update click list
+
+        pred_mask: (H, W)
         
-        # forward
-        B, V = label_B.shape[0], self.vae_local.vocab_size
-        self.var.require_backward_grad_sync = stepping
+        Returns:
+            Tuple[int, int, int]: (y, x, is_positive) coordinates of next click
+        """
+        if self.gt_mask is None:
+            raise ValueError("Ground truth mask not set. Call set_gt_mask first.")
         
-        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
-        gt_BL = torch.cat(gt_idx_Bl, dim=1)
-        x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+        assert pred_mask.ndim == 2
         
-        with self.var_opt.amp_ctx:
-            self.var_wo_ddp.forward
-            logits_BLV = self.var(label_B, x_BLCv_wo_first_l)
-            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
-            if prog_si >= 0:    # in progressive training
-                bg, ed = self.begin_ends[prog_si]
-                assert logits_BLV.shape[1] == gt_BL.shape[1] == ed
-                lw = self.loss_weight[:, :ed].clone()
-                lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
-            else:               # not in progressive training
-                lw = self.loss_weight
-            loss = loss.mul(lw).sum(dim=-1).mean()
+        # Calculate false negative mask (ground truth is 1 but prediction is 0)
+        fn_mask = np.logical_and(np.logical_and(self.gt_mask, np.logical_not(pred_mask)), self.not_ignore_mask)
+        # Calculate false positive mask (ground truth is 0 but prediction is 1)
+        fp_mask = np.logical_and(np.logical_and(np.logical_not(self.gt_mask), pred_mask), self.not_ignore_mask)
+
+        # pad fn_mask and fp_mask with 1 pixel
+        fn_mask = np.pad(fn_mask, ((1, 1), (1, 1)), mode='constant', constant_values=0)
+        fp_mask = np.pad(fp_mask, ((1, 1), (1, 1)), mode='constant', constant_values=0)
+
+        # Compute distance transforms to find farthest points from boundaries
+        fn_mask_dt = cv2.distanceTransform(fn_mask.astype(np.uint8), cv2.DIST_L2, 0)
+        fp_mask_dt = cv2.distanceTransform(fp_mask.astype(np.uint8), cv2.DIST_L2, 0)
+
+        # unpad fn_mask_dt and fp_mask_dt
+        fn_mask_dt = fn_mask_dt[1:-1, 1:-1]
+        fp_mask_dt = fp_mask_dt[1:-1, 1:-1]
+
+        # Mask out already clicked points
+        fn_mask_dt = fn_mask_dt * self.not_clicked_map
+        fp_mask_dt = fp_mask_dt * self.not_clicked_map
+
+        # Find maximum distances in each mask
+        fn_max_dist = np.max(fn_mask_dt)
+        fp_max_dist = np.max(fp_mask_dt)
+
+        # Determine if next click should be positive (add) or negative (remove)
+        is_positive = fn_max_dist > fp_max_dist
         
-        # backward
-        grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping)
+        # Get coordinates of point with maximum distance
+        if is_positive:
+            coords_y, coords_x = np.where(fn_mask_dt == fn_max_dist)
+        else:
+            coords_y, coords_x = np.where(fp_mask_dt == fp_max_dist)
+
+        # Store click and update state
+        click = (coords_y[0], coords_x[0], 1 if is_positive else 0)
+        self.click_list.append(click)
+        self.not_clicked_map[coords_y[0], coords_x[0]] = False
         
-        # log
-        pred_BL = logits_BLV.data.argmax(dim=-1)
-        if it == 0 or it in metric_lg.log_iters:
-            Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)).item()
-            acc_mean = (pred_BL == gt_BL).float().mean().item() * 100
-            if prog_si >= 0:    # in progressive training
-                Ltail = acc_tail = -1
-            else:               # not in progressive training
-                Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)).item()
-                acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
-            grad_norm = grad_norm.item()
-            metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm)
-        
-        # log to tensorboard
-        if g_it == 0 or (g_it + 1) % 500 == 0:
-            prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()
-            dist.allreduce(prob_per_class_is_chosen)
-            prob_per_class_is_chosen /= prob_per_class_is_chosen.sum()
-            cluster_usage = (prob_per_class_is_chosen > 0.001 / V).float().mean().item() * 100
-            if dist.is_master():
-                if g_it == 0:
-                    tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-10000)
-                    tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-1000)
-                kw = dict(z_voc_usage=cluster_usage)
-                for si, (bg, ed) in enumerate(self.begin_ends):
-                    if 0 <= prog_si < si: break
-                    pred, tar = logits_BLV.data[:, bg:ed].reshape(-1, V), gt_BL[:, bg:ed].reshape(-1)
-                    acc = (pred.argmax(dim=-1) == tar).float().mean().item() * 100
-                    ce = self.val_loss(pred, tar).item()
-                    kw[f'acc_{self.resos[si]}'] = acc
-                    kw[f'L_{self.resos[si]}'] = ce
-                tb_lg.update(head='AR_iter_loss', **kw, step=g_it)
-                tb_lg.update(head='AR_iter_schedule', prog_a_reso=self.resos[prog_si], prog_si=prog_si, prog_wp=prog_wp, step=g_it)
-        
-        self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
-        return grad_norm, scale_log2
+        return click
     
-    def get_config(self):
-        return {
-            'patch_nums':   self.patch_nums, 'resos': self.resos,
-            'label_smooth': self.label_smooth,
-            'prog_it':      self.prog_it, 'last_prog_si': self.last_prog_si, 'first_prog': self.first_prog,
-        }
+    def to_sam_format(self, pad_size: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        coords = torch.tensor([(click[1], click[0]) for click in self.click_list])
+        # label: 1 for positive, 0 for negative, -1 for padding
+        label = torch.tensor([click[2] for click in self.click_list])
+        L_clicks = len(self.click_list)
+        if pad_size > 0 and pad_size > L_clicks:
+            coords = torch.cat([coords, torch.zeros(pad_size - L_clicks, 2)], dim=0)
+            label = torch.cat([label, torch.zeros(pad_size - L_clicks, dtype=torch.long) - 1], dim=0)
+        return coords, label
+
+class MaskSegTrainer:
     
-    def state_dict(self):
-        state = {'config': self.get_config()}
-        for k in ('var_wo_ddp', 'vae_local', 'var_opt'):
-            m = getattr(self, k)
-            if m is not None:
-                if hasattr(m, '_orig_mod'):
-                    m = m._orig_mod
-                state[k] = m.state_dict()
-        return state
-    
-    def load_state_dict(self, state, strict=True, skip_vae=False):
-        for k in ('var_wo_ddp', 'vae_local', 'var_opt'):
-            if skip_vae and 'vae' in k: continue
-            m = getattr(self, k)
-            if m is not None:
-                if hasattr(m, '_orig_mod'):
-                    m = m._orig_mod
-                ret = m.load_state_dict(state[k], strict=strict)
-                if ret is not None:
-                    missing, unexpected = ret
-                    print(f'[VARTrainer.load_state_dict] {k} missing:  {missing}')
-                    print(f'[VARTrainer.load_state_dict] {k} unexpected:  {unexpected}')
+    def __init__(self, maskseg: MaskSeg, optimizer: optim.Optimizer, device: str):
+        self.maskseg = maskseg
+        self.optimizer = optimizer
+        self.gen_tokens = [1, 4, 16, 64, 256, 1024]
+        self.max_num_clicks = 10
+        self.num_init_clicks = 2
+        self.max_num_iter_clicks = self.max_num_clicks - self.num_init_clicks
         
-        config: dict = state.pop('config', None)
-        self.prog_it = config.get('prog_it', 0)
-        self.last_prog_si = config.get('last_prog_si', -1)
-        self.first_prog = config.get('first_prog', True)
-        if config is not None:
-            for k, v in self.get_config().items():
-                if config.get(k, None) != v:
-                    err = f'[VAR.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k, None)})'
-                    if strict: raise AttributeError(err)
-                    else: print(err)
+        self.sequence_size = (256 // 8, 256 // 8)
+        self.dim = maskseg.maskgit.dim
+        self.device = device
+
+        self.pixel_mean = torch.tensor([123.675, 116.28, 103.53]).to(device) # copied from sam
+        self.pixel_std = torch.tensor([58.395, 57.12, 57.375]).to(device) # copied from sam
+        self.maskseg.to(device)
+    
+    def sample_from_logits(self, logits: torch.Tensor, num_samples: int = 1) -> torch.Tensor:
+        """
+        sample from logits
+
+        logits: (B, L)
+        """
+        return torch.multinomial(F.softmax(logits, dim=-1), num_samples=num_samples, replacement=True)
+
+    def preprocess_input(self, image: torch.Tensor, gt_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        preprocess image and gt_mask
+
+        image: (B, H, W, 3) H=W=1024
+        gt_mask: (B, H, W) H=W=256
+
+        returns:
+            image: (B, 3, H, W) normalized image
+            gt_mask_normalized: (B, H, W) -1 ~ 1 mask
+        """
+        image = (image - self.pixel_mean) / self.pixel_std
+        image = image.permute(0, 3, 1, 2) # (B, 3, H, W)
+
+        gt_mask_normalized = gt_mask * 2 - 1
+        return image, gt_mask_normalized
+
+    def forward_pass(self, image, gt_mask_normalized):
+        """
+        second stage non-interactive training
+
+        image: (B, 3, H, W) H=W=1024
+        gt_mask_normalized: (B, 1, H, W) -1 ~ 1 mask
+        """
+        full_size_image = image
+        image = F.interpolate(image, size=(256, 256), mode='bilinear', align_corners=False)
+
+        B, _, H, W = gt_mask_normalized.shape
+        L = 1024
+        C = self.dim
+        N_iter = len(self.gen_tokens) # num of iterations for generating
+
+        clickers = [Clicker(num_random_clicks=self.num_init_clicks) for _ in range(B)]
+        for i, clicker in enumerate(clickers):
+            clicker.set_gt_mask(gt_mask_normalized[i, 0].cpu().numpy())
+            clicks = clicker.init_clicks()
+
+        image_embed = self.maskseg.image_encoder(full_size_image) # (B, H, W, C) h_embed*w_embed = L
+
+        gt_idx = self.maskseg.maskgit.vqvae.img_to_idxBl(gt_mask_normalized.float())[-1] # (B, L)
+
+        blank_tokens = torch.zeros_like(gt_idx) + self.maskseg.maskgit.vocab_size # (B, L)
+        
+        # shuffle positions
+        positions = torch.randperm(L) # (L,)
+
+        masks = torch.zeros_like(gt_idx) # (B, L)
+        masks = masks.view(B, 1, L).repeat(1, N_iter, 1) # (B, N_iter, L)
+
+        for i, num_tokens in enumerate(self.gen_tokens):
+            masks[:, i, positions[:num_tokens]] = 1
+
+        x = torch.where(masks == 1, gt_idx, blank_tokens) # (B, N_iter, L)
+        x_pos = torch.arange(L).to(self.device).unsqueeze(0).unsqueeze(0).repeat(B, N_iter, 1) # (B, N_iter, L)
+
+        dense_pe = self.maskseg.prompt_encoder.get_dense_pe() # (1, C_enc, H, W)
+        dense_pe = dense_pe.permute(0, 2, 3, 1) # (1, H, W, C_enc)
+        # dense_pe_transformed = self.maskseg.prompt_enc_adapter(dense_pe) # (1, H, W, C)
+
+        image_embed = image_embed + dense_pe
+
+        click_sam_format = [clicker.to_sam_format(pad_size=2) for clicker in clickers]
+        click_pos_sam_format = torch.stack([click_tuple[0] for click_tuple in click_sam_format], dim=0) # (B * num_iter_clicks, 2)
+        click_label_sam_format = torch.stack([click_tuple[1] for click_tuple in click_sam_format], dim=0) # (B * num_iter_clicks,)
+
+        prompt_embed, _ = self.maskseg.prompt_encoder(
+            points=(click_pos_sam_format.to(self.device), click_label_sam_format.to(self.device)),
+            boxes=None,
+            masks=None
+        ) # (B, L_click, C)
+
+        prompt_embed = prompt_embed.view(B, 1, -1, C).repeat(1, N_iter, 1, 1) # (B, N_iter, L_click, C)
+        prompt_embed = prompt_embed.view(B * N_iter, -1, C) # (B*N_iter, L_click, C)
+
+        image_embed = image_embed.view(B, -1, C)
+        image_embed = image_embed.unsqueeze(1).expand(-1, N_iter, -1, -1) # (B, N_iter, L, C)
+        image_embed = image_embed.view(B * N_iter, -1, C) # (B*N_iter, L, C)
+
+        logits = self.maskseg.maskgit(x.view(-1, L), x_pos.view(-1, L), image_embed, prompt_embed, dense_pe.view(1, L, C)) # (B*N_iter, L, vocal_size)
+        
+        gt_idx_for_loss = gt_idx.unsqueeze(1).expand(-1, N_iter, -1).reshape(B*N_iter*L) # (B*N_iter*L,)
+        logits_for_loss = logits.reshape(B*N_iter*L, -1) # (B*N_iter*L, vocal_size)
+
+        loss = F.cross_entropy(logits_for_loss, gt_idx_for_loss)
+
+        return loss, logits

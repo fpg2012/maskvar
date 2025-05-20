@@ -1,7 +1,7 @@
 from hqseg44k import HQSeg44KTestDataset
 from models.vqvae_single import VQVAE_Single
 import torch
-from myutils import calc_iou
+from utils.metrics import calc_iou
 from tqdm import tqdm
 import numpy as np
 from torch.utils.data import DataLoader
