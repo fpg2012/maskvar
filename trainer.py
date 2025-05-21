@@ -6,6 +6,7 @@ from utils.clicker import Clicker
 from torch.utils.data import IterableDataset, Dataset, DataLoader
 from datasets.coco_lvis import LvisDataset
 from datasets.hqseg44k import HQSeg44KTrainDataset
+from tqdm import tqdm
 import numpy as np
 import time
 from models.maskseg import MaskSeg
@@ -39,10 +40,10 @@ class MaskLevelDataset(IterableDataset):
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         for i in range(len(self.dataset)):
             image, mask, instance_info = self.dataset[i]
-            image, image_embed = self.preprocess_image(image)
+            image, image_embed_sam = self.preprocess_image(image)
             for instance_idx in instance_info.keys():
-                single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
-                yield image, image_embed, single_mask
+                single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
+                yield image, image_embed_sam, single_mask_normalized, single_mask
 
     def preprocess_image(self, image):
         """
@@ -67,9 +68,11 @@ class MaskLevelDataset(IterableDataset):
 
         # print(f'image shape: {image.shape}')
 
-        image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
+        # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
+        with torch.no_grad():
+            image_embed_sam = self.image_encoder.sam_encoder(image.unsqueeze(0)).squeeze(0)
 
-        return image, image_embed
+        return image, image_embed_sam
 
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):
         mask = gt_mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
@@ -87,20 +90,22 @@ class MaskLevelDataset(IterableDataset):
         mask = F.pad(mask, (0, padw, 0, padh), value=0)
 
         # normalize mask
-        mask = mask * 2 - 1
+        mask_normalized = mask * 2 - 1
 
-        return mask
+        return mask_normalized, mask
 
 class MaskSegTrainer:
     
     def __init__(self, maskseg: MaskSeg, optimizer: optim.Optimizer, device: str,
-                  batch_size: int = 2, epoch: int = 1):
+                  batch_size: int = 2, num_epoch: int = 1):
         self.maskseg = maskseg
         self.optimizer = optimizer
         self.gen_tokens = [1, 4, 16, 64, 256, 1024]
         self.max_num_clicks = 10
         self.num_init_clicks = 2
         self.max_num_iter_clicks = self.max_num_clicks - self.num_init_clicks
+        self.num_epoch = num_epoch
+        self.batch_size = batch_size
         
         self.sequence_size = (256 // 8, 256 // 8)
         self.dim = maskseg.maskgit.dim
@@ -124,30 +129,37 @@ class MaskSegTrainer:
 
         dataset: MaskLevelDataset
         """
-        for i in range(self.epoch):
+        for i in range(self.num_epoch):
             epoch_start_time = time.time()
-            print(f'Epoch {i+1} / {self.epoch}')
+            print(f'Epoch {i+1} / {self.num_epoch}')
 
-            dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+            dataloader = DataLoader(dataset, batch_size=self.batch_size)
             losses = []
-            for image, image_embed, gt_mask in dataloader:
-                loss, logits = self.forward_pass(image_embed, gt_mask)
+            progress_bar = tqdm(dataloader, desc=f'Loss: {0:.4f}')
+            for image, image_embed, gt_mask_normalized, gt_mask in progress_bar:
+                loss, logits = self.forward_pass(image_embed, gt_mask_normalized, gt_mask)
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
                 losses.append(loss.item())
+                progress_bar.set_description(f'Loss: {loss.item():.4f}')
             
             avg_loss = np.mean(losses)
             epoch_time_elapsed = time.time() - epoch_start_time
             print(f'Average loss: {avg_loss:.4f}, Time elapsed: {epoch_time_elapsed:.2f}s')
 
-    def forward_pass(self, image_embed, gt_mask_normalized):
+            # save checkpoint
+            torch.save(self.maskseg.state_dict(), f'ckpt/maskseg_epoch_{i+1}.pth')
+
+    def forward_pass(self, image_embed_sam, gt_mask_normalized, gt_mask):
         """
         second stage non-interactive training
 
-        image: (B, 3, H, W) H=W=1024
+        image_embed_sam: (B, C_enc, H, W)
         gt_mask_normalized: (B, 1, H, W) -1 ~ 1 mask
         """
+        image_embed = self.maskseg.image_encoder.adapt_conv(image_embed_sam).permute(0, 2, 3, 1) # (B, H/2, W/2, C)
+
         B, _, H, W = gt_mask_normalized.shape
         L = 1024
         C = self.dim
@@ -155,7 +167,7 @@ class MaskSegTrainer:
 
         clickers = [Clicker(num_random_clicks=self.num_init_clicks) for _ in range(B)]
         for i, clicker in enumerate(clickers):
-            clicker.set_gt_mask(gt_mask_normalized[i, 0].cpu().numpy())
+            clicker.set_gt_mask(gt_mask[i, 0].cpu().numpy())
             clicks = clicker.init_clicks()
 
         gt_idx = self.maskseg.maskgit.vqvae.img_to_idxBl(gt_mask_normalized.float())[-1] # (B, L)

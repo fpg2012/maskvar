@@ -17,31 +17,34 @@ class Clicker:
         """
         random sample some clickes predict initial clicks
         """
-        for _ in range(self.num_random_clicks):
-            # Erode the mask to get points away from edges
-            kernel = np.ones((3, 3), np.uint8)
-            eroded_mask = cv2.erode(self.gt_mask.astype(np.uint8), kernel, iterations=1)
-            
-            # pad eroded_mask with 1 pixel
-            eroded_mask = np.pad(eroded_mask, ((1, 1), (1, 1)), mode='constant', constant_values=0)
+        try:
+            for _ in range(self.num_random_clicks):
+                # Erode the mask to get points away from edges
+                # kernel = np.ones((3, 3), np.uint8)
+                # eroded_mask = cv2.erode(self.gt_mask.astype(np.uint8), kernel, iterations=1)
+                eroded_mask = self.gt_mask.astype(np.uint8)
+                # pad eroded_mask with 1 pixel
+                eroded_mask = np.pad(eroded_mask, ((1, 1), (1, 1)), mode='constant', constant_values=0)
 
-            # Compute distance transform - points closer to center have higher values
-            dt = cv2.distanceTransform(eroded_mask, cv2.DIST_L2, 3)
+                # Compute distance transform - points closer to center have higher values
+                dt = cv2.distanceTransform(eroded_mask, cv2.DIST_L2, 3)
 
-            # unpad dt
-            dt = dt[1:-1, 1:-1]
+                # unpad dt
+                dt = dt[1:-1, 1:-1]
 
-            # Sample a point based on the probability map
-            flat_probs = ((dt*self.not_clicked_map)**2).flatten()
-            flat_probs = flat_probs / flat_probs.sum()  # Normalize to probabilities
-            idx = np.random.choice(len(flat_probs), p=flat_probs)
-            y, x = np.unravel_index(idx, dt.shape)
-            
-            # Add random click (1 for positive since sampling from gt_mask)
-            self.click_list.append((y, x, 1))
-            self.not_clicked_map[y, x] = False
-
-        return self.click_list, eroded_mask, dt
+                # Sample a point based on the probability map
+                flat_probs = ((dt*self.not_clicked_map)**2).flatten()
+                flat_probs = flat_probs / flat_probs.sum()  # Normalize to probabilities
+                idx = np.random.choice(len(flat_probs), p=flat_probs)
+                y, x = np.unravel_index(idx, dt.shape)
+                
+                # Add random click (1 for positive since sampling from gt_mask)
+                self.click_list.append((y, x, 1))
+                self.not_clicked_map[y, x] = False
+        except Exception as e:
+            print(f"Error in init_clicks: {e}")
+        finally:
+            return self.click_list, eroded_mask, dt
     
     def set_gt_mask(self, gt_mask):
         """
