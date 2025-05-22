@@ -123,7 +123,8 @@ class VectorQuantizer2(nn.Module):
                 # 计算损失
                 idx_Bhw = idx_N.view(B, pn, pn)
                 h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
-                h_BChw = self.quant_resi[si/(SN-1)](h_BChw)  # 应用残差连接
+                if SN - 1 > 0:
+                    h_BChw = self.quant_resi[si/(SN-1)](h_BChw)  # 应用残差连接
                 f_hat = f_hat + h_BChw  # 累加量化后的特征
                 f_rest -= h_BChw  # 更新剩余特征
                 
@@ -170,7 +171,8 @@ class VectorQuantizer2(nn.Module):
                 h_BChw = ms_h_BChw[si]
                 if si < len(self.v_patch_nums) - 1:
                     h_BChw = F.interpolate(h_BChw, size=(H, W), mode='bicubic')
-                h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
+                if SN - 1 > 0:
+                    h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
                 f_hat.add_(h_BChw)
                 if last_one: ls_f_hat_BChw = f_hat
                 else: ls_f_hat_BChw.append(f_hat.clone())
@@ -179,8 +181,9 @@ class VectorQuantizer2(nn.Module):
             f_hat = ms_h_BChw[0].new_zeros(B, self.Cvae, self.v_patch_nums[0], self.v_patch_nums[0], dtype=torch.float32)
             for si, pn in enumerate(self.v_patch_nums): # 从小尺度到大尺度
                 f_hat = F.interpolate(f_hat, size=(pn, pn), mode='bicubic')
-                h_BChw = self.quant_resi[si/(SN-1)](ms_h_BChw[si])
-                f_hat.add_(h_BChw)
+                if SN - 1 > 0:
+                    h_BChw = self.quant_resi[si/(SN-1)](ms_h_BChw[si])
+                    f_hat.add_(h_BChw)
                 if last_one: ls_f_hat_BChw = f_hat
                 else: ls_f_hat_BChw.append(f_hat)
         
@@ -222,7 +225,8 @@ class VectorQuantizer2(nn.Module):
             
             idx_Bhw = idx_N.view(B, ph, pw)
             h_BChw = F.interpolate(self.embedding(idx_Bhw).permute(0, 3, 1, 2), size=(H, W), mode='bicubic').contiguous() if (si != SN-1) else self.embedding(idx_Bhw).permute(0, 3, 1, 2).contiguous()
-            h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
+            if SN - 1 > 0:
+                h_BChw = self.quant_resi[si/(SN-1)](h_BChw)
             f_hat.add_(h_BChw)
             f_rest.sub_(h_BChw)
             f_hat_or_idx_Bl.append(f_hat.clone() if to_fhat else idx_N.reshape(B, ph*pw))
@@ -249,7 +253,8 @@ class VectorQuantizer2(nn.Module):
         for si in range(SN-1):
             if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break   # 渐进式训练（目前不支持）
             h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn_next, pn_next), size=(H, W), mode='bicubic')
-            f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
+            if SN - 1 > 0:
+                f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))
             pn_next = self.v_patch_nums[si+1]
             next_scales.append(F.interpolate(f_hat, size=(pn_next, pn_next), mode='area').view(B, C, -1).transpose(1, 2))
         return torch.cat(next_scales, dim=1) if len(next_scales) else None    # 将BlCs连接成BLC，应该是float32类型
@@ -268,12 +273,14 @@ class VectorQuantizer2(nn.Module):
         """
         HW = self.v_patch_nums[-1]
         if si != SN-1:
-            h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=(HW, HW), mode='bicubic'))     # 上采样后应用卷积
-            f_hat.add_(h)
+            if SN - 1 > 0:
+                h = self.quant_resi[si/(SN-1)](F.interpolate(h_BChw, size=(HW, HW), mode='bicubic'))     # 上采样后应用卷积
+                f_hat.add_(h)
             return f_hat, F.interpolate(f_hat, size=(self.v_patch_nums[si+1], self.v_patch_nums[si+1]), mode='area')
         else:
-            h = self.quant_resi[si/(SN-1)](h_BChw)
-            f_hat.add_(h)
+            if SN - 1 > 0:
+                h = self.quant_resi[si/(SN-1)](h_BChw)
+                f_hat.add_(h)
             return f_hat, f_hat
 
 
