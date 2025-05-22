@@ -49,6 +49,44 @@ def build_vqvae_single(vqvae_checkpoint_path: Optional[str] = None, require_grad
 
     return vqvae
 
+def build_sam_image_encoder(sam_checkpoint_path: Optional[str] = None) -> SamImageEncoder:
+    dim = 256
+
+    encoder_embed_dim=768
+    encoder_depth=12
+    encoder_num_heads=12
+    encoder_global_attn_indexes=[2, 5, 8, 11]
+
+    prompt_embed_dim = 256
+    image_size = 1024 # keep the same as the original sam
+    vit_patch_size = 16
+
+    sam_image_encoder=SamImageEncoder(
+        depth=encoder_depth,
+        embed_dim=encoder_embed_dim,
+        img_size=image_size,
+        mlp_ratio=4,
+        norm_layer=partial(torch.nn.LayerNorm, eps=1e-6),
+        num_heads=encoder_num_heads,
+        patch_size=vit_patch_size,
+        qkv_bias=True,
+        use_rel_pos=True,
+        global_attn_indexes=encoder_global_attn_indexes,
+        window_size=14,
+        out_chans=prompt_embed_dim,
+    )
+
+    # load_state_dict
+    if sam_checkpoint_path is not None:
+        sam_state_dict = torch.load(sam_checkpoint_path)
+        image_encoder_state_dict = {}
+        for key, value in sam_state_dict.items():
+            if "image_encoder" in key:
+                image_encoder_state_dict[key.replace("image_encoder.", "")] = value
+        sam_image_encoder.load_state_dict(image_encoder_state_dict)
+
+    return sam_image_encoder
+
 def build_image_encoder(sam_checkpoint_path: Optional[str] = None) -> ImageEncoder:
     dim = 256
 
@@ -117,6 +155,26 @@ def build_prompt_encoder(sam_checkpoint_path: Optional[str] = None) -> PromptEnc
     return prompt_encoder
 
 def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
+    maskgit = MaskGIT(
+        vqvae=vqvae,
+        image_size=256,
+        patch_size=8,
+        dim=256,
+        num_heads=8,
+        num_blocks=8,
+        vocab_size=4096,
+        image_cross_layers=[0, 4],
+        click_cross_layers=[2, 6],
+        freeze_vqvae=True,
+    )
+
+    if maskgit_checkpoint_path is not None:
+        maskgit_state_dict = torch.load(maskgit_checkpoint_path)
+        maskgit.load_state_dict(maskgit_state_dict)
+
+    return maskgit
+
+def build_maskgit_v0(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
     maskgit = MaskGIT(
         vqvae=vqvae,
         image_size=256,

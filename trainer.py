@@ -11,6 +11,8 @@ import numpy as np
 import time
 from models.maskseg import MaskSeg
 from models.image_encoder import ImageEncoder
+from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
+import torch.distributed as dist
 
 def resize_longest_side(image, target_length, mode='bilinear'):
     scale = target_length * 1.0 / max(image.shape[-2], image.shape[-1])
@@ -29,16 +31,26 @@ def resize_longest_side(image, target_length, mode='bilinear'):
 
 class MaskLevelDataset(IterableDataset):
 
-    def __init__(self, dataset: Optional[LvisDataset | HQSeg44KTrainDataset], image_encoder: ImageEncoder, device: str):
+    def __init__(self, dataset: Optional[LvisDataset | HQSeg44KTrainDataset], sam_encoder: SamImageEncoder, device: str):
         self.dataset = dataset
-        self.image_encoder = image_encoder
+        self.sam_encoder = sam_encoder
         self.device = device
 
         self.pixel_mean = torch.tensor([123.675, 116.28, 103.53]).to(device) # copied from sam
         self.pixel_std = torch.tensor([58.395, 57.12, 57.375]).to(device) # copied from sam
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not dist.is_initialized():
+            rank = 0
+            world_size = 1
+        else:
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+
         for i in range(len(self.dataset)):
+            if i % world_size != rank:
+                continue
+
             image, mask, instance_info = self.dataset[i]
             image, image_embed_sam = self.preprocess_image(image)
             for instance_idx in instance_info.keys():
@@ -70,7 +82,7 @@ class MaskLevelDataset(IterableDataset):
 
         # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
         with torch.no_grad():
-            image_embed_sam = self.image_encoder.sam_encoder(image.unsqueeze(0)).squeeze(0)
+            image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0)
 
         return image, image_embed_sam
 
@@ -136,6 +148,7 @@ class MaskSegTrainer:
             dataloader = DataLoader(dataset, batch_size=self.batch_size)
             losses = []
             progress_bar = tqdm(dataloader, desc=f'Loss: {0:.4f}')
+            last_checkpoint_time = time.time()  # Initialize the timer
             for image, image_embed, gt_mask_normalized, gt_mask in progress_bar:
                 loss, logits = self.forward_pass(image_embed, gt_mask_normalized, gt_mask)
                 self.optimizer.zero_grad()
@@ -143,12 +156,18 @@ class MaskSegTrainer:
                 self.optimizer.step()
                 losses.append(loss.item())
                 progress_bar.set_description(f'Loss: {loss.item():.4f}')
+
+                # Check if 8 hours have passed since the last checkpoint
+                current_time = time.time()
+                if current_time - last_checkpoint_time >= 8 * 3600:  # 8 hours in seconds
+                    torch.save(self.maskseg.state_dict(), f'ckpt/maskseg_wallclock_{int(current_time)}.pth')
+                    last_checkpoint_time = current_time  # Reset the timer
             
             avg_loss = np.mean(losses)
             epoch_time_elapsed = time.time() - epoch_start_time
             print(f'Average loss: {avg_loss:.4f}, Time elapsed: {epoch_time_elapsed:.2f}s')
 
-            # save checkpoint
+            # save checkpoint for each epoch
             torch.save(self.maskseg.state_dict(), f'ckpt/maskseg_epoch_{i+1}.pth')
 
     def forward_pass(self, image_embed_sam, gt_mask_normalized, gt_mask):
