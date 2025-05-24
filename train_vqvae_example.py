@@ -3,20 +3,18 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 import torch.distributed as dist
-from torchvision import transforms
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
-import numpy as np
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-from pathlib import Path
-from PIL import Image
 import os
 import argparse
+from torch.cuda.amp import GradScaler
+import numpy as np
 
 from models.vqvae_single import VQVAE_Single
 from datasets.hqseg44k import HQSeg44KTrainDataset
-from utils.loss import NormalizedFocalLoss
+from utils.loss import NormalizedFocalLoss, FocalLoss, NormalizedFocalLoss2
+from build_everything import build_vqvae_single_monoscale_v2
 
 def resize_longest_side(image, target_length, mode='bilinear'):
     scale = target_length * 1.0 / max(image.shape[-2], image.shape[-1])
@@ -75,7 +73,7 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
-def load_checkpoint(model, optimizer, checkpoint_path, device, rank):
+def load_checkpoint(model, optimizer: torch.optim.Adam, checkpoint_path, device, rank):
     """
     加载checkpoint
     
@@ -91,41 +89,54 @@ def load_checkpoint(model, optimizer, checkpoint_path, device, rank):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"找不到checkpoint文件: {checkpoint_path}")
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    map_location = 'cpu'
+
+    dist.barrier()
+
+    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
     
-    # 如果是DDP模型，需要特殊处理
-    if isinstance(model, DDP):
-        model.module.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'])
     
     # 由于没有优化器状态，我们从头开始
-    start_epoch = args.start_epoch
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch']
     
     if rank == 0:
         print(f"成功加载checkpoint，从epoch {start_epoch} 继续训练")
     
     return start_epoch
 
-def train_epoch(model, dataloader, optimizer, device, epoch, rank):
+def train_epoch(model, dataloader, optimizer, device, epoch, rank, use_focal_loss=False):
     model.train()
     
     # total_loss = 0
-    focal_loss = NormalizedFocalLoss(alpha=0.5, gamma=2.0).to(device)
+    if not use_focal_loss:
+        focal_loss = NormalizedFocalLoss(alpha=0.5, gamma=2.0).to(device)
+    else:
+        # focal_loss = FocalLoss(alpha=0.5, gamma=2.0).to(device)
+        focal_loss = NormalizedFocalLoss2(alpha=0.5, gamma=2.0).to(device)
 
     dataloader_iter = tqdm(dataloader) if rank == 0 else dataloader
     
     for batch in dataloader_iter:
         x = batch.to(device)
-        x_recon, _, vq_loss = model(x)
-        recon_loss = focal_loss(x_recon, x)
-        loss = recon_loss + vq_loss
+        # with torch.autocast(device_type='cuda'):
+        x_recon, usage, vq_loss = model(x, ret_usages=True)
+        if use_focal_loss:
+            recons_loss, scale = focal_loss(x_recon, x)
+            loss = scale * (recons_loss + vq_loss)
+        else:
+            recon_loss = focal_loss(x_recon, x)
+            loss = recon_loss + vq_loss
         
         optimizer.zero_grad()
+        # scaler.scale(loss).backward()
         loss.backward()
         optimizer.step()
+        # scaler.step(optimizer)
+        # scaler.update()
         if rank == 0:
-            dataloader_iter.set_description(f'loss: {loss.item():.4f}')
+            dataloader_iter.set_description(f'loss: {loss.item():.3f}={recon_loss.item():.3f}+{vq_loss.item():.3f}, usage: {usage}')
         # total_loss += loss.item()
     
     # dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -143,16 +154,9 @@ def main(rank, world_size, args):
     # DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 模型参数
-    VOCAB_SIZE = 4096  # 码本大小
-    Z_CHANNELS = 32   # 潜在空间通道数
-    BASE_CHANNELS = 128  # 基础通道数
-    BETA = 0.25  # commitment loss权重
-
-    # 数据预处理
-    transform = None  # 我们已经在__getitem__中处理了所有转换
 
     # 创建数据加载器
-    inside_dataset = HQSeg44KTrainDataset(data_root='data/sam-hq', transform=transform)
+    inside_dataset = HQSeg44KTrainDataset(data_root='data/sam-hq')
     dataset = MaskOnlyHQSeg44K(inside_dataset=inside_dataset)
     # sampler = None
     sampler = DistributedSampler(dataset) if world_size > 1 else None
@@ -166,43 +170,48 @@ def main(rank, world_size, args):
         pin_memory=True
     )
 
-    model = VQVAE_Single(
-        vocab_size=VOCAB_SIZE,
-        z_channels=Z_CHANNELS,
-        ch=BASE_CHANNELS,
-        beta=BETA,
-        # v_patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
-        v_patch_nums=[32],
-        test_mode=False,
-        ddconfig=dict(in_channels=1, ch_mult=(1, 1, 2, 4), num_res_blocks=2,   # 通道数乘数，用于构建网络层
-                    using_sa=True, using_mid_sa=True,)
-    ).to(DEVICE)
+    # model = VQVAE_Single(
+    #     vocab_size=VOCAB_SIZE,
+    #     z_channels=Z_CHANNELS,
+    #     ch=BASE_CHANNELS,
+    #     beta=BETA,
+    #     # v_patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
+    #     v_patch_nums=[32],
+    #     test_mode=False,
+    #     ddconfig=dict(in_channels=1, ch_mult=(1, 1, 2, 4), num_res_blocks=2,   # 通道数乘数，用于构建网络层
+    #                 using_sa=True, using_mid_sa=True,)
+    # ).to(DEVICE)
 
-    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
-
+    model = build_vqvae_single_monoscale_v2(require_grad=True)
+    model.to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     # 如果指定了checkpoint，则加载它
-    start_epoch = args.start_epoch
     if args.checkpoint is not None:
-        start_epoch = load_checkpoint(model, optimizer, args.checkpoint, DEVICE)
+        start_epoch = load_checkpoint(model, optimizer, args.checkpoint, DEVICE, rank)
+    elif args.start_epoch is not None:
+        start_epoch = args.start_epoch
+    else:
+        start_epoch = 0
+
+    model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
     # 训练循环
     for epoch in range(start_epoch, NUM_EPOCHS):
         sampler.set_epoch(epoch)
-        train_epoch(model, dataloader, optimizer, DEVICE, epoch, rank)
+        train_epoch(model, dataloader, optimizer, DEVICE, epoch, rank, use_focal_loss=args.focal_loss)
         
         if rank == 0:
             print(f'Epoch {epoch+1}/{NUM_EPOCHS}')
         
-            if (epoch + 1) % 2 == 0:
+            if (epoch + 1) % 1 == 0:
                 # 保存checkpoint
                 checkpoint = {
                     'epoch': epoch + 1,
                     'model_state_dict': model.module.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
-                torch.save(checkpoint, f'vqvae_single_monoscale_epoch_{epoch+1}.pth')
+                torch.save(checkpoint, f'vqvae_single_monoscale_v2_epoch_{epoch+1}.pth')
     
     cleanup()
 
@@ -214,6 +223,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', type=int, default=8, help='总训练epoch数')
     parser.add_argument('--batch_size', type=int, default=8, help='批次大小')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='学习率')
+    parser.add_argument('--focal_loss', action='store_true', help='是否使用FocalLoss，不开启默认使用NormalizedFocalLoss')
     args = parser.parse_args()
 
     world_size = torch.cuda.device_count()

@@ -136,7 +136,8 @@ class VectorQuantizer2(nn.Module):
                     else: self.ema_vocab_hit_SV[si].mul_(0.99).add_(hit_V.mul(0.01))
                     self.record_hit += 1
                 vocab_hit_V.add_(hit_V)
-                mean_vq_loss += F.mse_loss(f_hat.data, f_BChw).mul_(self.beta) + F.mse_loss(f_hat, f_no_grad)
+                # mean_vq_loss += F.mse_loss(f_hat.data, f_BChw).mul_(self.beta) + F.mse_loss(f_hat, f_no_grad)
+                mean_vq_loss += F.mse_loss(f_hat.data, f_BChw).mul_(self.beta)
             
             mean_vq_loss *= 1. / SN
             f_hat = (f_hat.data - f_no_grad).add_(f_BChw)
@@ -144,7 +145,8 @@ class VectorQuantizer2(nn.Module):
         # 计算码本使用率
         world_size = tdist.get_world_size() if dist.initialized() else 1
         margin = world_size * (f_BChw.numel() / f_BChw.shape[1]) / self.vocab_size * 0.08
-        if ret_usages: usages = [(self.ema_vocab_hit_SV[si] >= margin).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]
+        # if ret_usages: usages = [(self.ema_vocab_hit_SV[si] >= margin).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]
+        if ret_usages: usages = [(self.ema_vocab_hit_SV[si]).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]
         else: usages = None
         return f_hat, usages, mean_vq_loss
     # ===================== `forward` 仅用于VAE训练 =====================
