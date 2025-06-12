@@ -13,12 +13,55 @@ from models.vqvae import VQVAE, VectorQuantizer2
 
 
 class SharedAdaLin(nn.Linear):
+    """
+    共享的自适应线性层，用于AdaLN（Adaptive Layer Normalization）的条件投影。
+    将条件嵌入投影到多个head的缩放和偏置参数。
+    
+    输入:
+        cond_BD: 条件嵌入张量，形状为(B, D)，其中B是batch size，D是输入维度
+    
+    输出:
+        重排后的张量，形状为(B, 1, 6, C)，其中：
+        - B: batch size
+        - 1: 用于广播的维度
+        - 6: 对应6个参数（gamma1, beta1, gamma2, beta2, gamma3, beta3）
+            用于控制AdaLN中的缩放(scale)和偏置(shift)参数
+        - C: 每个head的通道数
+    
+    注意:
+        - 继承自nn.Linear，权重形状为(6*C, D)
+        - 输出被重塑为(B, 1, 6, C)，便于后续处理
+        - 主要用于AdaLN中，为不同的归一化层提供自适应的缩放和偏置参数
+    """
     def forward(self, cond_BD):
-        C = self.weight.shape[0] // 6
+        C = self.weight.shape[0] // 6  # 计算每个head的通道数
+        # 线性变换后重塑为(B, 1, 6, C)
+        # 6个参数对应AdaLN中的多个缩放和偏置项
         return super().forward(cond_BD).view(-1, 1, 6, C)   # B16C
 
 
 class VAR(nn.Module):
+    """
+    VAR模型，用于生成图像。
+    
+    参数:
+        vae_local: VQVAE模型，用于编码和解码图像
+        num_classes: 类别数量
+        depth: Transformer的层数
+        embed_dim: Transformer的嵌入维度
+        num_heads: Transformer的注意力头数
+        mlp_ratio: MLP的比率
+        drop_rate: Dropout比率
+        attn_drop_rate: 注意力Dropout比率
+        drop_path_rate: Dropout路径比率
+        norm_eps: 归一化epsilon
+        shared_aln: 是否共享AdaLN
+        cond_drop_rate: 条件Dropout比率
+        attn_l2_norm: 是否对注意力进行L2归一化
+        patch_nums: 每个patch的分辨率列表
+        flash_if_available: 是否使用Flash Attention
+        fused_if_available: 是否使用Fused AddNorm
+    """
     def __init__(
         self, vae_local: VQVAE,
         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
@@ -28,60 +71,84 @@ class VAR(nn.Module):
         flash_if_available=True, fused_if_available=True,
     ):
         super().__init__()
-        # 0. hyperparameters
-        assert embed_dim % num_heads == 0
+        
+        # 0. 验证和初始化基本参数
+        assert embed_dim % num_heads == 0, "Embedding dimension must be divisible by number of heads"
+        # 从VAE模型获取通道数和词汇表大小
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
+        # 模型核心参数
         self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
         
+        # 条件dropout率
         self.cond_drop_rate = cond_drop_rate
+        # 进行式训练阶段索引
         self.prog_si = -1   # progressive training
         
-        self.patch_nums: Tuple[int] = patch_nums
+        # 1. 初始化patch相关参数
+        self.patch_nums: Tuple[int] = patch_nums  # 各阶段的patch大小
+        # 计算总token数（所有阶段patch的平方和）
         self.L = sum(pn ** 2 for pn in self.patch_nums)
+        # 第一阶段的token数
         self.first_l = self.patch_nums[0] ** 2
+        # 计算各阶段token的起始和结束索引
         self.begin_ends = []
         cur = 0
         for i, pn in enumerate(self.patch_nums):
-            self.begin_ends.append((cur, cur+pn ** 2))
+            self.begin_ends.append((cur, cur+pn ** 2))  # (start_index, end_index) for each stage
             cur += pn ** 2
         
+        # 阶段数减1（用于进行式训练）
         self.num_stages_minus_1 = len(self.patch_nums) - 1
+        # 初始化随机数生成器
         self.rng = torch.Generator(device=dist.get_device())
         
-        # 1. input (word) embedding
+        # 2. 初始化输入embedding
+        # 获取VAE的量化器
         quant: VectorQuantizer2 = vae_local.quantize
+        # 初始化VAE代理和量化器代理
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
+        # 初始化词嵌入层，将VAE的token映射到模型的embedding维度
         self.word_embed = nn.Linear(self.Cvae, self.C)
         
-        # 2. class embedding
+        # 2. 类别嵌入
+        # 计算初始化标准差
         init_std = math.sqrt(1 / self.C / 3)
         self.num_classes = num_classes
+        # 初始化均匀概率分布
         self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
+        # 初始化类别嵌入层
         self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
+        # 初始化第一阶段的位置嵌入
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
         
-        # 3. absolute position embedding
+        # 3. 绝对位置嵌入
+        # 为每个阶段生成位置嵌入
         pos_1LC = []
         for i, pn in enumerate(self.patch_nums):
             pe = torch.empty(1, pn*pn, self.C)
             nn.init.trunc_normal_(pe, mean=0, std=init_std)
             pos_1LC.append(pe)
+        # 将所有阶段的位置嵌入拼接在一起
         pos_1LC = torch.cat(pos_1LC, dim=1)     # 1, L, C
         assert tuple(pos_1LC.shape) == (1, self.L, self.C)
         self.pos_1LC = nn.Parameter(pos_1LC)
-        # level embedding (similar to GPT's segment embedding, used to distinguish different levels of token pyramid)
+        # 初始化层级嵌入（类似于GPT的segment embedding，用于区分不同层级的token金字塔）
         self.lvl_embed = nn.Embedding(len(self.patch_nums), self.C)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
         
-        # 4. backbone blocks
+        # 4. 主干网络块
+        # 初始化共享的AdaLN层
         self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False), SharedAdaLin(self.D, 6*self.C)) if shared_aln else nn.Identity()
         
+        # 初始化规范化层
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
+        # 计算stochastic depth的衰减率
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
+        # 初始化Transformer块
         self.blocks = nn.ModuleList([
             AdaLNSelfAttn(
                 cond_dim=self.D, shared_aln=shared_aln,
@@ -93,8 +160,10 @@ class VAR(nn.Module):
             for block_idx in range(depth)
         ])
         
+        # 检查是否使用fused操作
         fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
         self.using_fused_add_norm_fn = any(fused_add_norm_fns)
+        # 打印模型配置信息
         print(
             f'\n[constructor]  ==== flash_if_available={flash_if_available} ({sum(b.attn.using_flash for b in self.blocks)}/{self.depth}), fused_if_available={fused_if_available} (fusing_add_ln={sum(fused_add_norm_fns)}/{self.depth}, fusing_mlp={sum(b.ffn.fused_mlp_func is not None for b in self.blocks)}/{self.depth}) ==== \n'
             f'    [VAR config ] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}\n'
@@ -102,16 +171,18 @@ class VAR(nn.Module):
             end='\n\n', flush=True
         )
         
-        # 5. attention mask used in training (for masking out the future)
-        #    it won't be used in inference, since kv cache is enabled
+        # 5. 注意力掩码（仅在训练时使用）
+        #    推理时不会使用，因为启用了kv缓存
+        # 为每个阶段创建层级索引
         d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
         dT = d.transpose(1, 2)    # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
         self.register_buffer('lvl_1L', lvl_1L)
+        # 创建注意力掩码
         attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
         
-        # 6. classifier head
+        # 6. 分类器头部
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
     
@@ -189,49 +260,94 @@ class VAR(nn.Module):
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
-    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
+    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:
         """
-        :param label_B: label_B
-        :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
-        :return: logits BLV, V is vocab_size
+        前向传播函数，生成logits
+        
+        Args:
+            label_B: 类别标签，形状为(B,)，B是batch size
+            x_BLCv_wo_first_l: 教师强制输入，形状为(B, L-self.first_l, Cvae)，
+                            其中L是总token数，Cvae是VAE的隐变量维度
+                            注意：不包含第一个token的输入
+        
+        Returns:
+            logits_BLV: 输出logits，形状为(B, L, V)，V是词表大小
         """
+        # 获取当前progressive training阶段的token范围
+        # 如果prog_si<0，则使用完整序列(0, self.L)
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
-        B = x_BLCv_wo_first_l.shape[0]
+        B = x_BLCv_wo_first_l.shape[0]  # batch size
+        
+        # 使用FP32精度处理类别嵌入和位置编码
         with torch.cuda.amp.autocast(enabled=False):
-            label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
+            # 标签dropout：以cond_drop_rate概率将标签替换为num_classes（表示无类别）
+            label_B = torch.where(
+                torch.rand(B, device=label_B.device) < self.cond_drop_rate,
+                self.num_classes,  # 使用num_classes表示无类别
+                label_B
+            )
+            
+            # 获取类别嵌入（条件嵌入）
+            # sos/cond_BD: (B, D), 其中D是嵌入维度
             sos = cond_BD = self.class_emb(label_B)
+            
+            # 为序列开始添加位置编码
+            # sos: (B, first_l, D)
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
             
-            if self.prog_si == 0: x_BLC = sos
-            else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
-            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
+            # 构建输入序列
+            if self.prog_si == 0:  # 如果是第一个progressive阶段
+                x_BLC = sos  # 只使用开始标记
+            else:
+                # 将开始标记与输入序列拼接
+                # word_embed将输入映射到与sos相同的嵌入空间
+                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+            
+            # 添加层级嵌入和位置编码
+            # lvl_embed: 不同层级的嵌入
+            # pos_1LC: 位置编码
+            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
         
+        # 注意力掩码（用于自回归生成）
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
+        
+        # 条件投影（用于AdaLN）
+        # cond_BD_or_gss: (B, D)
         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
         
-        # hack: get the dtype if mixed precision is used
+        # 获取混合精度训练中的主数据类型
         temp = x_BLC.new_ones(8, 8)
         main_type = torch.matmul(temp, temp).dtype
         
+        # 确保所有张量使用相同的数据类型
         x_BLC = x_BLC.to(dtype=main_type)
         cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
         
-        AdaLNSelfAttn.forward
+        # 通过多个transformer块
+        AdaLNSelfAttn.forward  # 这行代码看起来是调试用的，实际没有效果
         for i, b in enumerate(self.blocks):
+            # 每个block包含自注意力和前馈网络
+            # 使用AdaLN（自适应层归一化）结合条件信息
             x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        
+        # 获取最终的logits
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
         
+        # 以下代码用于保持计算图完整性，确保梯度正常传播
         if self.prog_si == 0:
             if isinstance(self.word_embed, nn.Linear):
+                # 确保word_embed的梯度被计算
                 x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
             else:
+                # 对于非线性的word_embed，确保其参数梯度被计算
                 s = 0
                 for p in self.word_embed.parameters():
                     if p.requires_grad:
                         s += p.view(-1)[0] * 0
                 x_BLC[0, 0, 0] += s
-        return x_BLC    # logits BLV, V is vocab_size
+        
+        return x_BLC  # (B, L, V)
     
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated

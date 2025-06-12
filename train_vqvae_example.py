@@ -14,7 +14,7 @@ import numpy as np
 from models.vqvae_single import VQVAE_Single
 from datasets.hqseg44k import HQSeg44KTrainDataset
 from utils.loss import NormalizedFocalLoss, FocalLoss, NormalizedFocalLoss2
-from build_everything import build_vqvae_single_monoscale_v2
+from build_everything import build_vqvae_single_monoscale_v2_2, build_vqvae_single_v3
 
 def resize_longest_side(image, target_length, mode='bilinear'):
     scale = target_length * 1.0 / max(image.shape[-2], image.shape[-1])
@@ -89,7 +89,7 @@ def load_checkpoint(model, optimizer: torch.optim.Adam, checkpoint_path, device,
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"找不到checkpoint文件: {checkpoint_path}")
     
-    map_location = 'cpu'
+    map_location = f'cuda:{rank}'
 
     dist.barrier()
 
@@ -136,7 +136,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, rank, use_focal_los
         # scaler.step(optimizer)
         # scaler.update()
         if rank == 0:
-            dataloader_iter.set_description(f'loss: {loss.item():.3f}={recon_loss.item():.3f}+{vq_loss.item():.3f}, usage: {usage}')
+            dataloader_iter.set_description(f'loss: {loss.item():.3f}={recon_loss.item():.3f}+{vq_loss.item():.3f}, usage: {usage[0]:.1f}')
         # total_loss += loss.item()
     
     # dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -182,7 +182,7 @@ def main(rank, world_size, args):
     #                 using_sa=True, using_mid_sa=True,)
     # ).to(DEVICE)
 
-    model = build_vqvae_single_monoscale_v2(require_grad=True)
+    model = build_vqvae_single_v3(require_grad=True)
     model.to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -211,7 +211,7 @@ def main(rank, world_size, args):
                     'model_state_dict': model.module.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                 }
-                torch.save(checkpoint, f'vqvae_single_monoscale_v2_epoch_{epoch+1}.pth')
+                torch.save(checkpoint, f'vqvae_single_v3_epoch_{epoch+1}.pth')
     
     cleanup()
 

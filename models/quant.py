@@ -5,7 +5,7 @@ import torch
 from torch import distributed as tdist, nn as nn
 from torch.nn import functional as F
 
-import dist
+# import dist
 
 
 # this file only provides the VectorQuantizer2 used in VQVAE
@@ -118,7 +118,7 @@ class VectorQuantizer2(nn.Module):
                 # 统计码本使用情况
                 hit_V = idx_N.bincount(minlength=self.vocab_size).float()
                 if self.training:
-                    if dist.initialized(): handler = tdist.all_reduce(hit_V, async_op=True)
+                    if tdist.is_initialized(): handler = tdist.all_reduce(hit_V, async_op=True)
                 
                 # 计算损失
                 idx_Bhw = idx_N.view(B, pn, pn)
@@ -129,7 +129,7 @@ class VectorQuantizer2(nn.Module):
                 f_rest -= h_BChw  # 更新剩余特征
                 
                 # 更新码本使用统计
-                if self.training and dist.initialized():
+                if self.training and tdist.is_initialized():
                     handler.wait()
                     if self.record_hit == 0: self.ema_vocab_hit_SV[si].copy_(hit_V)
                     elif self.record_hit < 100: self.ema_vocab_hit_SV[si].mul_(0.9).add_(hit_V.mul(0.1))
@@ -143,10 +143,10 @@ class VectorQuantizer2(nn.Module):
             f_hat = (f_hat.data - f_no_grad).add_(f_BChw)
         
         # 计算码本使用率
-        world_size = tdist.get_world_size() if dist.initialized() else 1
+        world_size = tdist.get_world_size() if tdist.is_initialized() else 1
         margin = world_size * (f_BChw.numel() / f_BChw.shape[1]) / self.vocab_size * 0.08
-        # if ret_usages: usages = [(self.ema_vocab_hit_SV[si] >= margin).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]
-        if ret_usages: usages = [(self.ema_vocab_hit_SV[si]).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]
+        if ret_usages: usages = [(self.ema_vocab_hit_SV[si] >= margin).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]
+        # if ret_usages: usages = [(self.ema_vocab_hit_SV[si]).float().mean().item() * 100 for si, pn in enumerate(self.v_patch_nums)]
         else: usages = None
         return f_hat, usages, mean_vq_loss
     # ===================== `forward` 仅用于VAE训练 =====================
