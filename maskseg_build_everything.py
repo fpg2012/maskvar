@@ -59,9 +59,11 @@ def build_var_image_encoder() -> VarImageEncoder:
     var_image_encoder = VarImageEncoder(neck_fpn)
     return var_image_encoder
 
-def build_maskvar(maskvar_checkpoint_path: Optional[str] = None, vqvae: VQVAE_Single = None, flash_if_available: bool = False) -> MaskVAR:
+def build_maskvar(maskvar_checkpoint_path: Optional[str] = None, vqvae: VQVAE_Single = None, image_encoder: VarImageEncoder = None, prompt_encoder: PromptEncoder = None, flash_if_available: bool = False) -> MaskVAR:
     maskvar = MaskVAR(
         vae_local=vqvae,
+        image_encoder=image_encoder,
+        prompt_encoder=prompt_encoder,
         num_classes=1,
         depth=4,
         embed_dim=256,

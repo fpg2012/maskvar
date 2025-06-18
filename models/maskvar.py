@@ -2,6 +2,7 @@ import math
 from functools import partial
 from typing import Optional, Tuple, Union, List
 
+from models.prompt_encoder import PromptEncoder
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
@@ -45,7 +46,7 @@ class MaskVAR(nn.Module):
         fused_if_available: 是否使用Fused AddNorm
     """
     def __init__(
-        self, vae_local: VQVAE,
+        self, vae_local: VQVAE, image_encoder: VarImageEncoder, prompt_encoder: PromptEncoder,
         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
         norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
         attn_l2_norm=False,
@@ -53,6 +54,9 @@ class MaskVAR(nn.Module):
         flash_if_available=True, fused_if_available=True,
     ):
         super().__init__()
+
+        self.image_encoder = image_encoder
+        self.prompt_encoder = prompt_encoder
         
         # 0. 验证和初始化基本参数
         assert embed_dim % num_heads == 0, "Embedding dimension must be divisible by number of heads"
@@ -171,6 +175,8 @@ class MaskVAR(nn.Module):
         # 6. 分类器头部
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
+
+        self.pe_grids = [self.prompt_encoder.pe_layer.forward((pn, pn)).permute(1, 2, 0) for pn in self.patch_nums]
     
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
@@ -246,7 +252,12 @@ class MaskVAR(nn.Module):
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
-    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor, image_multiscale_feats, prompt_embedding) -> torch.Tensor:
+    def forward(self, 
+                label_B: torch.LongTensor, 
+                x_BLCv_wo_first_l: torch.Tensor, 
+                sam_image_embedding: torch.Tensor,
+                points_coords, points_labels,
+                ) -> torch.Tensor:
         """
         前向传播函数，生成logits
         
@@ -261,6 +272,13 @@ class MaskVAR(nn.Module):
         Returns:
             logits_BLV: 输出logits，形状为(B, L, V)，V是词表大小
         """
+
+        image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
+        prompt_embedding, _ = self.prompt_encoder(
+            points=(points_coords, points_labels),
+            boxes=None,
+            masks=None,
+        )
 
         # print(f'MaskVAR: x_BLCv_wo_first_l.shape: {x_BLCv_wo_first_l.shape}')
         # print(f'MaskVAR: image_multiscale_feats.shape: {image_multiscale_feats.shape}')
