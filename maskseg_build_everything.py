@@ -5,8 +5,8 @@ from models.maskgit import MaskGIT
 from models.maskseg import MaskSeg
 from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
 from models.prompt_encoder import PromptEncoder
-from models.image_encoder import ImageEncoder
-
+from models.image_encoder import ImageEncoder, VarImageEncoder, NeckFPN
+from models.maskvar import MaskVAR
 from functools import partial
 from typing import Optional
 
@@ -16,7 +16,6 @@ def build_maskseg(vqvae_checkpoint_path: Optional[str] = None, maskgit_checkpoin
 
     prompt_encoder = build_prompt_encoder(sam_checkpoint_path)
     image_encoder = build_image_encoder(sam_checkpoint_path)
-
     maskgit = build_maskgit(vqvae, maskgit_checkpoint_path)
 
     maskseg = MaskSeg(maskgit=maskgit, 
@@ -48,6 +47,41 @@ def build_vqvae_single(vqvae_checkpoint_path: Optional[str] = None, require_grad
         vqvae.load_state_dict(vqvae_state_dict)
 
     return vqvae
+
+def build_var_image_encoder() -> VarImageEncoder:
+    neck_fpn = NeckFPN(
+        embed_dim=256, 
+        in_dim=256, 
+        in_size=(64, 64),
+        real_size=(256, 256),
+        patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32)
+    )
+    var_image_encoder = VarImageEncoder(neck_fpn)
+    return var_image_encoder
+
+def build_maskvar(maskvar_checkpoint_path: Optional[str] = None, vqvae: VQVAE_Single = None, flash_if_available: bool = False) -> MaskVAR:
+    maskvar = MaskVAR(
+        vae_local=vqvae,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=16,
+        mlp_ratio=4.,
+        drop_rate=0.1,
+        attn_drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
+        flash_if_available=flash_if_available,
+        fused_if_available=True,
+    )
+    if maskvar_checkpoint_path is not None:
+        maskvar_state_dict = torch.load(maskvar_checkpoint_path)
+        maskvar.load_state_dict(maskvar_state_dict)
+    return maskvar
 
 def build_vqvae_single_v3(vqvae_checkpoint_path: Optional[str] = None, require_grad = False) -> VQVAE_Single:
     vocab_size = 4096  # 码本大小

@@ -7,40 +7,22 @@ import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
 import dist
-from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
+from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn, CrossAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
+from .var import SharedAdaLin
+from .image_encoder import VarImageEncoder
 
+def create_aligned_attn_bias(L, device="cuda", dtype=torch.float32):
+    # 计算对齐后的长度（向上取整到最近的8的倍数）
+    aligned_L = (L + 7) // 8 * 8
+    # 创建对齐张量并切片
+    attn_bias = torch.zeros((1, 1, aligned_L, aligned_L), dtype=dtype, device=device)
+    attn_bias = attn_bias.contiguous()
+    attn_bias = attn_bias[:, :, :L, :L]  # 切片到实际长度
+    return attn_bias.contiguous()
 
-class SharedAdaLin(nn.Linear):
-    """
-    共享的自适应线性层，用于AdaLN（Adaptive Layer Normalization）的条件投影。
-    将条件嵌入投影到多个head的缩放和偏置参数。
-    
-    输入:
-        cond_BD: 条件嵌入张量，形状为(B, D)，其中B是batch size，D是输入维度
-    
-    输出:
-        重排后的张量，形状为(B, 1, 6, C)，其中：
-        - B: batch size
-        - 1: 用于广播的维度
-        - 6: 对应6个参数（gamma1, beta1, gamma2, beta2, gamma3, beta3）
-            用于控制AdaLN中的缩放(scale)和偏置(shift)参数
-        - C: 每个head的通道数
-    
-    注意:
-        - 继承自nn.Linear，权重形状为(6*C, D)
-        - 输出被重塑为(B, 1, 6, C)，便于后续处理
-        - 主要用于AdaLN中，为不同的归一化层提供自适应的缩放和偏置参数
-    """
-    def forward(self, cond_BD):
-        C = self.weight.shape[0] // 6  # 计算每个head的通道数
-        # 线性变换后重塑为(B, 1, 6, C)
-        # 6个参数对应AdaLN中的多个缩放和偏置项
-        return super().forward(cond_BD).view(-1, 1, 6, C)   # B16C
-
-
-class VAR(nn.Module):
+class MaskVAR(nn.Module):
     """
     VAR模型，用于生成图像。
     
@@ -150,7 +132,7 @@ class VAR(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
         # 初始化Transformer块
         self.blocks = nn.ModuleList([
-            AdaLNSelfAttn(
+            CrossAttn(
                 cond_dim=self.D, shared_aln=shared_aln,
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx], last_drop_p=0 if block_idx == 0 else dpr[block_idx-1],
@@ -174,13 +156,17 @@ class VAR(nn.Module):
         # 5. 注意力掩码（仅在训练时使用）
         #    推理时不会使用，因为启用了kv缓存
         # 为每个阶段创建层级索引
-        d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
+        d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1).to(self.pos_1LC.device)
         dT = d.transpose(1, 2)    # dT: 11L
         lvl_1L = dT[:, 0].contiguous()
         self.register_buffer('lvl_1L', lvl_1L)
         # 创建注意力掩码
         attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
-        self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
+        aligned_L = ((attn_bias_for_masking.size(-1) + 7) // 8) * 8
+        aligned_attn_bias = torch.zeros((1, 1, aligned_L, aligned_L), 
+                                        dtype=attn_bias_for_masking.dtype, device=attn_bias_for_masking.device)
+        aligned_attn_bias[..., :attn_bias_for_masking.size(-2), :attn_bias_for_masking.size(-1)] = attn_bias_for_masking
+        self.register_buffer('attn_bias_for_masking', aligned_attn_bias)
         
         # 6. 分类器头部
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
@@ -260,7 +246,7 @@ class VAR(nn.Module):
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
-    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:
+    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor, image_multiscale_feats, prompt_embedding) -> torch.Tensor:
         """
         前向传播函数，生成logits
         
@@ -269,10 +255,17 @@ class VAR(nn.Module):
             x_BLCv_wo_first_l: 教师强制输入，形状为(B, L-self.first_l, Cvae)，
                             其中L是总token数，Cvae是VAE的隐变量维度
                             注意：不包含第一个token的输入
+            image_multiscale_feats: 多尺度图像特征，形状为(B, Li, C)
+            prompt_embedding: 提示词嵌入，形状为(B, Lp, C)
         
         Returns:
             logits_BLV: 输出logits，形状为(B, L, V)，V是词表大小
         """
+
+        # print(f'MaskVAR: x_BLCv_wo_first_l.shape: {x_BLCv_wo_first_l.shape}')
+        # print(f'MaskVAR: image_multiscale_feats.shape: {image_multiscale_feats.shape}')
+        # print(f'MaskVAR: prompt_embedding.shape: {prompt_embedding.shape}')
+
         # 获取当前progressive training阶段的token范围
         # 如果prog_si<0，则使用完整序列(0, self.L)
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
@@ -307,6 +300,7 @@ class VAR(nn.Module):
             # lvl_embed: 不同层级的嵌入
             # pos_1LC: 位置编码
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
+            image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
         
         # 注意力掩码（用于自回归生成）
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
@@ -321,7 +315,7 @@ class VAR(nn.Module):
         
         # 确保所有张量使用相同的数据类型
         x_BLC = x_BLC.to(dtype=main_type)
-        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
+        # cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
         
         # 通过多个transformer块
@@ -329,7 +323,8 @@ class VAR(nn.Module):
         for i, b in enumerate(self.blocks):
             # 每个block包含自注意力和前馈网络
             # 使用AdaLN（自适应层归一化）结合条件信息
-            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+            # x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+            x_BLC = b(x=x_BLC, cond=image_multiscale_feats, prompt_cond=prompt_embedding, attn_bias=attn_bias)
         
         # 获取最终的logits
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
@@ -403,26 +398,3 @@ class VAR(nn.Module):
     
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
-
-
-class VARHF(VAR, PyTorchModelHubMixin):
-            # repo_url="https://github.com/FoundationVision/VAR",
-            # tags=["image-generation"]):
-    def __init__(
-        self,
-        vae_kwargs,
-        num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-        norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
-        attn_l2_norm=False,
-        patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
-        flash_if_available=True, fused_if_available=True,
-    ):
-        vae_local = VQVAE(**vae_kwargs)
-        super().__init__(
-            vae_local=vae_local,
-            num_classes=num_classes, depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate,
-            norm_eps=norm_eps, shared_aln=shared_aln, cond_drop_rate=cond_drop_rate,
-            attn_l2_norm=attn_l2_norm,
-            patch_nums=patch_nums,
-            flash_if_available=flash_if_available, fused_if_available=fused_if_available,
-        )
