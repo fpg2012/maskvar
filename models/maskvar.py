@@ -52,11 +52,19 @@ class MaskVAR(nn.Module):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
+        image_encoder_requires_grad=False,
+        prompt_encoder_requires_grad=False,
     ):
         super().__init__()
 
         self.image_encoder = image_encoder
         self.prompt_encoder = prompt_encoder
+
+        # 设置image_encoder和prompt_encoder的参数是否需要梯度
+        for param in self.image_encoder.parameters():
+            param.requires_grad = image_encoder_requires_grad
+        for param in self.prompt_encoder.parameters():
+            param.requires_grad = prompt_encoder_requires_grad
         
         # 0. 验证和初始化基本参数
         assert embed_dim % num_heads == 0, "Embedding dimension must be divisible by number of heads"
@@ -189,6 +197,7 @@ class MaskVAR(nn.Module):
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
+        sam_image_embedding: torch.Tensor, points_coords, points_labels,
         g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
         more_smooth=False,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
@@ -205,21 +214,36 @@ class MaskVAR(nn.Module):
         """
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
+
+        image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
+        prompt_embedding, _ = self.prompt_encoder(
+            points=(points_coords, points_labels),
+            boxes=None,
+            masks=None,
+        )
+
+        image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
         
         if label_B is None:
             label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
         elif isinstance(label_B, int):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
-        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        # sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
         
+        sos = cond_BD = self.class_emb(label_B)
+
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+        next_token_map = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+        
+        print(f'next_token_map.shape: {next_token_map.shape}')
         
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
-        for b in self.blocks: b.attn.kv_caching(True)
+        for b in self.blocks:
+            b.attn.kv_caching(True)
+        
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
@@ -227,13 +251,15 @@ class MaskVAR(nn.Module):
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
+            print(f'x.shape: {x.shape}')
+            
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+                x = b(x=x, cond=image_multiscale_feats, prompt_cond=prompt_embedding, attn_bias=None)
             logits_BlV = self.get_logits(x, cond_BD)
             
-            t = cfg * ratio
-            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
+            # t = cfg * ratio
+            # logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
             
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth: # this is the default case
@@ -247,9 +273,10 @@ class MaskVAR(nn.Module):
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
+                # next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
         
-        for b in self.blocks: b.attn.kv_caching(False)
+        for b in self.blocks:
+            b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
     def forward(self, 
