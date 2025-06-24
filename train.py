@@ -15,7 +15,6 @@ from utils.data import build_dataset
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils.misc import auto_resume
 
-
 def build_everything(args: arg_util.Args):
     # resume
     auto_resume_info, start_ep, start_it, trainer_state, args_state = auto_resume(args, 'ar-ckpt*.pth')
@@ -36,27 +35,53 @@ def build_everything(args: arg_util.Args):
     print(f'global bs={args.glb_batch_size}, local bs={args.batch_size}')
     print(f'initial args:\n{str(args)}')
     
-    # build data
+    # 构建数据集和数据加载器
     if not args.local_debug:
         print(f'[build PT data] ...\n')
+        
+        # 构建训练和验证数据集
         num_classes, dataset_train, dataset_val = build_dataset(
-            args.data_path, final_reso=args.data_load_reso, hflip=args.hflip, mid_reso=args.mid_reso,
+            args.data_path, 
+            final_reso=args.data_load_reso, 
+            hflip=args.hflip, 
+            mid_reso=args.mid_reso,
         )
+        
+        # 记录数据集类型
         types = str((type(dataset_train).__name__, type(dataset_val).__name__))
         
+        # 创建验证数据加载器
         ld_val = DataLoader(
-            dataset_val, num_workers=0, pin_memory=True,
-            batch_size=round(args.batch_size*1.5), sampler=EvalDistributedSampler(dataset_val, num_replicas=dist.get_world_size(), rank=dist.get_rank()),
-            shuffle=False, drop_last=False,
+            dataset_val, 
+            num_workers=0, 
+            pin_memory=True,
+            batch_size=round(args.batch_size*1.5), 
+            sampler=EvalDistributedSampler(
+                dataset_val, 
+                num_replicas=dist.get_world_size(), 
+                rank=dist.get_rank()
+            ),
+            shuffle=False, 
+            drop_last=False,
         )
         del dataset_val
         
+        # 创建训练数据加载器
         ld_train = DataLoader(
-            dataset=dataset_train, num_workers=args.workers, pin_memory=True,
-            generator=args.get_different_generator_for_each_rank(), # worker_init_fn=worker_init_fn,
+            dataset=dataset_train, 
+            num_workers=args.workers, 
+            pin_memory=True,
+            generator=args.get_different_generator_for_each_rank(),
             batch_sampler=DistInfiniteBatchSampler(
-                dataset_len=len(dataset_train), glb_batch_size=args.glb_batch_size, same_seed_for_all_ranks=args.same_seed_for_all_ranks,
-                shuffle=True, fill_last=True, rank=dist.get_rank(), world_size=dist.get_world_size(), start_ep=start_ep, start_it=start_it,
+                dataset_len=len(dataset_train), 
+                glb_batch_size=args.glb_batch_size, 
+                same_seed_for_all_ranks=args.same_seed_for_all_ranks,
+                shuffle=True, 
+                fill_last=True, 
+                rank=dist.get_rank(), 
+                world_size=dist.get_world_size(), 
+                start_ep=start_ep, 
+                start_it=start_it,
             ),
         )
         del dataset_train
@@ -75,19 +100,28 @@ def build_everything(args: arg_util.Args):
         ld_val = ld_train = None
         iters_train = 10
     
-    # build models
+    # 构建模型组件
     from torch.nn.parallel import DistributedDataParallel as DDP
     from models import VAR, VQVAE, build_vae_var
     from trainer import VARTrainer
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params
-    
+
+    # 构建VAE和VAR模型
     vae_local, var_wo_ddp = build_vae_var(
-        V=4096, Cvae=32, ch=160, share_quant_resi=4,        # hard-coded VQVAE hyperparameters
-        device=dist.get_device(), patch_nums=args.patch_nums,
-        num_classes=num_classes, depth=args.depth, shared_aln=args.saln, attn_l2_norm=args.anorm,
-        flash_if_available=args.fuse, fused_if_available=args.fuse,
-        init_adaln=args.aln, init_adaln_gamma=args.alng, init_head=args.hd, init_std=args.ini,
+        V=4096, Cvae=32, ch=160, share_quant_resi=4,  # VQVAE超参数
+        device=dist.get_device(), 
+        patch_nums=args.patch_nums,
+        num_classes=num_classes, 
+        depth=args.depth, 
+        shared_aln=args.saln, 
+        attn_l2_norm=args.anorm,
+        flash_if_available=args.fuse, 
+        fused_if_available=args.fuse,
+        init_adaln=args.aln, 
+        init_adaln_gamma=args.alng, 
+        init_head=args.hd, 
+        init_std=args.ini,
     )
     
     vae_ckpt = 'vae_ch160v4096z32.pth'
@@ -106,7 +140,8 @@ def build_everything(args: arg_util.Args):
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder), ('VAE.quant', vae_local.quantize))]))
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_wo_ddp),)]) + '\n\n')
     
-    # build optimizer
+    # 构建优化器
+    # 过滤参数，为不同的参数组设置不同的优化策略
     names, paras, para_groups = filter_params(var_wo_ddp, nowd_keys={
         'cls_token', 'start_token', 'task_token', 'cfg_uncond',
         'pos_embed', 'pos_1LC', 'pos_start', 'start_pos', 'lvl_embed',
@@ -114,16 +149,25 @@ def build_everything(args: arg_util.Args):
         'ada_gss', 'moe_bias',
         'scale_mul',
     })
+    
+    # 选择优化器类型（Adam或AdamW）
     opt_clz = {
         'adam':  partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
         'adamw': partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
     }[args.opt.lower().strip()]
+    
+    # 设置优化器参数
     opt_kw = dict(lr=args.tlr, weight_decay=0)
     print(f'[INIT] optim={opt_clz}, opt_kw={opt_kw}\n')
     
+    # 创建混合精度优化器
     var_optim = AmpOptimizer(
-        mixed_precision=args.fp16, optimizer=opt_clz(params=para_groups, **opt_kw), names=names, paras=paras,
-        grad_clip=args.tclip, n_gradient_accumulation=args.ac
+        mixed_precision=args.fp16, 
+        optimizer=opt_clz(params=para_groups, **opt_kw), 
+        names=names, 
+        paras=paras,
+        grad_clip=args.tclip, 
+        n_gradient_accumulation=args.ac
     )
     del names, paras, para_groups
     
@@ -168,23 +212,33 @@ def build_everything(args: arg_util.Args):
     )
 
 
+# 主训练函数
 def main_training():
+    # 初始化分布式训练和获取参数
     args: arg_util.Args = arg_util.init_dist_and_get_args()
+    
+    # 如果是调试模式，启用梯度异常检测
     if args.local_debug:
         torch.autograd.set_detect_anomaly(True)
     
+    # 构建所有训练组件
     (
         tb_lg, trainer,
         start_ep, start_it,
         iters_train, ld_train, ld_val
     ) = build_everything(args)
     
-    # train
+    # 开始训练
     start_time = time.time()
+    
+    # 初始化最佳指标
     best_L_mean, best_L_tail, best_acc_mean, best_acc_tail = 999., 999., -1., -1.
     best_val_loss_mean, best_val_loss_tail, best_val_acc_mean, best_val_acc_tail = 999, 999, -1, -1
     
+    # 当前指标初始化
     L_mean, L_tail = -1, -1
+    
+    # 开始训练循环
     for ep in range(start_ep, args.ep):
         if hasattr(ld_train, 'sampler') and hasattr(ld_train.sampler, 'set_epoch'):
             ld_train.sampler.set_epoch(ep)
