@@ -50,7 +50,7 @@ class NeckFPN(nn.Module):
             x1 = conv(x)
             x1_interpolated = F.interpolate(x1, size=(pn, pn), mode='bilinear', align_corners=False)
 
-            print(f'x1_interpolated.shape: {x1_interpolated.shape}, pe_grid[{i}].shape: {pe_grids[i].shape}')
+            # print(f'x1_interpolated.shape: {x1_interpolated.shape}, pe_grid[{i}].shape: {pe_grids[i].shape}')
 
             x1_interpolated = x1_interpolated.permute(0, 2, 3, 1) + pe_grids[i].unsqueeze(0)
             x1_interpolated = x1_interpolated.view(B, -1, C)

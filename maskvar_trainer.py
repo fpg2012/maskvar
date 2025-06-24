@@ -1,4 +1,5 @@
 from typing import List, Tuple, Optional, Iterator, Union
+from models import sam_image_encoder
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,13 +11,20 @@ import time
 from tqdm import tqdm
 import numpy as np
 
-from models.maskvar import MaskVar
+from models.maskvar import MaskVAR
 from models.image_encoder import ImageEncoder
 from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
 from models import VAR, VQVAE, VectorQuantizer2
 from utils.amp_sc import AmpOptimizer
 from utils.clicker import Clicker
 from utils.misc import MetricLogger, TensorboardLogger
+
+from utils.clicker import init_clicks, predict_next_click, to_sam_format
+
+Ten = torch.Tensor
+FTen = torch.Tensor
+ITen = torch.LongTensor
+BTen = torch.BoolTensor
 
 def resize_longest_side(image, target_length, mode='bilinear'):
     scale = target_length * 1.0 / max(image.shape[-2], image.shape[-1])
@@ -110,11 +118,16 @@ class MaskLevelDataset(IterableDataset):
 
         return mask_normalized, mask
 
+class InteractiveConfig:
+    def __init__(self, num_random_clicks: int = 1, num_interactive_clicks: int = 20):
+        self.num_random_clicks = num_random_clicks
+        self.num_interactive_clicks = num_interactive_clicks
+
 class MaskVarTrainer(object):
     def __init__(
         self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
-        vae_local: VQVAE, var_wo_ddp: MaskVar, var: DDP,
-        var_opt: AmpOptimizer, label_smooth: float,
+        vae_local: VQVAE, var_wo_ddp: MaskVAR, var: DDP,
+        var_opt: AmpOptimizer, label_smooth: float, interactive_config: InteractiveConfig,
     ):
         super(MaskVarTrainer, self).__init__()
         
@@ -153,7 +166,10 @@ class MaskVarTrainer(object):
         self.prog_it = 0  # 当前 progressive 阶段的迭代次数
         self.last_prog_si = -1  # 上一个 progressive 阶段索引
         self.first_prog = True  # 是否处于第一个 progressive 阶段
+
+        self.interactive_config = interactive_config
     
+    # !TODO: not done
     @torch.no_grad()
     def eval_ep(self, ld_val: DataLoader):
         tot = 0
@@ -186,9 +202,109 @@ class MaskVarTrainer(object):
         L_mean, L_tail, acc_mean, acc_tail, _ = stats.tolist()
         return L_mean, L_tail, acc_mean, acc_tail, tot, time.time()-stt
     
+    def interactive_train_step(
+        self, it: int, g_it: int, stepping: bool,
+        metric_lg: MetricLogger, tb_lg: TensorboardLogger,
+        gt_mask_B1HW: FTen, 
+        label_B: Union[ITen, FTen], 
+        prog_si: int, prog_wp_it: float,
+        image_embed_sam_BCencHW: FTen,
+    ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
+        """
+        Interactive training step.
+
+        Args:
+            it: 当前epoch内的迭代步数
+            g_it: 全局迭代步数（跨epoch累计）
+            stepping: 是否执行optimizer step（梯度累积时可能需要跳过）
+            metric_lg: 指标记录器
+            tb_lg: TensorBoard记录器
+            gt_mask_B1HW: 输入gt mask，形状(B, 1, H, W)
+            label_B: 标签，形状(B, L)
+            prog_si: 当前progressive training阶段索引
+            prog_wp_it: 当前progressive阶段的warmup迭代数
+            image_embed_sam_BCencHW: 输入的SAM特征，形状(B, C_enc, H, W)
+
+        Returns:
+            grad_norm: 梯度范数
+            scale_log2: 混合精度训练的scaler的log2值
+        """
+        B = gt_mask_B1HW.shape[0]
+        # sample init clicks for each batch
+        click_lists = []
+        for i in range(B):
+            click_list, eroded_mask, dt = init_clicks(gt_mask_B1HW[i].cpu().numpy()[0], num_random_clicks=self.interactive_config.num_random_clicks)
+            click_lists.append(click_list)
+
+        point_coords = []
+        point_labels = []
+        for i in range(B):
+            coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
+            point_coords.append(coords)
+            point_labels.append(labels)
+
+        pred_masks = self.var.module.autoregressive_infer_cfg(
+            B=B,
+            label_B=0,
+            sam_image_embedding=image_embed_sam_BCencHW,
+            point_coords=torch.Tensor(point_coords),
+            point_labels=torch.Tensor(point_labels),
+        ) # (B, 1, 256, 256)
+
+        # sample interact clicks for each batch
+        not_click_maps = [None] * B
+        num_clicks = np.random.randint(1, self.interactive_config.num_interactive_clicks+1)
+        for i in range(B):
+            for _ in range(num_clicks):
+                predict_next_click(
+                    gt_mask_B1HW[i].cpu().numpy()[0], 
+                    pred_mask=pred_masks[i].cpu().numpy()[0], 
+                    click_list=click_lists[i], 
+                    not_clicked_map=not_click_maps[i]
+                )
+            
+            point_coords.clear()
+            point_labels.clear()
+            for i in range(B):
+                coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
+                point_coords.append(coords)
+                point_labels.append(labels)
+            
+            pred_masks = self.var.module.autoregressive_infer_cfg(
+                B=B,
+                label_B=0,
+                sam_image_embedding=image_embed_sam_BCencHW,
+                point_coords=torch.Tensor(point_coords),
+                point_labels=torch.Tensor(point_labels),
+            ) # (B, 1, 256, 256)
+        
+        point_coords.clear()
+        point_labels.clear()
+        for i in range(B):
+            coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
+            point_coords.append(coords)
+            point_labels.append(labels)
+
+        return self.train_step(
+            it=it, g_it=g_it, stepping=stepping,
+            metric_lg=metric_lg, tb_lg=tb_lg,
+            gt_mask_B1HW=gt_mask_B1HW,
+            label_B=label_B,
+            prog_si=prog_si, prog_wp_it=prog_wp_it,
+            image_embed_sam_BCencHW=image_embed_sam_BCencHW,
+            prompt_points_coords_BN2=torch.Tensor(point_coords),
+            prompt_points_labels_BN=torch.Tensor(point_labels),
+        )
+    
     def train_step(
-        self, it: int, g_it: int, stepping: bool, metric_lg: MetricLogger, tb_lg: TensorboardLogger,
-        inp_B3HW: FTen, label_B: Union[ITen, FTen], prog_si: int, prog_wp_it: float,
+        self, it: int, g_it: int, stepping: bool, 
+        metric_lg: MetricLogger, tb_lg: TensorboardLogger,
+        gt_mask_B1HW: FTen, 
+        label_B: Union[ITen, FTen], 
+        prog_si: int, prog_wp_it: float,
+        image_embed_sam_BCencHW: FTen,
+        prompt_points_coords_BN2: FTen,
+        prompt_points_labels_BN: ITen,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         """
         Train one step on the given input.
@@ -199,10 +315,13 @@ class MaskVarTrainer(object):
             stepping: 是否执行optimizer step（梯度累积时可能需要跳过）
             metric_lg: 指标记录器
             tb_lg: TensorBoard记录器
-            inp_B3HW: 输入图像，形状(B, 3, H, W)
+            gt_mask_B1HW: 输入gt mask，形状(B, 1, H, W)
             label_B: 标签，形状(B, L)
             prog_si: 当前progressive training阶段索引
             prog_wp_it: 当前progressive阶段的warmup迭代数
+            image_embed_sam_BCencHW: 输入的SAM特征，形状(B, C_enc, H, W)
+            prompt_points_coords_BN2: 输入的prompt点坐标，形状(B, N, 2)
+            prompt_points_labels_BN: 输入的prompt点标签，形状(B, N)
         
         Returns:
             grad_norm: 梯度范数
@@ -234,7 +353,7 @@ class MaskVarTrainer(object):
         self.var.require_backward_grad_sync = stepping  # 设置DDP梯度同步
         
         # 将图像转换为token索引序列
-        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
+        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(gt_mask_B1HW)
         gt_BL = torch.cat(gt_idx_Bl, dim=1)  # 拼接所有token (B, L)
         # 生成模型输入（去掉第一个token）
         x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
@@ -242,7 +361,7 @@ class MaskVarTrainer(object):
         # 混合精度训练上下文
         with self.var_opt.amp_ctx:
             # 前向传播
-            logits_BLV = self.var(label_B, x_BLCv_wo_first_l)  # (B, L, V)
+            logits_BLV = self.var(label_B, x_BLCv_wo_first_l, image_embed_sam_BCencHW, prompt_points_coords_BN2, prompt_points_labels_BN)  # (B, L, V)
             # 计算每个token的loss (B, L)
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
             
