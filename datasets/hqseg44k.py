@@ -91,6 +91,9 @@ class HQSeg44KTrainDataset(torch.utils.data.Dataset):
                 node_level=0      # 实例层级
             )
         }
+        if self.transform:
+            result = self.transform((img, mask, instances_info))
+            return result
         return img, mask, instances_info  # 格式: (image, layers, instances_info)
     
 class HQSeg44KTestDataset(torch.utils.data.Dataset):
