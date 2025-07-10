@@ -7,6 +7,11 @@ from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
 from models.prompt_encoder import PromptEncoder
 from models.image_encoder import ImageEncoder, VarImageEncoder, NeckFPN
 from models.maskvar import MaskVAR
+
+from datasets.mask_level_dataset import MaskLevelDataset
+from datasets.coco_lvis import LvisDataset
+from datasets.hqseg44k import HQSeg44KTrainDataset
+
 from functools import partial
 from typing import Optional
 
@@ -24,6 +29,35 @@ def build_maskseg(vqvae_checkpoint_path: Optional[str] = None, maskgit_checkpoin
                       freeze_prompt_encoder=True)
 
     return maskseg
+
+def build_maskvar(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, flash_if_available: bool = False, device='cpu'):
+    vqvae = build_vqvae_single(vqvae_checkpoint_path).to(device)
+    sam_image_encoder = build_sam_image_encoder(sam_checkpoint_path).to(device)
+    var_image_encoder = build_var_image_encoder().to(device)
+    prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
+    maskvar = MaskVAR(
+        vae_local=vqvae, 
+        image_encoder=var_image_encoder, 
+        prompt_encoder=prompt_encoder,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=16,
+        mlp_ratio=4.,
+        drop_rate=0.1,
+        attn_drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
+        flash_if_available=flash_if_available,
+        fused_if_available=True,
+        image_encoder_requires_grad=True,
+        prompt_encoder_requires_grad=False,
+    ).to(device)
+    return vqvae, maskvar, sam_image_encoder
 
 def build_vqvae_single(vqvae_checkpoint_path: Optional[str] = None, require_grad = False) -> VQVAE_Single:
     vocab_size = 4096  # 码本大小
@@ -48,6 +82,29 @@ def build_vqvae_single(vqvae_checkpoint_path: Optional[str] = None, require_grad
 
     return vqvae
 
+def build_vqvae_single_fewer_stages(vqvae_checkpoint_path: Optional[str] = None, require_grad = False) -> VQVAE_Single:
+    vocab_size = 4096  # 码本大小
+    z_channels = 32   # 潜在空间通道数
+    base_channels = 128  # 基础通道数
+    beta = 0.25  # commitment loss权重
+
+    vqvae = VQVAE_Single(
+        vocab_size=vocab_size,
+        z_channels=z_channels,
+        ch=base_channels,
+        beta=beta,
+        v_patch_nums=(1, 2, 4, 8, 16, 32),
+        test_mode=False,
+        ddconfig=dict(in_channels=1, ch_mult=(1, 1, 2, 4), num_res_blocks=2,   # 通道数乘数，用于构建网络层
+                    using_sa=True, using_mid_sa=True,)
+    )
+
+    if vqvae_checkpoint_path is not None:
+        vqvae_state_dict = torch.load(vqvae_checkpoint_path)
+        vqvae.load_state_dict(vqvae_state_dict)
+    
+    return vqvae
+
 def build_var_image_encoder() -> VarImageEncoder:
     neck_fpn = NeckFPN(
         embed_dim=256, 
@@ -59,31 +116,31 @@ def build_var_image_encoder() -> VarImageEncoder:
     var_image_encoder = VarImageEncoder(neck_fpn)
     return var_image_encoder
 
-def build_maskvar(maskvar_checkpoint_path: Optional[str] = None, vqvae: VQVAE_Single = None, image_encoder: VarImageEncoder = None, prompt_encoder: PromptEncoder = None, flash_if_available: bool = False) -> MaskVAR:
-    maskvar = MaskVAR(
-        vae_local=vqvae,
-        image_encoder=image_encoder,
-        prompt_encoder=prompt_encoder,
-        num_classes=1,
-        depth=4,
-        embed_dim=256,
-        num_heads=16,
-        mlp_ratio=4.,
-        drop_rate=0.1,
-        attn_drop_rate=0.1,
-        drop_path_rate=0.1,
-        norm_eps=1e-6,
-        shared_aln=False,
-        cond_drop_rate=0.1,
-        attn_l2_norm=False,
-        patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
-        flash_if_available=flash_if_available,
-        fused_if_available=True,
-    )
-    if maskvar_checkpoint_path is not None:
-        maskvar_state_dict = torch.load(maskvar_checkpoint_path)
-        maskvar.load_state_dict(maskvar_state_dict)
-    return maskvar
+# def build_maskvar(maskvar_checkpoint_path: Optional[str] = None, vqvae: VQVAE_Single = None, image_encoder: VarImageEncoder = None, prompt_encoder: PromptEncoder = None, flash_if_available: bool = False) -> MaskVAR:
+#     maskvar = MaskVAR(
+#         vae_local=vqvae,
+#         image_encoder=image_encoder,
+#         prompt_encoder=prompt_encoder,
+#         num_classes=1,
+#         depth=4,
+#         embed_dim=256,
+#         num_heads=16,
+#         mlp_ratio=4.,
+#         drop_rate=0.1,
+#         attn_drop_rate=0.1,
+#         drop_path_rate=0.1,
+#         norm_eps=1e-6,
+#         shared_aln=False,
+#         cond_drop_rate=0.1,
+#         attn_l2_norm=False,
+#         patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
+#         flash_if_available=flash_if_available,
+#         fused_if_available=True,
+#     )
+#     if maskvar_checkpoint_path is not None:
+#         maskvar_state_dict = torch.load(maskvar_checkpoint_path)
+#         maskvar.load_state_dict(maskvar_state_dict)
+#     return maskvar
 
 def build_vqvae_single_v3(vqvae_checkpoint_path: Optional[str] = None, require_grad = False) -> VQVAE_Single:
     vocab_size = 4096  # 码本大小
@@ -377,3 +434,21 @@ def build_maskgit_v0(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str]
         maskgit.load_state_dict(maskgit_state_dict)
 
     return maskgit
+
+def build_cocolvis_dataset(dataset_path='data/coco_lvis'):
+    trainset = LvisDataset(
+        dataset_path=dataset_path,
+        split='train',
+        img_split='train',
+        stuff_prob=0.0,
+    )
+
+    valset = LvisDataset(
+        dataset_path=dataset_path,
+        split='val',
+        img_split='val',
+        stuff_prob=0.0,
+    )
+
+    return trainset, valset
+    

@@ -52,7 +52,7 @@ class NeckFPN(nn.Module):
 
             # print(f'x1_interpolated.shape: {x1_interpolated.shape}, pe_grid[{i}].shape: {pe_grids[i].shape}')
 
-            x1_interpolated = x1_interpolated.permute(0, 2, 3, 1) + pe_grids[i].unsqueeze(0)
+            x1_interpolated = x1_interpolated.permute(0, 2, 3, 1) + pe_grids[i].unsqueeze(0).to(x1_interpolated.device)
             x1_interpolated = x1_interpolated.view(B, -1, C)
             multiscale_feats.append(x1_interpolated)
         return multiscale_feats

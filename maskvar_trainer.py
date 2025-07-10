@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import IterableDataset, Dataset, DataLoader
-from torch.distributed import DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel as DDP
 import dist
 import time
 from tqdm import tqdm
@@ -20,103 +20,14 @@ from utils.clicker import Clicker
 from utils.misc import MetricLogger, TensorboardLogger
 
 from utils.clicker import init_clicks, predict_next_click, to_sam_format
+from utils import resize_longest_side
+
+from datasets.mask_level_dataset import MaskLevelDataset
 
 Ten = torch.Tensor
 FTen = torch.Tensor
 ITen = torch.LongTensor
 BTen = torch.BoolTensor
-
-def resize_longest_side(image, target_length, mode='bilinear'):
-    scale = target_length * 1.0 / max(image.shape[-2], image.shape[-1])
-    newh, neww = image.shape[-2] * scale, image.shape[-1] * scale
-    neww = int(neww + 0.5)
-    newh = int(newh + 0.5)
-
-    if mode == 'bilinear':
-        return F.interpolate(
-            image, (newh, neww), mode=mode, align_corners=False, antialias=True
-        )
-    else:
-        return F.interpolate(
-            image, (newh, neww), mode=mode,
-        )
-
-class MaskLevelDataset(IterableDataset):
-
-    def __init__(self, dataset: Optional[LvisDataset | HQSeg44KTrainDataset], sam_encoder: SamImageEncoder, device: str):
-        self.dataset = dataset
-        self.sam_encoder = sam_encoder
-        self.device = device
-
-        self.pixel_mean = torch.tensor([123.675, 116.28, 103.53]).to(device) # copied from sam
-        self.pixel_std = torch.tensor([58.395, 57.12, 57.375]).to(device) # copied from sam
-
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        if not dist.is_initialized():
-            rank = 0
-            world_size = 1
-        else:
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-
-        for i in range(len(self.dataset)):
-            if i % world_size != rank:
-                continue
-
-            image, mask, instance_info = self.dataset[i]
-            image, image_embed_sam = self.preprocess_image(image)
-            for instance_idx in instance_info.keys():
-                single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
-                yield image, image_embed_sam, single_mask_normalized, single_mask
-
-    def preprocess_image(self, image):
-        """
-        preprocess image for image encoder
-
-        image: (H, W, 3)
-        """
-        image = torch.from_numpy(image).to(self.device) / 255.0
-        image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
-        image = resize_longest_side(image.unsqueeze(0), 1024).squeeze(0)
-
-        # normalize image
-        image = image.permute(1, 2, 0) # (3, H, W) -> (H, W, 3)
-        image = (image - self.pixel_mean) / self.pixel_std
-        image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
-
-        # pad image to 1024
-        h, w = image.shape[-2:]
-        padh = 1024 - h
-        padw = 1024 - w
-        image = F.pad(image, (0, padw, 0, padh), value=0)
-
-        # print(f'image shape: {image.shape}')
-
-        # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
-        with torch.no_grad():
-            image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0)
-
-        return image, image_embed_sam
-
-    def preprocess_mask(self, gt_mask, instance_info, instance_idx):
-        mask = gt_mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
-
-        # to tensor
-        mask = torch.from_numpy(mask).to(self.device, dtype=torch.float32).unsqueeze(0)
-
-        mask = resize_longest_side(mask.unsqueeze(0), 256, 'nearest').squeeze(0)
-        mask = mask.long()
-
-        # pad mask to 256
-        h, w = mask.shape[-2:]
-        padh = 256 - h
-        padw = 256 - w
-        mask = F.pad(mask, (0, padw, 0, padh), value=0)
-
-        # normalize mask
-        mask_normalized = mask * 2 - 1
-
-        return mask_normalized, mask
 
 class InteractiveConfig:
     def __init__(self, num_random_clicks: int = 1, num_interactive_clicks: int = 20):
@@ -178,9 +89,9 @@ class MaskVarTrainer(object):
         training = self.var_wo_ddp.training
         self.var_wo_ddp.eval()
         for inp_B3HW, label_B in ld_val:
-            B, V = label_B.shape[0], self.vae_local.vocab_size
+            B, V = inp_B3HW.shape[0], self.vae_local.vocab_size
             inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
-            label_B = label_B.to(dist.get_device(), non_blocking=True)
+            # label_B = label_B.to(dist.get_device(), non_blocking=True)
             
             gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
@@ -245,14 +156,14 @@ class MaskVarTrainer(object):
 
         pred_masks = self.var.module.autoregressive_infer_cfg(
             B=B,
-            label_B=0,
+            label_B=None,
             sam_image_embedding=image_embed_sam_BCencHW,
-            point_coords=torch.Tensor(point_coords),
-            point_labels=torch.Tensor(point_labels),
+            points_coords=torch.stack(point_coords).to(device=dist.get_device()),
+            points_labels=torch.stack(point_labels).to(device=dist.get_device()),
         ) # (B, 1, 256, 256)
 
         # sample interact clicks for each batch
-        not_click_maps = [None] * B
+        not_click_maps = [np.ones_like(gt_mask_B1HW[i].cpu().numpy()[0], dtype=bool) for i in range(B)]
         num_clicks = np.random.randint(1, self.interactive_config.num_interactive_clicks+1)
         for i in range(B):
             for _ in range(num_clicks):
@@ -269,13 +180,13 @@ class MaskVarTrainer(object):
                 coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
                 point_coords.append(coords)
                 point_labels.append(labels)
-            
+
             pred_masks = self.var.module.autoregressive_infer_cfg(
                 B=B,
-                label_B=0,
+                label_B=None,
                 sam_image_embedding=image_embed_sam_BCencHW,
-                point_coords=torch.Tensor(point_coords),
-                point_labels=torch.Tensor(point_labels),
+                points_coords=torch.stack(point_coords).to(device=dist.get_device()),
+                points_labels=torch.stack(point_labels).to(device=dist.get_device()),
             ) # (B, 1, 256, 256)
         
         point_coords.clear()
@@ -289,11 +200,11 @@ class MaskVarTrainer(object):
             it=it, g_it=g_it, stepping=stepping,
             metric_lg=metric_lg, tb_lg=tb_lg,
             gt_mask_B1HW=gt_mask_B1HW,
-            label_B=label_B,
+            label_B=None,
             prog_si=prog_si, prog_wp_it=prog_wp_it,
             image_embed_sam_BCencHW=image_embed_sam_BCencHW,
-            prompt_points_coords_BN2=torch.Tensor(point_coords),
-            prompt_points_labels_BN=torch.Tensor(point_labels),
+            prompt_points_coords_BN2=torch.stack(point_coords).to(device=dist.get_device()),
+            prompt_points_labels_BN=torch.stack(point_labels).to(device=dist.get_device()),
         )
     
     def train_step(
@@ -349,10 +260,11 @@ class MaskVarTrainer(object):
             prog_si = -1
         
         # ==================== 前向传播 ====================
-        B, V = label_B.shape[0], self.vae_local.vocab_size  # batch_size, 词表大小
+        B, V = gt_mask_B1HW.shape[0], self.vae_local.vocab_size  # batch_size, 词表大小
         self.var.require_backward_grad_sync = stepping  # 设置DDP梯度同步
         
         # 将图像转换为token索引序列
+        # print(f'gt_mask_B1HW.dtype: {gt_mask_B1HW.dtype}')
         gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(gt_mask_B1HW)
         gt_BL = torch.cat(gt_idx_Bl, dim=1)  # 拼接所有token (B, L)
         # 生成模型输入（去掉第一个token）
@@ -361,7 +273,7 @@ class MaskVarTrainer(object):
         # 混合精度训练上下文
         with self.var_opt.amp_ctx:
             # 前向传播
-            logits_BLV = self.var(label_B, x_BLCv_wo_first_l, image_embed_sam_BCencHW, prompt_points_coords_BN2, prompt_points_labels_BN)  # (B, L, V)
+            logits_BLV = self.var(label_B, x_BLCv_wo_first_l.detach(), image_embed_sam_BCencHW.detach(), prompt_points_coords_BN2.detach(), prompt_points_labels_BN.detach())  # (B, L, V)
             # 计算每个token的loss (B, L)
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
             
@@ -483,8 +395,8 @@ class MaskVarTrainer(object):
                 ret = m.load_state_dict(state[k], strict=strict)
                 if ret is not None:
                     missing, unexpected = ret
-                    print(f'[VARTrainer.load_state_dict] {k} missing:  {missing}')
-                    print(f'[VARTrainer.load_state_dict] {k} unexpected:  {unexpected}')
+                    print(f'[MaskVarTrainer.load_state_dict] {k} missing:  {missing}')
+                    print(f'[MaskVarTrainer.load_state_dict] {k} unexpected:  {unexpected}')
         
         config: dict = state.pop('config', None)
         self.prog_it = config.get('prog_it', 0)
@@ -493,6 +405,6 @@ class MaskVarTrainer(object):
         if config is not None:
             for k, v in self.get_config().items():
                 if config.get(k, None) != v:
-                    err = f'[VAR.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k, None)})'
+                    err = f'[MaskVarTrainer.load_state_dict] config mismatch:  this.{k}={v} (ckpt.{k}={config.get(k, None)})'
                     if strict: raise AttributeError(err)
                     else: print(err)

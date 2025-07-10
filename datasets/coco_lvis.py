@@ -46,6 +46,17 @@ class LvisDataset(torch.utils.data.Dataset):
 
             self.dataset_samples = [sample for sample in self.dataset_samples
                                    if sample[0] in allow_images_ids]
+        
+        self.num_masks_splits = [380410, 377555, 376958, 387074]
+
+    def count_masks(self, world_size=4, rank=0):
+        assert world_size == 4 or world_size == 2 or world_size == 1
+        if world_size == 4:
+            return self.num_masks_splits[rank]
+        elif world_size == 2:
+            return self.num_masks_splits[rank] + self.num_masks_splits[rank + 2]
+        else:
+            return sum(self.num_masks_splits)
 
     def __len__(self):
         """Returns the total number of samples in the dataset."""

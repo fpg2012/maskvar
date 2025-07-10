@@ -2,6 +2,7 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 import torch
+import traceback
 
 class Clicker:
 
@@ -123,6 +124,8 @@ class Clicker:
 
 def init_clicks(gt_mask, num_random_clicks=2, click_list=[], not_clicked_map=None):
     click_list = []
+    if not_clicked_map is None:
+        not_clicked_map = np.ones_like(gt_mask, dtype=bool)
     try:
         for _ in range(num_random_clicks):
             # Erode the mask to get points away from edges
@@ -148,6 +151,8 @@ def init_clicks(gt_mask, num_random_clicks=2, click_list=[], not_clicked_map=Non
             click_list.append((y, x, 1))
             not_clicked_map[y, x] = False
     except Exception as e:
+        # print traceback
+        traceback.print_exc()
         print(f"Error in init_clicks: {e}")
     finally:
         return click_list, eroded_mask, dt

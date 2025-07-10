@@ -4,7 +4,7 @@ from typing import Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin
+# from huggingface_hub import PyTorchModelHubMixin
 
 import dist
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
@@ -405,24 +405,24 @@ class VAR(nn.Module):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
 
-class VARHF(VAR, PyTorchModelHubMixin):
-            # repo_url="https://github.com/FoundationVision/VAR",
-            # tags=["image-generation"]):
-    def __init__(
-        self,
-        vae_kwargs,
-        num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
-        norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
-        attn_l2_norm=False,
-        patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
-        flash_if_available=True, fused_if_available=True,
-    ):
-        vae_local = VQVAE(**vae_kwargs)
-        super().__init__(
-            vae_local=vae_local,
-            num_classes=num_classes, depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate,
-            norm_eps=norm_eps, shared_aln=shared_aln, cond_drop_rate=cond_drop_rate,
-            attn_l2_norm=attn_l2_norm,
-            patch_nums=patch_nums,
-            flash_if_available=flash_if_available, fused_if_available=fused_if_available,
-        )
+# class VARHF(VAR, PyTorchModelHubMixin):
+#             # repo_url="https://github.com/FoundationVision/VAR",
+#             # tags=["image-generation"]):
+#     def __init__(
+#         self,
+#         vae_kwargs,
+#         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+#         norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
+#         attn_l2_norm=False,
+#         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
+#         flash_if_available=True, fused_if_available=True,
+#     ):
+#         vae_local = VQVAE(**vae_kwargs)
+#         super().__init__(
+#             vae_local=vae_local,
+#             num_classes=num_classes, depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate,
+#             norm_eps=norm_eps, shared_aln=shared_aln, cond_drop_rate=cond_drop_rate,
+#             attn_l2_norm=attn_l2_norm,
+#             patch_nums=patch_nums,
+#             flash_if_available=flash_if_available, fused_if_available=fused_if_available,
+#         )

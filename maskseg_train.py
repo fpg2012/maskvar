@@ -1,5 +1,5 @@
-from build_everything import build_maskseg
-from trainer import MaskSegTrainer, MaskLevelDataset
+from maskseg_build_everything import build_maskseg
+from maskseg_trainer import MaskSegTrainer, MaskLevelDataset
 from models.maskseg import MaskSeg
 from datasets.coco_lvis import LvisDataset
 from utils.transforms import ResizeLongestSide

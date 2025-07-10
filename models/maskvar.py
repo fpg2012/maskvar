@@ -52,7 +52,7 @@ class MaskVAR(nn.Module):
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         flash_if_available=True, fused_if_available=True,
-        image_encoder_requires_grad=False,
+        image_encoder_requires_grad=True,
         prompt_encoder_requires_grad=False,
     ):
         super().__init__()
@@ -224,11 +224,14 @@ class MaskVAR(nn.Module):
 
         image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
         
-        if label_B is None:
-            label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
-        elif isinstance(label_B, int):
-            label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
+        # if label_B is None:
+        #     label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
+        # elif isinstance(label_B, int):
+        #     label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
+        if label_B is None:
+            label_B = torch.zeros(B, dtype=torch.long, device=self.lvl_1L.device)
+
         # sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
         
         sos = cond_BD = self.class_emb(label_B)
@@ -236,7 +239,7 @@ class MaskVAR(nn.Module):
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         next_token_map = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         
-        print(f'next_token_map.shape: {next_token_map.shape}')
+        # print(f'next_token_map.shape: {next_token_map.shape}')
         
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
@@ -251,7 +254,7 @@ class MaskVAR(nn.Module):
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
-            print(f'x.shape: {x.shape}')
+            # print(f'x.shape: {x.shape}')
             
             AdaLNSelfAttn.forward
             for b in self.blocks:
@@ -300,12 +303,18 @@ class MaskVAR(nn.Module):
             logits_BLV: 输出logits，形状为(B, L, V)，V是词表大小
         """
 
+        B = x_BLCv_wo_first_l.shape[0]
+        if label_B is None:
+            label_B = torch.zeros(B, dtype=torch.long, device=self.lvl_1L.device)
+
         image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
         prompt_embedding, _ = self.prompt_encoder(
             points=(points_coords, points_labels),
             boxes=None,
             masks=None,
         )
+
+        prompt_embedding = prompt_embedding.detach()
 
         # print(f'MaskVAR: x_BLCv_wo_first_l.shape: {x_BLCv_wo_first_l.shape}')
         # print(f'MaskVAR: image_multiscale_feats.shape: {image_multiscale_feats.shape}')
@@ -319,11 +328,11 @@ class MaskVAR(nn.Module):
         # 使用FP32精度处理类别嵌入和位置编码
         with torch.cuda.amp.autocast(enabled=False):
             # 标签dropout：以cond_drop_rate概率将标签替换为num_classes（表示无类别）
-            label_B = torch.where(
-                torch.rand(B, device=label_B.device) < self.cond_drop_rate,
-                self.num_classes,  # 使用num_classes表示无类别
-                label_B
-            )
+            # label_B = torch.where(
+            #     torch.rand(B, device=label_B.device) < self.cond_drop_rate,
+            #     self.num_classes,  # 使用num_classes表示无类别
+            #     label_B
+            # )
             
             # 获取类别嵌入（条件嵌入）
             # sos/cond_BD: (B, D), 其中D是嵌入维度
@@ -344,7 +353,7 @@ class MaskVAR(nn.Module):
             # 添加层级嵌入和位置编码
             # lvl_embed: 不同层级的嵌入
             # pos_1LC: 位置编码
-            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
+            x_BLC = x_BLC + self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
             image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
         
         # 注意力掩码（用于自回归生成）
@@ -352,7 +361,7 @@ class MaskVAR(nn.Module):
         
         # 条件投影（用于AdaLN）
         # cond_BD_or_gss: (B, D)
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+        # cond_BD_or_gss = self.shared_ada_lin(cond_BD)
         
         # 获取混合精度训练中的主数据类型
         temp = x_BLC.new_ones(8, 8)
