@@ -13,6 +13,8 @@ from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 from .var import SharedAdaLin
 from .image_encoder import VarImageEncoder
+from torch.profiler import record_function
+from utils.timer import profile_timer
 
 def create_aligned_attn_bias(L, device="cuda", dtype=torch.float32):
     # 计算对齐后的长度（向上取整到最近的8的倍数）
@@ -215,14 +217,16 @@ class MaskVAR(nn.Module):
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
 
-        image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
-        prompt_embedding, _ = self.prompt_encoder(
-            points=(points_coords, points_labels),
-            boxes=None,
-            masks=None,
-        )
-
-        image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
+        with record_function("multiscale_image_encoder"):   
+            image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
+        with record_function("prompt_encoder"):
+            prompt_embedding, _ = self.prompt_encoder(
+                points=(points_coords, points_labels),
+                boxes=None,
+                masks=None,
+            )
+        with record_function("add_lvl_pos"):
+            image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
         
         # if label_B is None:
         #     label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
@@ -233,14 +237,14 @@ class MaskVAR(nn.Module):
             label_B = torch.zeros(B, dtype=torch.long, device=self.lvl_1L.device)
 
         # sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
-        
-        sos = cond_BD = self.class_emb(label_B)
+        with record_function("class_emb"):
+            sos = cond_BD = self.class_emb(label_B)
 
-        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+            lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+            next_token_map = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1) + lvl_pos[:, :self.first_l]
         
-        # print(f'next_token_map.shape: {next_token_map.shape}')
-        
+            # print(f'next_token_map.shape: {next_token_map.shape}')
+            
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
@@ -248,39 +252,46 @@ class MaskVAR(nn.Module):
             b.attn.kv_caching(True)
         
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
-            ratio = si / self.num_stages_minus_1
-            # last_L = cur_L
-            cur_L += pn*pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            x = next_token_map
-            # print(f'x.shape: {x.shape}')
-            
-            AdaLNSelfAttn.forward
-            for b in self.blocks:
-                x = b(x=x, cond=image_multiscale_feats, prompt_cond=prompt_embedding, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD)
-            
-            # t = cfg * ratio
-            # logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
-            
-            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            if not more_smooth: # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
-            else:   # not used when evaluating FID/IS/Precision/Recall
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
-                h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-            if si != self.num_stages_minus_1:   # prepare for next stage
-                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                # next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
+            with record_function(f'autogressive pass {si}'):
+                ratio = si / self.num_stages_minus_1
+                # last_L = cur_L
+                cur_L += pn*pn
+                # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+                cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+                x = next_token_map
+                # print(f'x.shape: {x.shape}')
+                
+                AdaLNSelfAttn.forward
+                for b in self.blocks:
+                    with record_function(f'autogressive pass {si} block {b}'):
+                        x = b(x=x, cond=image_multiscale_feats, prompt_cond=prompt_embedding, attn_bias=None)
+                with record_function(f'autogressive pass {si} logits'):
+                    logits_BlV = self.get_logits(x, cond_BD)
+                
+                # t = cfg * ratio
+                # logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
+                with record_function(f'autogressive pass {si} sample'):
+                    idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+                    if not more_smooth: # this is the default case
+                        h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
+                    else:   # not used when evaluating FID/IS/Precision/Recall
+                        gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
+                        h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                
+                with record_function(f'autogressive pass {si} get next input'):
+                    h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+                    f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+                    if si != self.num_stages_minus_1:   # prepare for next stage
+                        next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                        next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
+                        # next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
         
         for b in self.blocks:
             b.attn.kv_caching(False)
-        return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+        
+        with record_function("vae_proxy"):
+            ret = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+        return ret
     
     def forward(self, 
                 label_B: torch.LongTensor, 
@@ -306,15 +317,15 @@ class MaskVAR(nn.Module):
         B = x_BLCv_wo_first_l.shape[0]
         if label_B is None:
             label_B = torch.zeros(B, dtype=torch.long, device=self.lvl_1L.device)
-
-        image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
-        prompt_embedding, _ = self.prompt_encoder(
-            points=(points_coords, points_labels),
-            boxes=None,
-            masks=None,
-        )
-
-        prompt_embedding = prompt_embedding.detach()
+        with record_function("multiscale_image_encoder"):
+            image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
+        with record_function("prompt_encoder"):
+            prompt_embedding, _ = self.prompt_encoder(
+                points=(points_coords, points_labels),
+                boxes=None,
+                masks=None,
+            )
+            prompt_embedding = prompt_embedding.detach()
 
         # print(f'MaskVAR: x_BLCv_wo_first_l.shape: {x_BLCv_wo_first_l.shape}')
         # print(f'MaskVAR: image_multiscale_feats.shape: {image_multiscale_feats.shape}')
@@ -325,36 +336,37 @@ class MaskVAR(nn.Module):
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]  # batch size
         
-        # 使用FP32精度处理类别嵌入和位置编码
-        with torch.cuda.amp.autocast(enabled=False):
-            # 标签dropout：以cond_drop_rate概率将标签替换为num_classes（表示无类别）
-            # label_B = torch.where(
-            #     torch.rand(B, device=label_B.device) < self.cond_drop_rate,
-            #     self.num_classes,  # 使用num_classes表示无类别
-            #     label_B
-            # )
-            
-            # 获取类别嵌入（条件嵌入）
-            # sos/cond_BD: (B, D), 其中D是嵌入维度
-            sos = cond_BD = self.class_emb(label_B)
-            
-            # 为序列开始添加位置编码
-            # sos: (B, first_l, D)
-            sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
-            
-            # 构建输入序列
-            if self.prog_si == 0:  # 如果是第一个progressive阶段
-                x_BLC = sos  # 只使用开始标记
-            else:
-                # 将开始标记与输入序列拼接
-                # word_embed将输入映射到与sos相同的嵌入空间
-                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
-            
-            # 添加层级嵌入和位置编码
-            # lvl_embed: 不同层级的嵌入
-            # pos_1LC: 位置编码
-            x_BLC = x_BLC + self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
-            image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
+        with record_function("class_emb"):
+            # 使用FP32精度处理类别嵌入和位置编码
+            with torch.cuda.amp.autocast(enabled=False):
+                # 标签dropout：以cond_drop_rate概率将标签替换为num_classes（表示无类别）
+                # label_B = torch.where(
+                #     torch.rand(B, device=label_B.device) < self.cond_drop_rate,
+                #     self.num_classes,  # 使用num_classes表示无类别
+                #     label_B
+                # )
+                
+                # 获取类别嵌入（条件嵌入）
+                # sos/cond_BD: (B, D), 其中D是嵌入维度
+                sos = cond_BD = self.class_emb(label_B)
+                
+                # 为序列开始添加位置编码
+                # sos: (B, first_l, D)
+                sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
+                
+                # 构建输入序列
+                if self.prog_si == 0:  # 如果是第一个progressive阶段
+                    x_BLC = sos  # 只使用开始标记
+                else:
+                    # 将开始标记与输入序列拼接
+                    # word_embed将输入映射到与sos相同的嵌入空间
+                    x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+                
+                # 添加层级嵌入和位置编码
+                # lvl_embed: 不同层级的嵌入
+                # pos_1LC: 位置编码
+                x_BLC = x_BLC + self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
+                image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]
         
         # 注意力掩码（用于自回归生成）
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
@@ -375,13 +387,15 @@ class MaskVAR(nn.Module):
         # 通过多个transformer块
         AdaLNSelfAttn.forward  # 这行代码看起来是调试用的，实际没有效果
         for i, b in enumerate(self.blocks):
-            # 每个block包含自注意力和前馈网络
-            # 使用AdaLN（自适应层归一化）结合条件信息
-            # x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-            x_BLC = b(x=x_BLC, cond=image_multiscale_feats, prompt_cond=prompt_embedding, attn_bias=attn_bias)
+            with record_function(f"transformer_block_{i}"):
+                # 每个block包含自注意力和前馈网络
+                # 使用AdaLN（自适应层归一化）结合条件信息
+                # x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+                x_BLC = b(x=x_BLC, cond=image_multiscale_feats, prompt_cond=prompt_embedding, attn_bias=attn_bias)
         
         # 获取最终的logits
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
+        with record_function("get_logits"):
+            x_BLC = self.get_logits(x_BLC.float(), cond_BD)
         
         # 以下代码用于保持计算图完整性，确保梯度正常传播
         if self.prog_si == 0:

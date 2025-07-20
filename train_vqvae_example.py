@@ -14,7 +14,7 @@ from PIL import Image
 import os
 import argparse
 
-from maskseg_build_everything import build_vqvae_single_fewer_stages
+from maskseg_build_everything import build_vqvae_single_4_stages, build_vqvae_single_fewer_stages
 from models.vqvae_single import VQVAE_Single
 from datasets.hqseg44k import HQSeg44KTrainDataset
 
@@ -161,6 +161,7 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
 
 # 创建数据加载器
 dataset = HQSeg44KTrainDataset(data_root='data/sam-hq', transform=transform, )
+print(f'数据集大小: {len(dataset)}')
 sampler = DistributedSampler(dataset) if world_size > 1 else None
 dataloader = DataLoader(
     dataset, 
@@ -172,7 +173,8 @@ dataloader = DataLoader(
     # collate_fn=hqseg44k_collate_fn
 )
 
-model = build_vqvae_single_fewer_stages(args.checkpoint, require_grad=True).to(DEVICE)
+# model = build_vqvae_single_fewer_stages(args.checkpoint, require_grad=True).to(DEVICE)
+model = build_vqvae_single_4_stages(args.checkpoint, require_grad=True).to(DEVICE)
 
 # 将模型包装为DDP模型
 if world_size > 1:
@@ -264,7 +266,7 @@ def visualize_reconstruction(model, dataloader, device, num_samples=5):
             break
 
 # 可视化重建结果
-visualize_reconstruction(model, dataloader, DEVICE)
+# visualize_reconstruction(model, dataloader, DEVICE)
 
 # 清理分布式环境
 if world_size > 1:

@@ -20,3 +20,4 @@ local_output*
 *.ipynb
 data/
 useless/
+logs/
