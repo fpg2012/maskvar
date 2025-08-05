@@ -154,47 +154,49 @@ class MaskVarTrainer(object):
             point_coords.append(coords)
             point_labels.append(labels)
 
-        pred_masks = self.var.module.autoregressive_infer_cfg(
-            B=B,
-            label_B=None,
-            sam_image_embedding=image_embed_sam_BCencHW,
-            points_coords=torch.stack(point_coords).to(device=dist.get_device()),
-            points_labels=torch.stack(point_labels).to(device=dist.get_device()),
-        ) # (B, 1, 256, 256)
+        # interactive sample clicks
 
-        # sample interact clicks for each batch
-        not_click_maps = [np.ones_like(gt_mask_B1HW[i].cpu().numpy()[0], dtype=bool) for i in range(B)]
-        num_clicks = np.random.randint(1, self.interactive_config.num_interactive_clicks+1)
-        for i in range(B):
-            for _ in range(num_clicks):
-                predict_next_click(
-                    gt_mask_B1HW[i].cpu().numpy()[0], 
-                    pred_mask=pred_masks[i].cpu().numpy()[0], 
-                    click_list=click_lists[i], 
-                    not_clicked_map=not_click_maps[i]
-                )
+        # pred_masks = self.var.module.autoregressive_infer_cfg(
+        #     B=B,
+        #     label_B=None,
+        #     sam_image_embedding=image_embed_sam_BCencHW,
+        #     points_coords=torch.stack(point_coords).to(device=dist.get_device()),
+        #     points_labels=torch.stack(point_labels).to(device=dist.get_device()),
+        # ) # (B, 1, 256, 256)
+
+        # # sample interact clicks for each batch
+        # not_click_maps = [np.ones_like(gt_mask_B1HW[i].cpu().numpy()[0], dtype=bool) for i in range(B)]
+        # num_clicks = np.random.randint(1, self.interactive_config.num_interactive_clicks+1)
+        # for i in range(B):
+        #     for _ in range(num_clicks):
+        #         predict_next_click(
+        #             gt_mask_B1HW[i].cpu().numpy()[0], 
+        #             pred_mask=pred_masks[i].cpu().numpy()[0], 
+        #             click_list=click_lists[i], 
+        #             not_clicked_map=not_click_maps[i]
+        #         )
             
-            point_coords.clear()
-            point_labels.clear()
-            for i in range(B):
-                coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
-                point_coords.append(coords)
-                point_labels.append(labels)
+        #     point_coords.clear()
+        #     point_labels.clear()
+        #     for i in range(B):
+        #         coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
+        #         point_coords.append(coords)
+        #         point_labels.append(labels)
 
-            pred_masks = self.var.module.autoregressive_infer_cfg(
-                B=B,
-                label_B=None,
-                sam_image_embedding=image_embed_sam_BCencHW,
-                points_coords=torch.stack(point_coords).to(device=dist.get_device()),
-                points_labels=torch.stack(point_labels).to(device=dist.get_device()),
-            ) # (B, 1, 256, 256)
+        #     pred_masks = self.var.module.autoregressive_infer_cfg(
+        #         B=B,
+        #         label_B=None,
+        #         sam_image_embedding=image_embed_sam_BCencHW,
+        #         points_coords=torch.stack(point_coords).to(device=dist.get_device()),
+        #         points_labels=torch.stack(point_labels).to(device=dist.get_device()),
+        #     ) # (B, 1, 256, 256)
         
-        point_coords.clear()
-        point_labels.clear()
-        for i in range(B):
-            coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
-            point_coords.append(coords)
-            point_labels.append(labels)
+        # point_coords.clear()
+        # point_labels.clear()
+        # for i in range(B):
+        #     coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
+        #     point_coords.append(coords)
+        #     point_labels.append(labels)
 
         return self.train_step(
             it=it, g_it=g_it, stepping=stepping,

@@ -16,9 +16,11 @@ import argparse
 import tensorboard
 from torch.utils.tensorboard import SummaryWriter
 
-from maskseg_build_everything import build_vqvae_single_4_stages, build_vqvae_single_fewer_stages
+from maskseg_build_everything import build_vqvae_single_4_stages, build_vqvae_single_fewer_stages, build_cocolvis_dataset
 from models.vqvae_single import VQVAE_Single
 from datasets.hqseg44k import HQSeg44KTrainDataset
+from datasets.coco_lvis import LvisDataset
+from datasets.mask_level_dataset import MaskLevelDataset
 
 # 添加命令行参数解析
 parser = argparse.ArgumentParser(description='训练VQVAE模型')
@@ -117,9 +119,16 @@ def hqseg44k_datasample_to_mask(sample):
     mask_normalized = mask * 2 - 1
     return mask_normalized.permute(2, 0, 1).contiguous()
 
+def cocolvis_datasample_to_mask(sample):
+    """
+    coco_lvis datasample: (image, image_embed_sam, single_mask_normalized, single_mask)
+    """
+    mask_normalized = sample[2]
+    return mask_normalized.permute(2, 0, 1).contiguous()
+
 # 数据预处理
 transform = transforms.Compose([
-    hqseg44k_datasample_to_mask,
+    cocolvis_datasample_to_mask,
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.RandomVerticalFlip(p=0.5),
     transforms.RandomAffine(15, translate=(0.1, 0.1), scale=(0.9, 1.1)),
@@ -162,17 +171,13 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     return start_epoch
 
 # 创建数据加载器
-dataset = HQSeg44KTrainDataset(data_root='data/sam-hq', transform=transform, )
-print(f'数据集大小: {len(dataset)}')
-sampler = DistributedSampler(dataset) if world_size > 1 else None
+# dataset = HQSeg44KTrainDataset(data_root='data/sam-hq', transform=transform, )
+dataset, val_dataset = build_cocolvis_dataset()
+# print(f'数据集大小: {len(dataset)}')
+# sampler = DistributedSampler(dataset) if world_size > 1 else None
 dataloader = DataLoader(
     dataset, 
-    batch_size=BATCH_SIZE, 
-    shuffle=(sampler is None),
-    num_workers=4,
-    sampler=sampler,
-    pin_memory=True,
-    # collate_fn=hqseg44k_collate_fn
+    batch_size=BATCH_SIZE,
 )
 
 # model = build_vqvae_single_fewer_stages(args.checkpoint, require_grad=True).to(DEVICE)
@@ -191,7 +196,7 @@ if args.checkpoint is not None:
 
 summary_writer = SummaryWriter(f'{args.out_dir}/logs')
 
-def train_epoch(model, dataloader, optimizer, device, epoch, global_iter_num=0):
+def train_epoch(model, dataloader, optimizer, device, epoch, len_dataloader, global_iter_num=0):
     model.train()
     if isinstance(dataloader.sampler, DistributedSampler):
         dataloader.sampler.set_epoch(epoch)
@@ -201,7 +206,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, global_iter_num=0):
     
     for batch in tqdm(dataloader, disable=rank != 0):
         x = batch.to(device)
-        x_recon, usages, vq_loss = model(x, ret_usages=True)
+        x_recon, _, vq_loss = model(x)
         recon_loss = focal_loss(x_recon, x)
         loss = recon_loss + vq_loss
         
@@ -211,10 +216,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, global_iter_num=0):
         
         total_loss += loss.item()
 
-        if global_iter_num % 100 == 0:
-            summary_writer.add_scalar(f'train_loss_{rank}', total_loss / len(dataloader), global_iter_num)
-            for i, usage in enumerate(usages):
-                summary_writer.add_scalar(f'usage_{rank}_stage{i}', usage, global_iter_num)
+        if global_iter_num % 1000 == 0:
+            summary_writer.add_scalar(f'train_loss_{rank}', total_loss / len_dataloader, global_iter_num)
+            summary_writer.add_scalar(f'usage_{rank}', model.module.quantize.usage.item(), global_iter_num)
             summary_writer.add_scalar(f'recons_loss_{rank}', recon_loss.item(), global_iter_num)
             summary_writer.add_scalar(f'vq_loss_{rank}', vq_loss.item(), global_iter_num)
         global_iter_num += 1
@@ -224,19 +228,41 @@ def train_epoch(model, dataloader, optimizer, device, epoch, global_iter_num=0):
         dist.all_reduce(torch.tensor(total_loss).to(device))
         total_loss /= world_size
     
-    return total_loss / len(dataloader), global_iter_num
+    if rank == 0:  # 只在主进程绘图
+        summary_writer.add_scalar('train_loss', total_loss / len_dataloader, epoch)
+    
+    return total_loss / len_dataloader, global_iter_num
+
+# def eval_epoch(model, dataloader, device, epoch, len_dataloader):
+#     if isinstance(model, DDP):
+#         model = model.module
+#     model.eval()
+    
+#     total_loss = 0
+#     focal_loss = NormalizedFocalLoss(alpha=0.5, gamma=2.0).to(device)
+    
+#     for batch in tqdm(dataloader, disable=rank != 0):
+#         x = batch.to(device)
+#         x_recon, usages, vq_loss = model(x)
+#         recon_loss = focal_loss(x_recon, x)
+#         loss = recon_loss + vq_loss
+        
+#         total_loss += loss.item()
+    
+#     return total_loss / len_dataloader
 
 # 训练循环
 train_losses = []
+len_dataloader = dataset.count_masks(world_size=world_size, rank=rank)
 global_iter_num = 0
 for epoch in range(start_epoch, NUM_EPOCHS):
-    epoch_loss, global_iter_num = train_epoch(model, dataloader, optimizer, DEVICE, epoch, global_iter_num)
+    epoch_loss, global_iter_num = train_epoch(model, dataloader, optimizer, DEVICE, epoch, len_dataloader, global_iter_num)
     train_losses.append(epoch_loss)
     
     if rank == 0:  # 只在主进程打印和保存
         print(f'Epoch {epoch+1}/{NUM_EPOCHS}, Loss: {epoch_loss:.4f}')
         
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 2 == 0:
             # 保存checkpoint
             checkpoint = {
                 'epoch': epoch + 1,
@@ -248,9 +274,10 @@ for epoch in range(start_epoch, NUM_EPOCHS):
 def visualize_reconstruction(model, dataloader, device, num_samples=5):
     if rank != 0:  # 只在主进程可视化
         return
-    
+
     if isinstance(model, DDP):
         model = model.module
+    
     model.eval()
     with torch.no_grad():
         for batch in dataloader:
@@ -278,4 +305,3 @@ def visualize_reconstruction(model, dataloader, device, num_samples=5):
 if world_size > 1:
     dist.destroy_process_group()
 
-summary_writer.close()

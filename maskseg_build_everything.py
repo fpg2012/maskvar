@@ -13,7 +13,7 @@ from datasets.coco_lvis import LvisDataset
 from datasets.hqseg44k import HQSeg44KTrainDataset
 
 from functools import partial
-from typing import Optional
+from typing import Optional, Tuple
 
 
 def build_maskseg(vqvae_checkpoint_path: Optional[str] = None, maskgit_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None) -> MaskSeg:
@@ -118,7 +118,32 @@ def build_vqvae_single_4_stages(vqvae_checkpoint_path: Optional[str] = None, req
         z_channels=z_channels,
         ch=base_channels,
         beta=beta,
-        v_patch_nums=(1, 4, 16, 32),
+        v_patch_nums=(1, 8, 16, 32),
+        test_mode=False,
+        ddconfig=dict(in_channels=1, ch_mult=(1, 1, 2, 4), num_res_blocks=2,   # 通道数乘数，用于构建网络层
+                    using_sa=True, using_mid_sa=True,)
+    )
+
+    if vqvae_checkpoint_path is not None:
+        vqvae_state_dict = torch.load(vqvae_checkpoint_path)
+        if 'model_state_dict' in vqvae_state_dict.keys():
+            vqvae_state_dict = vqvae_state_dict['model_state_dict']
+        vqvae.load_state_dict(vqvae_state_dict)
+    
+    return vqvae
+
+def build_vqvae_single_4_stages_v2(vqvae_checkpoint_path: Optional[str] = None, require_grad = False) -> VQVAE_Single:
+    vocab_size = 4096  # 码本大小
+    z_channels = 32   # 潜在空间通道数
+    base_channels = 128  # 基础通道数
+    beta = 0.25  # commitment loss权重
+
+    vqvae = VQVAE_Single(
+        vocab_size=vocab_size,
+        z_channels=z_channels,
+        ch=base_channels,
+        beta=beta,
+        v_patch_nums=(8, 16, 24, 32),
         test_mode=False,
         ddconfig=dict(in_channels=1, ch_mult=(1, 1, 2, 4), num_res_blocks=2,   # 通道数乘数，用于构建网络层
                     using_sa=True, using_mid_sa=True,)
@@ -462,7 +487,7 @@ def build_maskgit_v0(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str]
 
     return maskgit
 
-def build_cocolvis_dataset(dataset_path='data/coco_lvis'):
+def build_cocolvis_dataset(dataset_path='data/coco_lvis') -> Tuple[LvisDataset, LvisDataset]:
     trainset = LvisDataset(
         dataset_path=dataset_path,
         split='train',

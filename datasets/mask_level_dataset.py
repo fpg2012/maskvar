@@ -26,10 +26,14 @@ def count_masks(dataset: LvisDataset | HQSeg44KTrainDataset, world_size=1, rank=
 
 class MaskLevelDataset(IterableDataset):
 
-    def __init__(self, dataset: Optional[LvisDataset | HQSeg44KTrainDataset], sam_encoder: SamImageEncoder, device: str):
+    def __init__(self, dataset: Optional[LvisDataset | HQSeg44KTrainDataset], sam_encoder: Optional[SamImageEncoder], device: str, with_image_embed=True):
         self.dataset = dataset
         self.sam_encoder = sam_encoder
         self.device = device
+        self.with_image_embed = with_image_embed
+        
+        if self.with_image_embed:
+            assert self.sam_encoder is not None
 
         self.pixel_mean = torch.tensor([123.675, 116.28, 103.53]).to(device) # copied from sam
         self.pixel_std = torch.tensor([58.395, 57.12, 57.375]).to(device) # copied from sam
@@ -83,9 +87,11 @@ class MaskLevelDataset(IterableDataset):
         # print(f'image shape: {image.shape}')
 
         # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
-        with torch.no_grad():
-            image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0)
-
+        if self.with_image_embed:
+            with torch.no_grad():
+                image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0)
+        else:
+            image_embed_sam = None
         return image, image_embed_sam
 
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):
