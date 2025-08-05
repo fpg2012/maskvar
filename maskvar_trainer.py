@@ -88,17 +88,39 @@ class MaskVarTrainer(object):
         stt = time.time()
         training = self.var_wo_ddp.training
         self.var_wo_ddp.eval()
-        for inp_B3HW, label_B in ld_val:
-            B, V = inp_B3HW.shape[0], self.vae_local.vocab_size
-            inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
-            # label_B = label_B.to(dist.get_device(), non_blocking=True)
+        for image, image_embed_sam, single_mask_normalized, single_mask in ld_val:
+            B, V = single_mask.shape[0], self.vae_local.vocab_size
+            image = image.to(dist.get_device(), non_blocking=True)
+            image_embed_sam = image_embed_sam.to(dist.get_device(), non_blocking=True)
+            single_mask_normalized = single_mask_normalized.to(dist.get_device(), non_blocking=True)
+            single_mask = single_mask.to(dist.get_device(), non_blocking=True)
+
+            label = torch.zeros(B, device=dist.get_device(), dtype=torch.long)
             
-            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
+            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(single_mask_normalized)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
             x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+
+            # sample clicks
+            click_lists = []
+            for i in range(B):
+                click_list, eroded_mask, dt = init_clicks(single_mask[i].cpu().numpy()[0], num_random_clicks=self.interactive_config.num_random_clicks)
+                click_lists.append(click_list)
+            point_coords = []
+            point_labels = []
+            for i in range(B):
+                coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
+                point_coords.append(coords)
+                point_labels.append(labels)
             
             self.var_wo_ddp.forward
-            logits_BLV = self.var_wo_ddp(label_B, x_BLCv_wo_first_l)
+            logits_BLV = self.var_wo_ddp(
+                label, 
+                x_BLCv_wo_first_l, 
+                image_embed_sam, 
+                points_coords=torch.stack(point_coords).to(device=dist.get_device()), 
+                points_labels=torch.stack(point_labels).to(device=dist.get_device())
+            )
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
             L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
             acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
@@ -116,10 +138,11 @@ class MaskVarTrainer(object):
     def interactive_train_step(
         self, it: int, g_it: int, stepping: bool,
         metric_lg: MetricLogger, tb_lg: TensorboardLogger,
-        gt_mask_B1HW: FTen, 
+        gt_mask_normalized_B1HW: FTen, 
         label_B: Union[ITen, FTen], 
         prog_si: int, prog_wp_it: float,
         image_embed_sam_BCencHW: FTen,
+        gt_mask_B1HW,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         """
         Interactive training step.
@@ -130,17 +153,18 @@ class MaskVarTrainer(object):
             stepping: 是否执行optimizer step（梯度累积时可能需要跳过）
             metric_lg: 指标记录器
             tb_lg: TensorBoard记录器
-            gt_mask_B1HW: 输入gt mask，形状(B, 1, H, W)
+            gt_mask_normalized_B1HW: 输入gt mask，形状(B, 1, H, W)
             label_B: 标签，形状(B, L)
             prog_si: 当前progressive training阶段索引
             prog_wp_it: 当前progressive阶段的warmup迭代数
             image_embed_sam_BCencHW: 输入的SAM特征，形状(B, C_enc, H, W)
+            gt_mask_B1HW: 输入gt mask，形状(B, 1, H, W)，0-1mask，未归一化
 
         Returns:
             grad_norm: 梯度范数
             scale_log2: 混合精度训练的scaler的log2值
         """
-        B = gt_mask_B1HW.shape[0]
+        B = gt_mask_normalized_B1HW.shape[0]
         # sample init clicks for each batch
         click_lists = []
         for i in range(B):
@@ -201,7 +225,7 @@ class MaskVarTrainer(object):
         return self.train_step(
             it=it, g_it=g_it, stepping=stepping,
             metric_lg=metric_lg, tb_lg=tb_lg,
-            gt_mask_B1HW=gt_mask_B1HW,
+            gt_mask_B1HW=gt_mask_normalized_B1HW,
             label_B=None,
             prog_si=prog_si, prog_wp_it=prog_wp_it,
             image_embed_sam_BCencHW=image_embed_sam_BCencHW,

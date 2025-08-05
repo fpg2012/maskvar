@@ -5,6 +5,7 @@ import sys
 import time
 import warnings
 from functools import partial
+from itertools import islice, cycle
 
 from models.vqvae_single import VQVAE_Single
 import torch
@@ -84,6 +85,9 @@ def build_everything(args: arg_util.Args):
     # iters_train = count_masks(train_set, world_size=tdist.get_world_size(), rank=tdist.get_rank())
     iters_train = train_set.count_masks(world_size=tdist.get_world_size(), rank=tdist.get_rank())
     # iters_val = count_masks(val_set)
+    max_iters_train = train_set.max_count_masks(world_size=tdist.get_world_size())
+    # max_iters_train = 100 # for debug only
+    iters_train = max_iters_train
 
     train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size)
     val_dataloader = DataLoader(val_set_masklevel, batch_size=args.batch_size)
@@ -205,9 +209,11 @@ def main_training():
                 # noinspection PyArgumentList
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
+
+        ld_train_iter = islice(cycle(ld_train), iters_train)
         
         stats, (sec, remain_time, finish_time) = train_one_ep(
-            ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
+            ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train_iter, iters_train, trainer
         )
         
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
@@ -218,7 +224,8 @@ def main_training():
         args.remain_time, args.finish_time = remain_time, finish_time
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
-        is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
+        # is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
+        is_val_and_also_saving = True
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
@@ -347,8 +354,8 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
             # Perform a single training step
             grad_norm, scale_log2 = trainer.interactive_train_step(
                 it=it, g_it=g_it, stepping=stepping, metric_lg=me, tb_lg=tb_lg,
-                gt_mask_B1HW=inp, label_B=label, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
-                image_embed_sam_BCencHW=image_embed_sam,
+                gt_mask_normalized_B1HW=inp, label_B=label, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
+                image_embed_sam_BCencHW=image_embed_sam, gt_mask_B1HW=single_mask,
             )
             
             # Update metrics and learning rate
