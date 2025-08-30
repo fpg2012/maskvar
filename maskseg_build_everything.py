@@ -59,6 +59,35 @@ def build_maskvar(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_pa
     ).to(device)
     return vqvae, maskvar, sam_image_encoder
 
+def build_maskvar_v2(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, flash_if_available: bool = False, device='cpu'):
+    vqvae = build_vqvae_single_4_stages_v2(vqvae_checkpoint_path).to(device)
+    sam_image_encoder = build_sam_image_encoder(sam_checkpoint_path).to(device)
+    var_image_encoder = build_var_image_encoder().to(device)
+    prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
+    maskvar = MaskVAR(
+        vae_local=vqvae, 
+        image_encoder=var_image_encoder, 
+        prompt_encoder=prompt_encoder,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=16,
+        mlp_ratio=4.,
+        drop_rate=0.1,
+        attn_drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=(8, 16, 24, 32),
+        flash_if_available=flash_if_available,
+        fused_if_available=True,
+        image_encoder_requires_grad=True,
+        prompt_encoder_requires_grad=False,
+    ).to(device)
+    return vqvae, maskvar, sam_image_encoder
+
 def build_vqvae_single(vqvae_checkpoint_path: Optional[str] = None, require_grad = False) -> VQVAE_Single:
     vocab_size = 4096  # 码本大小
     z_channels = 32   # 潜在空间通道数
@@ -144,6 +173,31 @@ def build_vqvae_single_4_stages_v2(vqvae_checkpoint_path: Optional[str] = None, 
         ch=base_channels,
         beta=beta,
         v_patch_nums=(8, 16, 24, 32),
+        test_mode=False,
+        ddconfig=dict(in_channels=1, ch_mult=(1, 1, 2, 4), num_res_blocks=2,   # 通道数乘数，用于构建网络层
+                    using_sa=True, using_mid_sa=True,)
+    )
+
+    if vqvae_checkpoint_path is not None:
+        vqvae_state_dict = torch.load(vqvae_checkpoint_path)
+        if 'model_state_dict' in vqvae_state_dict.keys():
+            vqvae_state_dict = vqvae_state_dict['model_state_dict']
+        vqvae.load_state_dict(vqvae_state_dict)
+    
+    return vqvae
+
+def build_vqvae_single_4_stages_4_slices(vqvae_checkpoint_path: Optional[str] = None, require_grad=False) -> VQVAE_Single:
+    vocab_size = 4096  # 码本大小
+    z_channels = 32   # 潜在空间通道数
+    base_channels = 128  # 基础通道数
+    beta = 0.25  # commitment loss权重
+
+    vqvae = VQVAE_Single(
+        vocab_size=vocab_size,
+        z_channels=z_channels,
+        ch=base_channels,
+        beta=beta,
+        v_patch_nums=(4, 8, 12, 16),
         test_mode=False,
         ddconfig=dict(in_channels=1, ch_mult=(1, 1, 2, 4), num_res_blocks=2,   # 通道数乘数，用于构建网络层
                     using_sa=True, using_mid_sa=True,)

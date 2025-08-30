@@ -91,7 +91,7 @@ class MaskLevelDataset(IterableDataset):
             with torch.no_grad():
                 image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0)
         else:
-            image_embed_sam = None
+            image_embed_sam = 0
         return image, image_embed_sam
 
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):

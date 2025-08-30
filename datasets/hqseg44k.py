@@ -10,10 +10,11 @@ import cv2
 from datasets.instance_info import InstanceInfo
 
 class HQSeg44KTrainDataset(torch.utils.data.Dataset):
-    def __init__(self, data_root='datasets/sam-hq', transform=None):
+    def __init__(self, data_root='datasets/sam-hq', transform=None, img_size=(256, 256)):
         self.data_root = Path(data_root)
         self.transform = transform
         self.data_list = []
+        self.img_size = img_size
         
         # 定义子目录
         self.subdirs = [
@@ -76,8 +77,8 @@ class HQSeg44KTrainDataset(torch.utils.data.Dataset):
         mask = mask[:size, :size]  # 裁剪掩码
         
         # 缩放到256x256（图像和掩码同步缩放）
-        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_LINEAR)  # 形状为 (256, 256, 3)
-        mask = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_NEAREST)  # 形状为 (256, 256)
+        img = cv2.resize(img, self.img_size, interpolation=cv2.INTER_LINEAR)  # 形状为 (256, 256, 3)
+        mask = cv2.resize(mask, self.img_size, interpolation=cv2.INTER_NEAREST)  # 形状为 (256, 256)
 
         mask = np.expand_dims(mask, axis=-1)  # 形状为 (256, 256, 1)
         
@@ -97,7 +98,7 @@ class HQSeg44KTrainDataset(torch.utils.data.Dataset):
         return img, mask, instances_info  # 格式: (image, layers, instances_info)
     
 class HQSeg44KTestDataset(torch.utils.data.Dataset):
-    def __init__(self, data_root='datasets/sam-hq'):
+    def __init__(self, data_root='datasets/sam-hq', transform=None, img_size=(256, 256)):
         """
         初始化测试数据集。
 
@@ -115,6 +116,7 @@ class HQSeg44KTestDataset(torch.utils.data.Dataset):
             'thin_object_detection/ThinObject5K/',
             'DIS5K/DIS-VD'
         ]
+        self.img_size = img_size
         
         # 加载数据列表
         self._load_data_list()
@@ -176,8 +178,8 @@ class HQSeg44KTestDataset(torch.utils.data.Dataset):
         mask = mask[:size, :size]  # 裁剪掩码
         
         # 缩放到256x256（图像和掩码同步缩放）
-        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_LINEAR)  # 形状为 (256, 256, 3)
-        mask = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_NEAREST)  # 形状为 (256, 256)
+        img = cv2.resize(img, self.img_size, interpolation=cv2.INTER_LINEAR)  # 形状为 (256, 256, 3)
+        mask = cv2.resize(mask, self.img_size, interpolation=cv2.INTER_NEAREST)  # 形状为 (256, 256)
 
         mask = np.expand_dims(mask, axis=-1)  # 形状为 (256, 256, 1)
         

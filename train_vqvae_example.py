@@ -16,7 +16,12 @@ import argparse
 import tensorboard
 from torch.utils.tensorboard import SummaryWriter
 
-from maskseg_build_everything import build_vqvae_single_4_stages, build_vqvae_single_fewer_stages
+from maskseg_build_everything import (
+    build_vqvae_single_4_stages, 
+    build_vqvae_single_fewer_stages, 
+    build_vqvae_single_4_stages_v2,
+    build_vqvae_single_4_stages_4_slices
+)
 from models.vqvae_single import VQVAE_Single
 from datasets.hqseg44k import HQSeg44KTrainDataset
 
@@ -28,6 +33,7 @@ parser.add_argument('--num_epochs', type=int, default=8, help='总训练epoch数
 parser.add_argument('--batch_size', type=int, default=8, help='批次大小')
 parser.add_argument('--learning_rate', type=float, default=1e-4, help='学习率')
 parser.add_argument('--out_dir', type=str, default='out', help='保存模型的目录')
+parser.add_argument('--division', type=int, default=1, help='一张图沿边切几份')
 args = parser.parse_args()
 
 os.makedirs(args.out_dir, exist_ok=True)
@@ -64,6 +70,8 @@ VOCAB_SIZE = 4096  # 码本大小
 Z_CHANNELS = 32   # 潜在空间通道数
 BASE_CHANNELS = 128  # 基础通道数
 BETA = 0.25  # commitment loss权重
+
+DIVISION = args.division
 
 class NormalizedFocalLoss(nn.Module):
     def __init__(self, alpha=0.5, gamma=2.0, eps=torch.finfo(torch.float).eps):
@@ -176,7 +184,9 @@ dataloader = DataLoader(
 )
 
 # model = build_vqvae_single_fewer_stages(args.checkpoint, require_grad=True).to(DEVICE)
-model = build_vqvae_single_4_stages(args.checkpoint, require_grad=True).to(DEVICE)
+# model = build_vqvae_single_4_stages(args.checkpoint, require_grad=True).to(DEVICE)
+# model = build_vqvae_single_4_stages_v2(args.checkpoint, require_grad=True).to(DEVICE)
+model = build_vqvae_single_4_stages_4_slices(args.checkpoint, require_grad=True).to(DEVICE)
 
 # 将模型包装为DDP模型
 if world_size > 1:
@@ -191,6 +201,13 @@ if args.checkpoint is not None:
 
 summary_writer = SummaryWriter(f'{args.out_dir}/logs')
 
+def divide_image(x_0, division):
+    B, C, H, W = x_0.shape
+    x = x_0.unfold(2, H//division, H//division).unfold(3, W//division, W//division)
+    x = x.contiguous().view(B, C, -1, H//division, W//division)
+    x = x.permute(2, 0, 1, 3, 4).contiguous().view(-1, C, H//division, W//division)
+    return x
+
 def train_epoch(model, dataloader, optimizer, device, epoch, global_iter_num=0):
     model.train()
     if isinstance(dataloader.sampler, DistributedSampler):
@@ -200,7 +217,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, global_iter_num=0):
     focal_loss = NormalizedFocalLoss(alpha=0.5, gamma=2.0).to(device)
     
     for batch in tqdm(dataloader, disable=rank != 0):
-        x = batch.to(device)
+        x_0 = batch.to(device)
+        # x_0 shape: (B, C, H, W)
+        if DIVISION == 1:
+            x = x_0
+        else:
+            x = divide_image(x_0, DIVISION)
         x_recon, usages, vq_loss = model(x, ret_usages=True)
         recon_loss = focal_loss(x_recon, x)
         loss = recon_loss + vq_loss

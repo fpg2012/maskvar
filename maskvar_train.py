@@ -123,9 +123,13 @@ def build_everything(args: arg_util.Args):
     )
     del names, paras, para_groups
     
+    patch_nums = var_wo_ddp.patch_nums
+    assert isinstance(patch_nums, (list, tuple)) and len(patch_nums) > 0, \
+        f'patch_nums must be a list or tuple with at least one element, got {type(patch_nums)} with length {len(patch_nums)}'
+    
     # build trainer
     trainer = MaskVarTrainer(
-        device=args.device, patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32), resos=args.resos,
+        device=args.device, patch_nums=patch_nums, resos=args.resos,
         vae_local=vae_local, var_wo_ddp=var_wo_ddp, var=var,
         var_opt=var_optim, label_smooth=args.ls,
         interactive_config=InteractiveConfig(2, 10),
@@ -188,6 +192,8 @@ def main_training():
         start_ep, start_it,
         iters_train, ld_train, ld_val
     ) = build_everything(args)
+    
+    args.patch_nums = trainer.patch_nums
     
     # 开始训练
     start_time = time.time()
