@@ -1,3 +1,5 @@
+# Example usgae
+# torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=11134 train_vqvae_example.py --num_epochs 50 --batch_size 4 --out_dir out_vqvae_4_slices --division 2
 import torch
 import torch.nn as nn
 import torch.optim as optim

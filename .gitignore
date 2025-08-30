@@ -22,4 +22,7 @@ data/
 useless/
 logs/
 vis_vqvae*/
-out_*/
+out*/
+__pycache__/
+.vscode/
+data/
