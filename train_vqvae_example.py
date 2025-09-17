@@ -22,7 +22,8 @@ from maskseg_build_everything import (
     build_vqvae_single_4_stages, 
     build_vqvae_single_fewer_stages, 
     build_vqvae_single_4_stages_v2,
-    build_vqvae_single_4_stages_4_slices
+    build_vqvae_single_4_stages_4_slices,
+    build_vqvae_single_4_stages_4_slices_v2,
 )
 from models.vqvae_single import VQVAE_Single
 from datasets.hqseg44k import HQSeg44KTrainDataset
@@ -188,7 +189,8 @@ dataloader = DataLoader(
 # model = build_vqvae_single_fewer_stages(args.checkpoint, require_grad=True).to(DEVICE)
 # model = build_vqvae_single_4_stages(args.checkpoint, require_grad=True).to(DEVICE)
 # model = build_vqvae_single_4_stages_v2(args.checkpoint, require_grad=True).to(DEVICE)
-model = build_vqvae_single_4_stages_4_slices(args.checkpoint, require_grad=True).to(DEVICE)
+# model = build_vqvae_single_4_stages_4_slices(args.checkpoint, require_grad=True).to(DEVICE)
+model = build_vqvae_single_4_stages_4_slices_v2(args.checkpoint, require_grad=True).to(DEVICE)
 
 # 将模型包装为DDP模型
 if world_size > 1:
