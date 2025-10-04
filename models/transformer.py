@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.attention import flex_attention
 import warnings
 
 try:
@@ -11,6 +12,9 @@ except ImportError:
     warnings.warn("xformers not found, using PyTorch scaled_dot_product_attention")
 
 class Attention(nn.Module):
+    """
+    Self-attention with attention mask
+    """
     
     def __init__(self, dim, num_heads, max_seq_len=512):
         super(Attention, self).__init__()
@@ -22,27 +26,13 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3)
         self.out_proj = nn.Linear(dim, dim)
     
-    def forward(self, x):
+    def forward(self, x, block_mask=None):
         B, L, C = x.shape
         # 生成QKV (B, L, 3, nH, head_dim)
         qkv = self.qkv(x).view(B, L, 3, self.num_heads, self.head_dim)
-
-        # 计算注意力
-        if XFORMERS_AVAILABLE and x.device.type != "cpu":
-            # 将 qkv 转换为 xformers 需要的格式
-            # 从 (B, L, 3, nH, head_dim) 转换为 (3, B, L, nH, head_dim)
-            q, k, v = qkv.permute(2, 0, 1, 3, 4).unbind(0)
-            # 现在 q,k,v 的形状都是 (B, L, nH, head_dim)
-            # 需要转换为 xformers 要求的 (B, L, nH, head_dim) 格式
-            y = xops.memory_efficient_attention(q, k, v, attn_bias=None)
-        else:
-            # 使用 PyTorch scaled_dot_product_attention
-            # 首先将 qkv 转换为 (3, B, nH, L, head_dim)
-            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-            # 现在 q,k,v 的形状都是 (B, nH, L, head_dim)，符合 scaled_dot_product_attention 的要求
-            y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
-            # y 的形状是 (B, nH, L, head_dim)，需要转换为 (B, L, nH, head_dim)
-            y = y.transpose(1, 2)
+        
+        q, k, v = qkv.permute(2, 0, 1, 3, 4).unbind(0)
+        y = flex_attention(q, k, v, block_mask=block_mask)
 
         y = y.contiguous().view(B, L, C)
         # 调整维度并合并
@@ -50,7 +40,10 @@ class Attention(nn.Module):
         return y
 
 class CrossAttention(nn.Module):
-
+    """
+    Cross-attention with attention mask
+    """
+    
     def __init__(self, dim, num_heads):
         super(CrossAttention, self).__init__()
         self.dim = dim
@@ -61,7 +54,7 @@ class CrossAttention(nn.Module):
         self.kv = nn.Linear(dim, dim*2)
         self.out_proj = nn.Linear(dim, dim)
     
-    def forward(self, query: torch.Tensor, key: torch.Tensor):
+    def forward(self, query: torch.Tensor, key: torch.Tensor, block_mask=None):
         B, Lq, C = query.shape
         _, Lk, _ = key.shape
         
@@ -73,21 +66,7 @@ class CrossAttention(nn.Module):
         kv = self.kv(key).view(B, Lk, 2, self.num_heads, self.head_dim)
         k, v = kv.permute(2, 0, 1, 3, 4).unbind(0)
         
-        if XFORMERS_AVAILABLE and query.device.type != "cpu":
-            # q: (B, Lq, nH, head_dim)
-            # k,v: (B, Lk, nH, head_dim)
-            # 这些维度已经符合 xformers 的要求
-            y = xops.memory_efficient_attention(q, k, v, attn_bias=None)
-        else:
-            # 使用 PyTorch scaled_dot_product_attention
-            # 需要将 q,k,v 转换为 (B, nH, L, head_dim) 格式
-            q = q.transpose(1, 2)  # (B, nH, Lq, head_dim)
-            k = k.transpose(1, 2)  # (B, nH, Lk, head_dim)
-            v = v.transpose(1, 2)  # (B, nH, Lk, head_dim)
-            
-            y = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
-            # y 的形状是 (B, nH, Lq, head_dim)，需要转换为 (B, Lq, nH, head_dim)
-            y = y.transpose(1, 2)
+        y = flex_attention(q, k, v, block_mask=block_mask)
         
         # y: (B, Lq, nH, head_dim) -> (B, Lq, C)
         y = y.contiguous().view(B, Lq, C)
@@ -96,7 +75,7 @@ class CrossAttention(nn.Module):
 
 class BlockSimple(nn.Module):
     
-    def __init__(self, dim, num_heads, dropout=0.1):
+    def __init__(self, dim, num_heads, dropout=0.1, block_mask=None):
         super(BlockSimple, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -111,9 +90,10 @@ class BlockSimple(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.layer_norm1 = nn.LayerNorm(dim)
         self.layer_norm2 = nn.LayerNorm(dim)
+        self.block_mask = block_mask
     
     def forward(self, x):
-        x = self.attn(x) + x
+        x = self.attn(x, block_mask=self.block_mask) + x
         x = self.dropout1(x)
         x = self.layer_norm1(x)
         x = self.ffn(x) + x
@@ -123,7 +103,7 @@ class BlockSimple(nn.Module):
 
 class BlockCross(nn.Module):
 
-    def __init__(self, dim, num_heads, dropout=0.1):
+    def __init__(self, dim, num_heads, dropout=0.1, block_mask=None):
         super(BlockCross, self).__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -138,9 +118,10 @@ class BlockCross(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.layer_norm1 = nn.LayerNorm(dim)
         self.layer_norm2 = nn.LayerNorm(dim)
-    
+        self.block_mask = block_mask
+
     def forward(self, x, key):
-        x = self.attn(x, key) + x
+        x = self.attn(x, key, block_mask=self.block_mask) + x
         x = self.dropout1(x)
         x = self.layer_norm1(x)
         x = self.ffn(x) + x

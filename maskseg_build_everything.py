@@ -3,6 +3,7 @@ import torch
 from models.vqvae_single import VQVAE_Single
 from models.maskgit import MaskGIT
 from models.maskseg import MaskSeg
+from models.flex_maskvar import FlexMaskVAR
 from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
 from models.prompt_encoder import PromptEncoder
 from models.image_encoder import ImageEncoder, VarImageEncoder, NeckFPN
@@ -54,6 +55,62 @@ def build_maskvar(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_pa
         patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32),
         flash_if_available=flash_if_available,
         fused_if_available=True,
+        image_encoder_requires_grad=True,
+        prompt_encoder_requires_grad=False,
+    ).to(device)
+    return vqvae, maskvar, sam_image_encoder
+
+def build_maskvar_flex(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, device='cpu'):
+    patch_num = (1, 2, 4, 8, 12, 16, 20, 24, 28, 32)
+    vqvae = build_vqvae_single(vqvae_checkpoint_path).to(device)
+    sam_image_encoder = build_sam_image_encoder(sam_checkpoint_path).to(device)
+    var_image_encoder = build_var_image_encoder().to(device)
+    prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
+    maskvar = FlexMaskVAR(
+        vae_local=vqvae, 
+        image_encoder=var_image_encoder, 
+        prompt_encoder=prompt_encoder,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=16,
+        mlp_ratio=4.,
+        drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=patch_num,
+        # fused_if_available=True,
+        image_encoder_requires_grad=True,
+        prompt_encoder_requires_grad=False,
+    ).to(device)
+    return vqvae, maskvar, sam_image_encoder
+
+def build_maskvar_flex_v2(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, device='cpu'):
+    patch_nums = (8, 16, 24, 32)
+    
+    vqvae = build_vqvae_single_4_stages_v2(vqvae_checkpoint_path).to(device)
+    sam_image_encoder = build_sam_image_encoder(sam_checkpoint_path).to(device)
+    var_image_encoder = build_var_image_encoder(patch_nums=patch_nums).to(device)
+    prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
+    maskvar = FlexMaskVAR(
+        vae_local=vqvae, 
+        image_encoder=var_image_encoder, 
+        prompt_encoder=prompt_encoder,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=16,
+        mlp_ratio=4.,
+        drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=patch_nums,
         image_encoder_requires_grad=True,
         prompt_encoder_requires_grad=False,
     ).to(device)
