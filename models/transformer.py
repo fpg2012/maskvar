@@ -1,12 +1,14 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import warnings
 
 try:
     import xformers.ops as xops
     XFORMERS_AVAILABLE = True
 except ImportError:
     XFORMERS_AVAILABLE = False
+    warnings.warn("xformers not found, using PyTorch scaled_dot_product_attention")
 
 class Attention(nn.Module):
     
@@ -46,7 +48,7 @@ class Attention(nn.Module):
         # 调整维度并合并
         y = self.out_proj(y)
         return y
-    
+
 class CrossAttention(nn.Module):
 
     def __init__(self, dim, num_heads):

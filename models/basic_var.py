@@ -277,6 +277,7 @@ class CrossAttn(nn.Module):
         self.fused_add_norm_fn = None
     
     # TODO: add AdaLN
+    # TODO: windowed attention for cross-attention
     # NOTE: attn_bias is None during inference because kv cache is enabled
     def forward(self, x, cond, prompt_cond, attn_bias):   # C: embed_dim, D: cond_dim
         # if self.shared_aln:
@@ -286,14 +287,20 @@ class CrossAttn(nn.Module):
         # x = x + self.drop_path(self.self_attn( self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1), attn_bias=attn_bias ).mul_(gamma1))
         # x = x + self.drop_path(self.ffn2( self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed when FusedMLP is used
         
-        x = x + self.drop_path(self.attn(x, cond, attn_bias=attn_bias))
-        x = x + self.drop_path(self.ffn(x))
+        with record_function("RefCrossAttn"):
+            x = x + self.drop_path(self.attn(x, cond, attn_bias=attn_bias))
+        with record_function("RefCrossFFN"):
+            x = x + self.drop_path(self.ffn(x))
 
-        x = x + self.drop_path(self.prompt_attn(x, prompt_cond))
-        x = x + self.drop_path(self.ffn2(x))
+        with record_function("PromptCrossAttn"):
+            x = x + self.drop_path(self.prompt_attn(x, prompt_cond))
+        with record_function("PromptCrossFFN"):
+            x = x + self.drop_path(self.ffn2(x))
 
-        x = x + self.drop_path(self.self_attn(x, attn_bias=attn_bias))
-        x = x + self.drop_path(self.ffn3(x))
+        with record_function("SelfAttn"):
+            x = x + self.drop_path(self.self_attn(x, attn_bias=attn_bias))
+        with record_function("SelfFFN"):
+            x = x + self.drop_path(self.ffn3(x))
         return x
     
     def extra_repr(self) -> str:

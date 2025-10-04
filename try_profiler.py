@@ -1,4 +1,4 @@
-from maskseg_build_everything import build_maskvar, build_cocolvis_dataset, build_prompt_encoder
+from maskseg_build_everything import build_maskvar, build_cocolvis_dataset, build_prompt_encoder, build_maskvar_v2
 from utils.timer import profile_timer
 from torch.profiler import profile, ProfilerActivity, schedule, tensorboard_trace_handler, record_function
 from torch.utils.data import DataLoader
@@ -97,8 +97,15 @@ if __name__ == "__main__":
     device = args.device
     batch_size = args.batch_size
 
-    vqvae, maskvar, sam_image_encoder = build_maskvar(
-        vqvae_checkpoint_path="ckpt/vqvae_single.pth",
+    # vqvae, maskvar, sam_image_encoder = build_maskvar(
+    #     vqvae_checkpoint_path="ckpt/vqvae_single.pth",
+    #     sam_checkpoint_path="ckpt/sam_vit_b_01ec64.pth",
+    #     flash_if_available=True,
+    #     device=device
+    # )
+    
+    vqvae, maskvar, sam_image_encoder = build_maskvar_v2(
+        vqvae_checkpoint_path="out_vqvae_4_stages_2/ckpt/vqvae_single_epoch_40.pth",
         sam_checkpoint_path="ckpt/sam_vit_b_01ec64.pth",
         flash_if_available=True,
         device=device

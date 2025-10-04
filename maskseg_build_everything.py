@@ -60,7 +60,38 @@ def build_maskvar(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_pa
     return vqvae, maskvar, sam_image_encoder
 
 def build_maskvar_v2(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, flash_if_available: bool = False, device='cpu'):
+    patch_nums = (8, 16, 24, 32)
+    
     vqvae = build_vqvae_single_4_stages_v2(vqvae_checkpoint_path).to(device)
+    sam_image_encoder = build_sam_image_encoder(sam_checkpoint_path).to(device)
+    var_image_encoder = build_var_image_encoder(patch_nums=patch_nums).to(device)
+    prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
+    maskvar = MaskVAR(
+        vae_local=vqvae, 
+        image_encoder=var_image_encoder, 
+        prompt_encoder=prompt_encoder,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=16,
+        mlp_ratio=4.,
+        drop_rate=0.1,
+        attn_drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=patch_nums,
+        flash_if_available=flash_if_available,
+        fused_if_available=True,
+        image_encoder_requires_grad=True,
+        prompt_encoder_requires_grad=False,
+    ).to(device)
+    return vqvae, maskvar, sam_image_encoder
+
+def build_maskvar_v3(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, flash_if_available: bool = False, device='cpu'):
+    vqvae = build_vqvae_single_4_stages_4_slices_v2(vqvae_checkpoint_path).to(device)
     sam_image_encoder = build_sam_image_encoder(sam_checkpoint_path).to(device)
     var_image_encoder = build_var_image_encoder().to(device)
     prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
@@ -236,13 +267,13 @@ def build_vqvae_single_4_stages_4_slices_v2(vqvae_checkpoint_path: Optional[str]
     
     return vqvae
 
-def build_var_image_encoder() -> VarImageEncoder:
+def build_var_image_encoder(patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32)) -> VarImageEncoder:
     neck_fpn = NeckFPN(
         embed_dim=256, 
         in_dim=256, 
         in_size=(64, 64),
         real_size=(256, 256),
-        patch_nums=(1, 2, 4, 8, 12, 16, 20, 24, 28, 32)
+        patch_nums=patch_nums,
     )
     var_image_encoder = VarImageEncoder(neck_fpn)
     return var_image_encoder

@@ -17,7 +17,12 @@ from utils import arg_util, misc
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils.misc import auto_resume
 
-from maskseg_build_everything import build_cocolvis_dataset, build_vqvae_single, build_maskvar
+from maskseg_build_everything import (
+    build_cocolvis_dataset,
+    build_vqvae_single,
+    build_maskvar,
+    build_maskvar_v2,
+)
 from maskvar_trainer import InteractiveConfig, MaskVarTrainer
 from models.maskvar import MaskVAR
 from datasets.mask_level_dataset import MaskLevelDataset, count_masks
@@ -61,7 +66,8 @@ def build_everything(args: arg_util.Args):
 
     # !TODO: replace with custom model
     # 构建VAE和VAR模型
-    vae_local, var_wo_ddp, sam_image_encoder = build_maskvar('ckpt/vqvae_single.pth', 'ckpt/sam_vit_b_01ec64.pth', flash_if_available=True, device=args.device) 
+    # vae_local, var_wo_ddp, sam_image_encoder = build_maskvar('ckpt/vqvae_single.pth', 'ckpt/sam_vit_b_01ec64.pth', flash_if_available=True, device=args.device) 
+    vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_v2('out_vqvae_4_stages_2/ckpt/vqvae_single_epoch_40.pth', 'ckpt/sam_vit_b_01ec64.pth', flash_if_available=True, device=args.device) 
     
     dist.barrier()
     # !TODO: load state dict
