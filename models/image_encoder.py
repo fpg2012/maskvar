@@ -29,10 +29,12 @@ class NeckFPN(nn.Module):
         """
         super().__init__()
         self.patch_nums = patch_nums
-        self.adapt_convs = nn.ModuleList([
-            nn.Conv2d(in_dim, embed_dim, kernel_size=(in_size[0]//pn, in_size[1]//pn), stride=(in_size[0]//pn, in_size[1]//pn))
-            for pn in patch_nums
-        ])
+        # self.adapt_convs = nn.ModuleList([
+        #     # nn.Conv2d(in_dim, embed_dim, kernel_size=(in_size[0]//pn, in_size[1]//pn), stride=(in_size[0]//pn, in_size[1]//pn))
+        #     nn.Conv2d(in_dim, embed_dim, kernel_size=(3, 3), padding=1)
+        #     for pn in patch_nums
+        # ])
+        self.adapt_conv = nn.Conv2d(in_dim, embed_dim, kernel_size=(3, 3), padding=1)
         self.in_size = in_size
         self.real_size = real_size
     
@@ -45,16 +47,29 @@ class NeckFPN(nn.Module):
         B, H, W, C = x.shape
         multiscale_feats = []
         x = x.permute(0, 3, 1, 2) # (B, C, H, W)
-        for i, conv in enumerate(self.adapt_convs):
-            pn = self.patch_nums[i]
-            x1 = conv(x)
+        x1 = self.adapt_conv(x) + x
+        
+        for i, pn in enumerate(self.patch_nums):
             x1_interpolated = F.interpolate(x1, size=(pn, pn), mode='bilinear', align_corners=False)
-
-            # print(f'x1_interpolated.shape: {x1_interpolated.shape}, pe_grid[{i}].shape: {pe_grids[i].shape}')
-
+            x1_reverse = F.interpolate(x1_interpolated, size=(H, W), mode='bilinear', align_corners=False)
+            
             x1_interpolated = x1_interpolated.permute(0, 2, 3, 1) + pe_grids[i].unsqueeze(0).to(x1_interpolated.device)
-            x1_interpolated = x1_interpolated.view(B, -1, C)
+            x1_interpolated = x1_interpolated.view(B, -1, C).contiguous()
             multiscale_feats.append(x1_interpolated)
+            
+            x1_resi = x1 - x1_reverse
+            x1 = x1_resi
+        
+        # for i, conv in enumerate(self.adapt_convs):
+        #     pn = self.patch_nums[i]
+        #     x1 = conv(x)
+        #     x1_interpolated = F.interpolate(x1, size=(pn, pn), mode='bilinear', align_corners=False)
+
+        #     # print(f'x1_interpolated.shape: {x1_interpolated.shape}, pe_grid[{i}].shape: {pe_grids[i].shape}')
+
+        #     x1_interpolated = x1_interpolated.permute(0, 2, 3, 1) + pe_grids[i].unsqueeze(0).to(x1_interpolated.device)
+        #     x1_interpolated = x1_interpolated.view(B, -1, C)
+        #     multiscale_feats.append(x1_interpolated)
         return multiscale_feats
 
 class VarImageEncoder(nn.Module):

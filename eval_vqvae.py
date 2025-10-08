@@ -24,6 +24,7 @@ from maskseg_build_everything import (
     build_vqvae_single_fewer_stages,
     build_vqvae_single_4_stages_4_slices,
     build_vqvae_single_4_stages_4_slices_v2,
+    build_vqvae_single_5_stages_v1
 )
 from typing import List, Optional, Dict, Tuple
 from utils.metrics import calc_iou
@@ -140,10 +141,13 @@ if __name__ == '__main__':
         build_vqvae = build_vqvae_single_4_stages_4_slices
     elif args.vqvae_config == 'single_4_stages_4_slices_v2':
         build_vqvae = build_vqvae_single_4_stages_4_slices_v2
+    elif args.vqvae_config == 'single_5_stages_v1':
+        build_vqvae = build_vqvae_single_5_stages_v1
     else:
         raise ValueError(f'Unknown vqvae config: {args.vqvae_config}')
 
     vqvae = build_vqvae(args.ckpt)
+    vqvae = torch.compile(vqvae)
     evaluator = VQVAE_Evaluator(vqvae, args.batch_size, args.low_iou_thresh, args.device, args.division)
     if args.dataset == 'lvis_val':
         dataset = LvisDataset(dataset_path='data/coco_lvis', split='val', img_split='val')

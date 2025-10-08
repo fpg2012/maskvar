@@ -162,7 +162,7 @@ class SelfAttention_v2(nn.Module):
         main_type = qkv.dtype
         # qkv: BL3Hc
         
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); dim_cat = 2               # q or k or v: BHLc
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).contiguous().unbind(dim=0); dim_cat = 2               # q or k or v: BHLc
         
         if self.attn_l2_norm:
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
@@ -323,9 +323,9 @@ class CrossAttention_v2(nn.Module):
         main_type = q.dtype
         
         # q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
-        q = q.permute(2, 0, 3, 1, 4).view(B, self.num_heads, L, self.head_dim)
-        k = k.permute(2, 0, 3, 1, 4).view(B, self.num_heads, -1, self.head_dim)
-        v = v.permute(2, 0, 3, 1, 4).view(B, self.num_heads, -1, self.head_dim)
+        q = q.permute(2, 0, 3, 1, 4).view(B, self.num_heads, L, self.head_dim).contiguous()
+        k = k.permute(2, 0, 3, 1, 4).view(B, self.num_heads, -1, self.head_dim).contiguous()
+        v = v.permute(2, 0, 3, 1, 4).view(B, self.num_heads, -1, self.head_dim).contiguous()
         dim_cat = 2  # q or k or v: BHLc
         
         if self.attn_l2_norm:

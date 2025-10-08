@@ -16,6 +16,7 @@ from .image_encoder import VarImageEncoder
 from torch.profiler import record_function
 from utils.timer import profile_timer
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.utils.checkpoint import checkpoint
 
 class FlexMaskVAR(nn.Module):
     """
@@ -44,11 +45,14 @@ class FlexMaskVAR(nn.Module):
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
         image_encoder_requires_grad=True,
         prompt_encoder_requires_grad=False,
+        sam_image_encoder=None,
+        attention_checkpoint=False,
     ):
         super().__init__()
 
         self.image_encoder = image_encoder
         self.prompt_encoder = prompt_encoder
+        self.sam_image_encoder = sam_image_encoder
 
         # 设置image_encoder和prompt_encoder的参数是否需要梯度
         for param in self.image_encoder.parameters():
@@ -174,18 +178,22 @@ class FlexMaskVAR(nn.Module):
         self.head = nn.Linear(self.C, self.V)
 
         self.pe_grids = [self.prompt_encoder.pe_layer.forward((pn, pn)).permute(1, 2, 0) for pn in self.patch_nums]
-        self.block_masks = {}
+        # self.block_masks = {}
+        
+        self.attention_checkpoint = attention_checkpoint
     
     def init_block_mask(self, length=None):
         def mask_mod(b, h, q_idx, k_idx) -> bool:
+            # return (self.level_idx[q_idx] == self.level_idx[k_idx])
             return (q_idx >= k_idx) | (self.level_idx[q_idx] == self.level_idx[k_idx])
+        
         # print("level_idx.device =", self.level_idx.device)
-        if length is None and self.block_masks.get(self.L) is None:
-            self.block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=self.L, KV_LEN=self.L, device=self.level_idx.device)
-            self.block_masks[self.L] = self.block_mask
-        else:
-            self.block_masks[length] = create_block_mask(mask_mod, B=None, H=None, Q_LEN=length, KV_LEN=length, device=self.level_idx.device)
-    
+        # if length is None and self.block_masks.get(self.L) is None:
+        #     self.block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=self.L, KV_LEN=self.L, device=self.level_idx.device)
+        #     self.block_masks[self.L] = self.block_mask
+        # else:
+        self.block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=self.L, KV_LEN=self.L, device=self.level_idx.device)
+        
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
             h, resi = h_or_h_and_residual   # fused_add_norm must be used
@@ -197,7 +205,7 @@ class FlexMaskVAR(nn.Module):
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
-        sam_image_embedding: torch.Tensor, points_coords, points_labels,
+        sam_image_embedding: torch.Tensor | None, points_coords, points_labels,
         g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
         more_smooth=False,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
@@ -214,15 +222,21 @@ class FlexMaskVAR(nn.Module):
         """
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
-
+        
+        if sam_image_embedding is None:
+            with torch.no_grad():
+                with record_function("sam_image_encoder"):
+                    sam_image_embedding = self.sam_image_encoder(image)
+                
         with record_function("multiscale_image_encoder"):   
             image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
         with record_function("prompt_encoder"):
-            prompt_embedding, _ = self.prompt_encoder(
-                points=(points_coords, points_labels),
-                boxes=None,
-                masks=None,
-            )
+            with torch.no_grad():
+                prompt_embedding, _ = self.prompt_encoder(
+                    points=(points_coords, points_labels),
+                    boxes=None,
+                    masks=None,
+                )
         with record_function("add_lvl_pos"):
             image_multiscale_feats = image_multiscale_feats + self.lvl_embed(self.lvl_1L.expand(B, -1)) + self.pos_1LC
         
@@ -322,12 +336,12 @@ class FlexMaskVAR(nn.Module):
         with record_function("multiscale_image_encoder"):
             image_multiscale_feats = self.image_encoder(sam_image_embedding, pe_grids=self.pe_grids)
         with record_function("prompt_encoder"):
-            prompt_embedding, _ = self.prompt_encoder(
-                points=(points_coords, points_labels),
-                boxes=None,
-                masks=None,
-            )
-            prompt_embedding = prompt_embedding.detach()
+            with torch.no_grad():
+                prompt_embedding, _ = self.prompt_encoder(
+                    points=(points_coords, points_labels),
+                    boxes=None,
+                    masks=None,
+                )
 
         # print(f'MaskVAR: x_BLCv_wo_first_l.shape: {x_BLCv_wo_first_l.shape}')
         # print(f'MaskVAR: image_multiscale_feats.shape: {image_multiscale_feats.shape}')
@@ -363,9 +377,9 @@ class FlexMaskVAR(nn.Module):
                     # 将开始标记与输入序列拼接
                     # word_embed将输入映射到与sos相同的嵌入空间
                     x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
-                    print(f'sos.shape: {sos.shape}')
-                    print(f'x_BLC_wo_first_l.shape: {x_BLCv_wo_first_l.shape}')
-                    print(f'x_BLC.shape: {x_BLC.shape}')
+                    # print(f'sos.shape: {sos.shape}')
+                    # print(f'x_BLC_wo_first_l.shape: {x_BLCv_wo_first_l.shape}')
+                    # print(f'x_BLC.shape: {x_BLC.shape}')
                 
                 # 添加层级嵌入和位置编码
                 # lvl_embed: 不同层级的嵌入
@@ -386,6 +400,9 @@ class FlexMaskVAR(nn.Module):
         
         # 确保所有张量使用相同的数据类型
         x_BLC = x_BLC.to(dtype=main_type)
+        # 也将条件和提示嵌入转换为相同的主数据类型，避免在checkpoint重算时出现隐式类型变化
+        image_multiscale_feats = image_multiscale_feats.to(dtype=main_type)
+        prompt_embedding = prompt_embedding.to(dtype=main_type)
         # cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         # attn_bias = attn_bias.to(dtype=main_type)
         
@@ -397,7 +414,22 @@ class FlexMaskVAR(nn.Module):
                 # 每个block包含自注意力和前馈网络
                 # 使用AdaLN（自适应层归一化）结合条件信息
                 # x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-                x_BLC = b(x=x_BLC, cond=image_multiscale_feats, prompt_cond=prompt_embedding, block_mask=self.block_mask)
+                
+                # 启用梯度检查点以降低显存峰值
+                # 注意：checkpoint 需要一个仅以 Tensor 为参数的可调用对象，这里通过 lambda 包装模块调用
+                # 注意：torch.utils.checkpoint 仅支持 Tensor 类型作为显式输入参数。
+                # self.block_mask 是 flex_attention 的 BlockMask 对象，非 Tensor，将其通过闭包捕获，避免作为显式输入传入。
+                # 同时避免在重算时因非 Tensor 对象状态差异导致的 metadata mismatch。
+                if self.attention_checkpoint:
+                    x_BLC = checkpoint(
+                        lambda x, cond, pcond: b(x=x, cond=cond, prompt_cond=pcond, block_mask=self.block_mask),
+                        x_BLC,
+                        image_multiscale_feats,
+                        prompt_embedding,
+                        use_reentrant=False,
+                    )
+                else:
+                    x_BLC = b(x=x_BLC, cond=image_multiscale_feats, prompt_cond=prompt_embedding, block_mask=self.block_mask)
         
         # 获取最终的logits
         with record_function("get_logits"):

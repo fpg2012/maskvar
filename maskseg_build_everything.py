@@ -8,6 +8,7 @@ from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
 from models.prompt_encoder import PromptEncoder
 from models.image_encoder import ImageEncoder, VarImageEncoder, NeckFPN
 from models.maskvar import MaskVAR
+from models.tinyvit import TinyViT
 
 from datasets.mask_level_dataset import MaskLevelDataset
 from datasets.coco_lvis import LvisDataset
@@ -71,10 +72,10 @@ def build_maskvar_flex(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoi
         image_encoder=var_image_encoder, 
         prompt_encoder=prompt_encoder,
         num_classes=1,
-        depth=4,
+        depth=2,
         embed_dim=256,
-        num_heads=16,
-        mlp_ratio=4.,
+        num_heads=4,
+        mlp_ratio=2,
         drop_rate=0.1,
         drop_path_rate=0.1,
         norm_eps=1e-6,
@@ -82,6 +83,62 @@ def build_maskvar_flex(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoi
         cond_drop_rate=0.1,
         attn_l2_norm=False,
         patch_nums=patch_num,
+        # fused_if_available=True,
+        image_encoder_requires_grad=True,
+        prompt_encoder_requires_grad=False,
+    ).to(device)
+    return vqvae, maskvar, sam_image_encoder
+
+def build_maskvar_flex_5_stages(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, device='cpu'):
+    patch_nums = (1, 8, 16, 24, 32)
+    vqvae = build_vqvae_single_5_stages_v1(vqvae_checkpoint_path).to(device)
+    sam_image_encoder = build_sam_image_encoder(sam_checkpoint_path).to(device)
+    var_image_encoder = build_var_image_encoder(patch_nums=patch_nums).to(device)
+    prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
+    maskvar = FlexMaskVAR(
+        vae_local=vqvae, 
+        image_encoder=var_image_encoder, 
+        prompt_encoder=prompt_encoder,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=4,
+        mlp_ratio=2,
+        drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=patch_nums,
+        # fused_if_available=True,
+        image_encoder_requires_grad=True,
+        prompt_encoder_requires_grad=False,
+    ).to(device)
+    return vqvae, maskvar, sam_image_encoder
+
+def build_maskvar_flex_mobile_5_stages(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, device='cpu'):
+    patch_nums = (1, 8, 16, 24, 32)
+    vqvae = build_vqvae_single_5_stages_v1(vqvae_checkpoint_path).to(device)
+    sam_image_encoder = build_mobile_sam_image_encoder(sam_checkpoint_path).to(device)
+    var_image_encoder = build_var_image_encoder(patch_nums=patch_nums).to(device)
+    prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
+    maskvar = FlexMaskVAR(
+        vae_local=vqvae, 
+        image_encoder=var_image_encoder, 
+        prompt_encoder=prompt_encoder,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=4,
+        mlp_ratio=4,
+        drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=patch_nums,
         # fused_if_available=True,
         image_encoder_requires_grad=True,
         prompt_encoder_requires_grad=False,
@@ -271,6 +328,32 @@ def build_vqvae_single_4_stages_v2(vqvae_checkpoint_path: Optional[str] = None, 
         if 'model_state_dict' in vqvae_state_dict.keys():
             vqvae_state_dict = vqvae_state_dict['model_state_dict']
         vqvae.load_state_dict(vqvae_state_dict)
+    
+    return vqvae
+
+def build_vqvae_single_5_stages_v1(vqvae_checkpoint_path: Optional[str] = None, require_grad = False) -> VQVAE_Single:
+    vocab_size = 4096  # 码本大小
+    z_channels = 32   # 潜在空间通道数
+    base_channels = 128  # 基础通道数
+    beta = 0.25  # commitment loss权重
+
+    vqvae = VQVAE_Single(
+        vocab_size=vocab_size,
+        z_channels=z_channels,
+        ch=base_channels,
+        beta=beta,
+        v_patch_nums=(1, 8, 16, 24, 32),
+        test_mode=False,
+        ddconfig=dict(in_channels=1, ch_mult=(1, 1, 2, 4), num_res_blocks=2,   # 通道数乘数，用于构建网络层
+                    using_sa=True, using_mid_sa=True,)
+    )
+
+    if vqvae_checkpoint_path is not None:
+        vqvae_state_dict = torch.load(vqvae_checkpoint_path, weights_only=True)
+        if 'model_state_dict' in vqvae_state_dict.keys():
+            vqvae_state_dict = vqvae_state_dict['model_state_dict']
+        new_state_dict = {k.replace("_orig_mod.", ""): v for k, v in vqvae_state_dict.items()}
+        vqvae.load_state_dict(new_state_dict)
     
     return vqvae
 
@@ -545,6 +628,31 @@ def build_sam_image_encoder(sam_checkpoint_path: Optional[str] = None) -> SamIma
                 image_encoder_state_dict[key.replace("image_encoder.", "")] = value
         sam_image_encoder.load_state_dict(image_encoder_state_dict)
 
+    return sam_image_encoder
+
+def build_mobile_sam_image_encoder(sam_checkpoint_path: Optional[str] = None) -> TinyViT:
+    sam_image_encoder = TinyViT(img_size=1024, in_chans=3, num_classes=1000,
+        embed_dims=[64, 128, 160, 320],
+        depths=[2, 2, 6, 2],
+        num_heads=[2, 4, 5, 10],
+        window_sizes=[7, 7, 14, 7],
+        mlp_ratio=4.,
+        drop_rate=0.,
+        drop_path_rate=0.0,
+        use_checkpoint=False,
+        mbconv_expand_ratio=4.0,
+        local_conv_size=3,
+        layer_lr_decay=0.8
+    )
+     # load_state_dict
+    if sam_checkpoint_path is not None:
+        sam_state_dict = torch.load(sam_checkpoint_path)
+        image_encoder_state_dict = {}
+        for key, value in sam_state_dict.items():
+            if "image_encoder" in key:
+                image_encoder_state_dict[key.replace("image_encoder.", "")] = value
+        sam_image_encoder.load_state_dict(image_encoder_state_dict)
+    
     return sam_image_encoder
 
 def build_image_encoder(sam_checkpoint_path: Optional[str] = None) -> ImageEncoder:

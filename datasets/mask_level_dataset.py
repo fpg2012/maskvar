@@ -35,8 +35,9 @@ class MaskLevelDataset(IterableDataset):
         if self.with_image_embed:
             assert self.sam_encoder is not None
 
-        self.pixel_mean = torch.tensor([123.675, 116.28, 103.53]).to(device) # copied from sam
-        self.pixel_std = torch.tensor([58.395, 57.12, 57.375]).to(device) # copied from sam
+        # 使用register_buffer避免每次都创建新tensor
+        self.pixel_mean = torch.tensor([123.675, 116.28, 103.53], device=device) # copied from sam
+        self.pixel_std = torch.tensor([58.395, 57.12, 57.375], device=device) # copied from sam
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
@@ -61,7 +62,8 @@ class MaskLevelDataset(IterableDataset):
             for instance_idx in instance_info.keys():
                 single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
                 # print(f'image.dtype, single_mask_normalized.dtype, single_mask.dtype: {image.dtype, single_mask_normalized.dtype, single_mask.dtype}')
-                yield image, image_embed_sam, single_mask_normalized, single_mask
+                # 确保返回的tensor已经detach，避免保留计算图
+                yield image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach()
 
     def preprocess_image(self, image):
         """
@@ -69,47 +71,49 @@ class MaskLevelDataset(IterableDataset):
 
         image: (H, W, 3)
         """
-        image = torch.from_numpy(image).to(self.device) / 255.0
-        image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
-        image = resize_longest_side(image.unsqueeze(0), 1024).squeeze(0)
+        with torch.no_grad():  # 整个预处理过程都不需要梯度
+            image = torch.from_numpy(image).to(self.device, dtype=torch.float32, non_blocking=True) / 255.0
+            image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
+            image = resize_longest_side(image.unsqueeze(0), 1024).squeeze(0)
 
-        # normalize image
-        image = image.permute(1, 2, 0) # (3, H, W) -> (H, W, 3)
-        image = (image - self.pixel_mean) / self.pixel_std
-        image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
+            # normalize image
+            image = image.permute(1, 2, 0) # (3, H, W) -> (H, W, 3)
+            image = (image - self.pixel_mean) / self.pixel_std
+            image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
 
-        # pad image to 1024
-        h, w = image.shape[-2:]
-        padh = 1024 - h
-        padw = 1024 - w
-        image = F.pad(image, (0, padw, 0, padh), value=0)
+            # pad image to 1024
+            h, w = image.shape[-2:]
+            padh = 1024 - h
+            padw = 1024 - w
+            image = F.pad(image, (0, padw, 0, padh), value=0)
 
-        # print(f'image shape: {image.shape}')
+            # print(f'image shape: {image.shape}')
 
-        # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
-        if self.with_image_embed:
-            with torch.no_grad():
-                image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0)
-        else:
-            image_embed_sam = 0
+            # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
+            if self.with_image_embed:
+                # 使用clone()创建新tensor，避免保留对encoder输出的引用
+                image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0).clone()
+            else:
+                image_embed_sam = 0
         return image, image_embed_sam
 
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):
-        mask = gt_mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
+        with torch.no_grad():  # mask预处理不需要梯度
+            mask = gt_mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
 
-        # to tensor
-        mask = torch.from_numpy(mask).to(self.device, dtype=torch.float32).unsqueeze(0)
+            # to tensor
+            mask = torch.from_numpy(mask).to(self.device, dtype=torch.float32, non_blocking=True).unsqueeze(0)
 
-        mask = resize_longest_side(mask.unsqueeze(0), 256, 'nearest').squeeze(0)
-        # mask = mask.long()
+            mask = resize_longest_side(mask.unsqueeze(0), 256, 'nearest').squeeze(0)
+            # mask = mask.long()
 
-        # pad mask to 256
-        h, w = mask.shape[-2:]
-        padh = 256 - h
-        padw = 256 - w
-        mask = F.pad(mask, (0, padw, 0, padh), value=0)
+            # pad mask to 256
+            h, w = mask.shape[-2:]
+            padh = 256 - h
+            padw = 256 - w
+            mask = F.pad(mask, (0, padw, 0, padh), value=0)
 
-        # normalize mask
-        mask_normalized = mask * 2 - 1
+            # normalize mask
+            mask_normalized = mask * 2 - 1
 
         return mask_normalized, mask

@@ -304,7 +304,10 @@ class MetricLogger(object):
         
         if isinstance(itrt, Iterator) and not hasattr(itrt, 'preload') and not hasattr(itrt, 'set_epoch'):
             for i in range(start_it, max_iters):
-                obj = next(itrt)
+                try:
+                    obj = next(itrt)
+                except StopIteration:
+                    break
                 self.data_time.update(time.time() - self.iter_end_t)
                 yield i, obj
                 self.iter_time.update(time.time() - self.iter_end_t)

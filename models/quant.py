@@ -97,7 +97,7 @@ class VectorQuantizer2(nn.Module):
         f_rest = f_no_grad.clone()  # 剩余特征
         f_hat = torch.zeros_like(f_rest)  # 量化后的特征
         
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type='cuda', enabled=False):
             mean_vq_loss: torch.Tensor = 0.0
             vocab_hit_V = torch.zeros(self.vocab_size, dtype=torch.float, device=f_BChw.device)
             SN = len(self.v_patch_nums)

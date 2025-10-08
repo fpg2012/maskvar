@@ -10,6 +10,7 @@ import dist
 import time
 from tqdm import tqdm
 import numpy as np
+import gc
 
 from models.maskvar import MaskVAR
 from models.image_encoder import ImageEncoder
@@ -39,6 +40,7 @@ class MaskVarTrainer(object):
         self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
         vae_local: VQVAE, var_wo_ddp: MaskVAR, var: DDP,
         var_opt: AmpOptimizer, label_smooth: float, interactive_config: InteractiveConfig,
+        sam_image_encoder = None
     ):
         super(MaskVarTrainer, self).__init__()
         
@@ -47,12 +49,14 @@ class MaskVarTrainer(object):
         self.vae_local = vae_local  # VAE 模型
         self.quantize_local = vae_local.quantize  # VAE 的量化器
         self.quantize_local: VectorQuantizer2  # 类型注解：向量量化器
+        # 确保在验证时可以直接访问未 DDP 包装的模型实例
         self.var_wo_ddp = var_wo_ddp  # 未包装的模型实例（用于 torch.compile 优化后）
         self.var_opt = var_opt  # 优化器
+        self.sam_image_encoder = sam_image_encoder
         
         # 随机数生成器
-        del self.var_wo_ddp.rng  # 删除原有的 RNG
-        self.var_wo_ddp.rng = torch.Generator(device=device)  # 创建新的 RNG 并指定设备
+        # del self.var_wo_ddp.rng  # 删除原有的 RNG
+        # self.var_wo_ddp.rng = torch.Generator(device=device)  # 创建新的 RNG 并指定设备
         
         # 损失函数配置
         self.label_smooth = label_smooth  # 标签平滑系数
@@ -100,11 +104,13 @@ class MaskVarTrainer(object):
             gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(single_mask_normalized)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
             x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+            del gt_idx_Bl  # 立即释放
 
             # sample clicks
+            single_mask_cpu = single_mask.cpu().numpy()
             click_lists = []
             for i in range(B):
-                click_list, eroded_mask, dt = init_clicks(single_mask[i].cpu().numpy()[0], num_random_clicks=self.interactive_config.num_random_clicks)
+                click_list, eroded_mask, dt = init_clicks(single_mask_cpu[i][0], num_random_clicks=self.interactive_config.num_random_clicks)
                 click_lists.append(click_list)
             point_coords = []
             point_labels = []
@@ -112,20 +118,26 @@ class MaskVarTrainer(object):
                 coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
                 point_coords.append(coords)
                 point_labels.append(labels)
+            del single_mask_cpu, click_lists  # 清理临时变量
             
             self.var_wo_ddp.forward
             logits_BLV = self.var_wo_ddp(
                 label, 
                 x_BLCv_wo_first_l, 
                 image_embed_sam, 
-                points_coords=torch.stack(point_coords).to(device=dist.get_device()), 
-                points_labels=torch.stack(point_labels).to(device=dist.get_device())
+                points_coords=torch.stack(point_coords).to(device=dist.get_device(), non_blocking=True), 
+                points_labels=torch.stack(point_labels).to(device=dist.get_device(), non_blocking=True)
             )
-            L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
-            L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
-            acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
-            acc_tail += (logits_BLV.data[:, -self.last_l:].argmax(dim=-1) == gt_BL[:, -self.last_l:]).sum() * (100 / self.last_l)
+            L_mean += self.val_loss(logits_BLV.view(-1, V), gt_BL.view(-1)) * B
+            L_tail += self.val_loss(logits_BLV[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
+            acc_mean += (logits_BLV.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
+            acc_tail += (logits_BLV[:, -self.last_l:].argmax(dim=-1) == gt_BL[:, -self.last_l:]).sum() * (100 / self.last_l)
             tot += B
+            
+            # 清理每个批次的tensor
+            del image, image_embed_sam, single_mask_normalized, single_mask, label
+            del gt_BL, x_BLCv_wo_first_l, logits_BLV, point_coords, point_labels
+        
         self.var_wo_ddp.train(training)
         
         stats = L_mean.new_tensor([L_mean.item(), L_tail.item(), acc_mean.item(), acc_tail.item(), tot])
@@ -166,9 +178,11 @@ class MaskVarTrainer(object):
         """
         B = gt_mask_normalized_B1HW.shape[0]
         # sample init clicks for each batch
+        # 使用detach()避免保留计算图，减少显存占用
+        gt_mask_cpu = gt_mask_B1HW.detach().cpu().numpy()
         click_lists = []
         for i in range(B):
-            click_list, eroded_mask, dt = init_clicks(gt_mask_B1HW[i].cpu().numpy()[0], num_random_clicks=self.interactive_config.num_random_clicks)
+            click_list, eroded_mask, dt = init_clicks(gt_mask_cpu[i][0], num_random_clicks=self.interactive_config.num_random_clicks)
             click_lists.append(click_list)
 
         point_coords = []
@@ -177,6 +191,9 @@ class MaskVarTrainer(object):
             coords, labels = to_sam_format(click_lists[i], pad_size=self.interactive_config.num_interactive_clicks+3)
             point_coords.append(coords)
             point_labels.append(labels)
+        
+        # 显式删除CPU副本
+        del gt_mask_cpu, click_lists
 
         # interactive sample clicks
 
@@ -222,6 +239,13 @@ class MaskVarTrainer(object):
         #     point_coords.append(coords)
         #     point_labels.append(labels)
 
+        # 提前转换到GPU，避免在train_step中重复转换
+        prompt_points_coords_BN2 = torch.stack(point_coords).to(device=dist.get_device(), non_blocking=True)
+        prompt_points_labels_BN = torch.stack(point_labels).to(device=dist.get_device(), non_blocking=True)
+        
+        # 清理临时列表
+        del point_coords, point_labels
+        
         return self.train_step(
             it=it, g_it=g_it, stepping=stepping,
             metric_lg=metric_lg, tb_lg=tb_lg,
@@ -229,8 +253,8 @@ class MaskVarTrainer(object):
             label_B=None,
             prog_si=prog_si, prog_wp_it=prog_wp_it,
             image_embed_sam_BCencHW=image_embed_sam_BCencHW,
-            prompt_points_coords_BN2=torch.stack(point_coords).to(device=dist.get_device()),
-            prompt_points_labels_BN=torch.stack(point_labels).to(device=dist.get_device()),
+            prompt_points_coords_BN2=prompt_points_coords_BN2,
+            prompt_points_labels_BN=prompt_points_labels_BN,
         )
     
     def train_step(
@@ -266,7 +290,7 @@ class MaskVarTrainer(object):
         """
         # ==================== Progressive Training 阶段管理 ====================
         # 设置模型和量化器的progressive阶段
-        self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = prog_si
+        # self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = prog_si
         
         # 如果progressive阶段变化，更新状态
         if self.last_prog_si != prog_si:
@@ -291,15 +315,22 @@ class MaskVarTrainer(object):
         
         # 将图像转换为token索引序列
         # print(f'gt_mask_B1HW.dtype: {gt_mask_B1HW.dtype}')
-        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(gt_mask_B1HW)
-        gt_BL = torch.cat(gt_idx_Bl, dim=1)  # 拼接所有token (B, L)
-        # 生成模型输入（去掉第一个token）
-        x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+        with torch.no_grad():
+            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(gt_mask_B1HW)
+            gt_BL = torch.cat(gt_idx_Bl, dim=1)  # 拼接所有token (B, L)
+            # 生成模型输入（去掉第一个token）
+            x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+            # 立即删除中间结果，释放显存
+            del gt_idx_Bl
         
         # 混合精度训练上下文
         with self.var_opt.amp_ctx:
             # 前向传播
-            logits_BLV = self.var(label_B, x_BLCv_wo_first_l.detach(), image_embed_sam_BCencHW.detach(), prompt_points_coords_BN2.detach(), prompt_points_labels_BN.detach())  # (B, L, V)
+            # torch.cuda.synchronize()
+            # print(f"[rank{dist.get_rank()}][MEM USAGE] before!! \n {torch.cuda.memory_summary(device=dist.get_device(), abbreviated=True)}")
+            logits_BLV = self.var(label_B, x_BLCv_wo_first_l, image_embed_sam_BCencHW, prompt_points_coords_BN2, prompt_points_labels_BN)  # (B, L, V)
+            # torch.cuda.synchronize()
+            # print(f"[rank{dist.get_rank()}][MEM USAGE] after!! \n {torch.cuda.memory_summary(device=dist.get_device(), abbreviated=True)}")
             # 计算每个token的loss (B, L)
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
             
@@ -314,84 +345,97 @@ class MaskVarTrainer(object):
             
             # 加权平均得到最终loss
             loss = loss.mul(lw).sum(dim=-1).mean()
-        
         # ==================== 反向传播 ====================
         grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping)
         
         # ==================== 记录指标 ====================
-        pred_BL = logits_BLV.data.argmax(dim=-1)  # 预测结果 (B, L)
-        
-        # 在指定迭代步记录指标
-        if it == 0 or it in metric_lg.log_iters:
-            # 计算平均loss和准确率
-            Lmean = self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)).item()
-            acc_mean = (pred_BL == gt_BL).float().mean().item() * 100
+        # 立即 detach 所有需要的 tensor，避免保留计算图
+        with torch.no_grad():
+            # 使用clone()确保完全断开计算图
+            logits_BLV_detached = logits_BLV.detach().clone()
+            gt_BL_detached = gt_BL.detach().clone()
+            pred_BL = logits_BLV_detached.argmax(dim=-1)  # 预测结果 (B, L)
             
-            # 在progressive training时不计算tail指标
-            if prog_si >= 0:
-                Ltail = acc_tail = -1
-            else:
-                # 计算最后一部分token的loss和准确率
-                Ltail = self.val_loss(
-                    logits_BLV.data[:, -self.last_l:].reshape(-1, V), 
-                    gt_BL[:, -self.last_l:].reshape(-1)
-                ).item()
-                acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
-            
-            # 更新指标记录器
-            grad_norm_val = grad_norm.item()
-            metric_lg.update(
-                Lm=Lmean,      # 平均loss
-                Lt=Ltail,      # 尾部loss
-                Accm=acc_mean, # 平均准确率
-                Acct=acc_tail, # 尾部准确率
-                tnm=grad_norm_val  # 梯度范数
-            )
-        
-        # ==================== TensorBoard日志 ====================
-        if g_it == 0 or (g_it + 1) % 500 == 0:
-            # 计算每个token类别的使用频率
-            prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()
-            dist.allreduce(prob_per_class_is_chosen)  # 多卡同步
-            prob_per_class_is_chosen /= prob_per_class_is_chosen.sum()
-            # 计算token使用率（使用频率>0.1%/V的token比例）
-            cluster_usage = (prob_per_class_is_chosen > 0.001 / V).float().mean().item() * 100
-            
-            # 只在主进程记录TensorBoard
-            if dist.is_master():
-                if g_it == 0:  # 初始记录
-                    tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-10000)
-                    tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-1000)
+            # 在指定迭代步记录指标
+            if it == 0 or it in metric_lg.log_iters:
+                # 计算平均loss和准确率
+                Lmean = self.val_loss(logits_BLV_detached.view(-1, V), gt_BL_detached.view(-1)).item()
+                acc_mean = (pred_BL == gt_BL_detached).float().mean().item() * 100
                 
-                # 准备记录数据
-                kw = dict(z_voc_usage=cluster_usage)
+                # 在progressive training时不计算tail指标
+                if prog_si >= 0:
+                    Ltail = acc_tail = -1
+                else:
+                    # 计算最后一部分token的loss和准确率
+                    Ltail = self.val_loss(
+                        logits_BLV_detached[:, -self.last_l:].reshape(-1, V), 
+                        gt_BL_detached[:, -self.last_l:].reshape(-1)
+                    ).item()
+                    acc_tail = (pred_BL[:, -self.last_l:] == gt_BL_detached[:, -self.last_l:]).float().mean().item() * 100
                 
-                # 为每个progressive阶段记录指标
-                for si, (bg, ed) in enumerate(self.begin_ends):
-                    if 0 <= prog_si < si:  # 只记录当前及之前的阶段
-                        break
-                    # 计算当前阶段的预测和标签
-                    pred = logits_BLV.data[:, bg:ed].reshape(-1, V)
-                    tar = gt_BL[:, bg:ed].reshape(-1)
-                    # 计算准确率和交叉熵
-                    acc = (pred.argmax(dim=-1) == tar).float().mean().item() * 100
-                    ce = self.val_loss(pred, tar).item()
-                    # 添加到记录
-                    kw[f'acc_{self.resos[si]}'] = acc
-                    kw[f'L_{self.resos[si]}'] = ce
-                
-                # 更新TensorBoard
-                tb_lg.update(head='AR_iter_loss', **kw, step=g_it)
-                tb_lg.update(
-                    head='AR_iter_schedule',
-                    prog_a_reso=self.resos[prog_si],  # 当前分辨率
-                    prog_si=prog_si,                  # 阶段索引
-                    prog_wp=prog_wp,                  # warmup进度
-                    step=g_it
+                # 更新指标记录器
+                grad_norm_val = grad_norm.item()
+                metric_lg.update(
+                    Lm=Lmean,      # 平均loss
+                    Lt=Ltail,      # 尾部loss
+                    Accm=acc_mean, # 平均准确率
+                    Acct=acc_tail, # 尾部准确率
+                    tnm=grad_norm_val  # 梯度范数
                 )
+            
+            # ==================== TensorBoard日志 ====================
+            if g_it == 0 or (g_it + 1) % 500 == 0:
+                # 计算每个token类别的使用频率
+                prob_per_class_is_chosen = pred_BL.view(-1).bincount(minlength=V).float()
+                dist.allreduce(prob_per_class_is_chosen)  # 多卡同步
+                prob_per_class_is_chosen /= prob_per_class_is_chosen.sum()
+                # 计算token使用率（使用频率>0.1%/V的token比例）
+                cluster_usage = (prob_per_class_is_chosen > 0.001 / V).float().mean().item() * 100
+                
+                # 只在主进程记录TensorBoard
+                if dist.is_master():
+                    if g_it == 0:  # 初始记录
+                        tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-10000)
+                        tb_lg.update(head='AR_iter_loss', z_voc_usage=cluster_usage, step=-1000)
+                    
+                    # 准备记录数据
+                    kw = dict(z_voc_usage=cluster_usage)
+                    
+                    # 为每个progressive阶段记录指标
+                    for si, (bg, ed) in enumerate(self.begin_ends):
+                        if 0 <= prog_si < si:  # 只记录当前及之前的阶段
+                            break
+                        # 计算当前阶段的预测和标签
+                        pred = logits_BLV_detached[:, bg:ed].reshape(-1, V)
+                        tar = gt_BL_detached[:, bg:ed].reshape(-1)
+                        # 计算准确率和交叉熵
+                        acc = (pred.argmax(dim=-1) == tar).float().mean().item() * 100
+                        ce = self.val_loss(pred, tar).item()
+                        # 添加到记录
+                        kw[f'acc_{self.resos[si]}'] = acc
+                        kw[f'L_{self.resos[si]}'] = ce
+                    
+                    # 更新TensorBoard
+                    tb_lg.update(head='AR_iter_loss', **kw, step=g_it)
+                    tb_lg.update(
+                        head='AR_iter_schedule',
+                        prog_a_reso=self.resos[prog_si],  # 当前分辨率
+                        prog_si=prog_si,                  # 阶段索引
+                        prog_wp=prog_wp,                  # warmup进度
+                        step=g_it
+                    )
+        
+        # 显式删除大 tensor，释放显存
+        del logits_BLV, logits_BLV_detached, gt_BL, gt_BL_detached, x_BLCv_wo_first_l, loss, pred_BL
+        # 删除输入tensor的引用
+        del image_embed_sam_BCencHW, prompt_points_coords_BN2, prompt_points_labels_BN
+        
+        # 定期清理显存碎片
+        if stepping and g_it % 10 == 0:
+            torch.cuda.empty_cache()
         
         # 重置progressive阶段
-        self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
+        # self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = -1
         return grad_norm, scale_log2
     
     def get_config(self):

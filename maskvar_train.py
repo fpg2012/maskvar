@@ -22,9 +22,13 @@ from maskseg_build_everything import (
     build_vqvae_single,
     build_maskvar,
     build_maskvar_v2,
+    build_maskvar_flex,
+    build_maskvar_flex_5_stages,
+    build_maskvar_flex_mobile_5_stages
 )
 from maskvar_trainer import InteractiveConfig, MaskVarTrainer
 from models.maskvar import MaskVAR
+from models.flex_maskvar import FlexMaskVAR
 from datasets.mask_level_dataset import MaskLevelDataset, count_masks
 
 def build_everything(args: arg_util.Args):
@@ -66,14 +70,19 @@ def build_everything(args: arg_util.Args):
 
     # !TODO: replace with custom model
     # 构建VAE和VAR模型
-    # vae_local, var_wo_ddp, sam_image_encoder = build_maskvar('ckpt/vqvae_single.pth', 'ckpt/sam_vit_b_01ec64.pth', flash_if_available=True, device=args.device) 
-    vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_v2('out_vqvae_4_stages_2/ckpt/vqvae_single_epoch_40.pth', 'ckpt/sam_vit_b_01ec64.pth', flash_if_available=True, device=args.device) 
+    vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_flex_mobile_5_stages('out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', 'ckpt/mobile_sam.pt', device=args.device) 
+    # vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_flex('ckpt/vqvae_single.pth', 'ckpt/sam_vit_b_01ec64.pth', device=args.device) 
+    # vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_v2('out_vqvae_4_stages_2/ckpt/vqvae_single_epoch_40.pth', 'ckpt/sam_vit_b_01ec64.pth', flash_if_available=True, device=args.device) 
     
     dist.barrier()
     # !TODO: load state dict
     
     vae_local: VQVAE_Single = args.compile_model(vae_local, args.vfast)
-    var_wo_ddp: MaskVAR = args.compile_model(var_wo_ddp, args.tfast)
+    vae_local.eval()
+    var_wo_ddp: FlexMaskVAR = args.compile_model(var_wo_ddp, args.tfast)
+    var_wo_ddp.prompt_encoder.eval()
+    sam_image_encoder = torch.compile(sam_image_encoder, mode='reduce-overhead')
+    sam_image_encoder.eval()
 
     var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=True, broadcast_buffers=False)
     
@@ -88,15 +97,14 @@ def build_everything(args: arg_util.Args):
     train_set_masklevel = MaskLevelDataset(train_set, sam_image_encoder, args.device)
     val_set_masklevel = MaskLevelDataset(val_set, sam_image_encoder, args.device)
     print(f'[INIT] counting masks...')
-    # iters_train = count_masks(train_set, world_size=tdist.get_world_size(), rank=tdist.get_rank())
-    iters_train = train_set.count_masks(world_size=tdist.get_world_size(), rank=tdist.get_rank())
-    # iters_val = count_masks(val_set)
-    max_iters_train = train_set.max_count_masks(world_size=tdist.get_world_size())
-    # max_iters_train = 100 # for debug only
-    iters_train = max_iters_train
-
-    train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size)
-    val_dataloader = DataLoader(val_set_masklevel, batch_size=args.batch_size)
+    # Per-rank minimum masks across splits (ensures all ranks have at least this many masks)
+    min_masks = train_set.max_count_masks(world_size=tdist.get_world_size())
+    # Convert mask count to batch iteration count
+    iters_train = min_masks // args.batch_size
+    # iters_train = 2 # for debug only
+    # Build dataloaders; drop_last to ensure exact number of full batches
+    train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
+    val_dataloader = DataLoader(val_set_masklevel, batch_size=args.batch_size, drop_last=True)
     
     # 构建优化器
     # 过滤参数，为不同的参数组设置不同的优化策略
@@ -222,8 +230,11 @@ def main_training():
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
 
-        ld_train_iter = islice(cycle(ld_train), iters_train)
+        # 避免使用cycle()，直接使用islice限制迭代次数
+        # cycle()会保留所有元素的引用，导致显存累积
+        ld_train_iter = islice(ld_train, iters_train)
         
+        print(f"[rank{tdist.get_rank()}][MEM USAGE]\n{torch.cuda.memory_summary(device=None, abbreviated=False)}")
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train_iter, iters_train, trainer
         )
@@ -319,7 +330,7 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
     g_it, max_it = ep * iters_train, args.ep * iters_train
     
     # Main training loop: iterate through the training data
-    for it, (image, image_embed_sam, single_mask_normalized, single_mask) in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
+    for it, (image, image_embed_sam, single_mask_normalized, single_mask) in me.log_every(start_it, iters_train, ld_or_itrt, 100 if iters_train > 8000 else 5, header):
             # Calculate global iteration count (across all epochs)
             g_it = ep * iters_train + it
             if it < start_it: continue  # Skip iterations if resuming from checkpoint
@@ -330,8 +341,11 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
             inp = single_mask_normalized
 
             # Move data to the specified device (GPU/CPU)
+            # 使用non_blocking=True加速CPU-GPU传输
             inp = inp.to(args.device, non_blocking=True)
             label = label.to(args.device, non_blocking=True)
+            image_embed_sam = image_embed_sam.to(args.device, non_blocking=True)
+            single_mask = single_mask.to(args.device, non_blocking=True)
             
             # Update current iteration info for logging
             args.cur_it = f'{it+1}/{iters_train}'
@@ -370,6 +384,9 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
                 image_embed_sam_BCencHW=image_embed_sam, gt_mask_B1HW=single_mask,
             )
             
+            # 显式删除输入tensor，释放显存
+            del image, image_embed_sam, single_mask_normalized, single_mask, inp, label
+            
             # Update metrics and learning rate
             me.update(tlr=max_tlr)
             
@@ -385,6 +402,10 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
             if args.tclip > 0:
                 tb_lg.update(head='AR_opt_grad/grad', grad_norm=grad_norm)
                 tb_lg.update(head='AR_opt_grad/grad', grad_clip=args.tclip)
+            
+            # 定期清理显存碎片
+            if stepping and (g_it + 1) % 50 == 0:
+                torch.cuda.empty_cache()
     
     me.synchronize_between_processes()
     return {k: meter.global_avg for k, meter in me.meters.items()}, me.iter_time.time_preds(max_it - (g_it + 1) + (args.ep - ep) * 15)  # +15: other cost

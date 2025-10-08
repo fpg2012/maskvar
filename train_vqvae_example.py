@@ -24,6 +24,7 @@ from maskseg_build_everything import (
     build_vqvae_single_4_stages_v2,
     build_vqvae_single_4_stages_4_slices,
     build_vqvae_single_4_stages_4_slices_v2,
+    build_vqvae_single_5_stages_v1
 )
 from models.vqvae_single import VQVAE_Single
 from datasets.hqseg44k import HQSeg44KTrainDataset
@@ -34,7 +35,7 @@ parser.add_argument('--checkpoint', type=str, default=None, help='要加载的ch
 parser.add_argument('--start_epoch', type=int, default=0, help='开始训练的epoch')
 parser.add_argument('--num_epochs', type=int, default=8, help='总训练epoch数')
 parser.add_argument('--batch_size', type=int, default=8, help='批次大小')
-parser.add_argument('--learning_rate', type=float, default=1e-4, help='学习率')
+parser.add_argument('--learning_rate', type=float, default=1.4e-4, help='学习率')
 parser.add_argument('--out_dir', type=str, default='out', help='保存模型的目录')
 parser.add_argument('--division', type=int, default=1, help='一张图沿边切几份')
 args = parser.parse_args()
@@ -190,13 +191,18 @@ dataloader = DataLoader(
 # model = build_vqvae_single_4_stages(args.checkpoint, require_grad=True).to(DEVICE)
 # model = build_vqvae_single_4_stages_v2(args.checkpoint, require_grad=True).to(DEVICE)
 # model = build_vqvae_single_4_stages_4_slices(args.checkpoint, require_grad=True).to(DEVICE)
-model = build_vqvae_single_4_stages_4_slices_v2(args.checkpoint, require_grad=True).to(DEVICE)
+# model = build_vqvae_single_4_stages_4_slices_v2(args.checkpoint, require_grad=True).to(DEVICE)
+model = build_vqvae_single_5_stages_v1(args.checkpoint, require_grad=True).to(DEVICE)
+torch.set_float32_matmul_precision('high')
+
+model = torch.compile(model, mode='reduce-overhead')
 
 # 将模型包装为DDP模型
 if world_size > 1:
-    model = DDP(model, device_ids=[gpu], find_unused_parameters=True)
+    # model = DDP(model, device_ids=[gpu], find_unused_parameters=True)
+    model = DDP(model, device_ids=[gpu])
 
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
 # 如果指定了checkpoint，则加载它
 start_epoch = args.start_epoch
