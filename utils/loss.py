@@ -93,7 +93,30 @@ class NormalizedFocalLoss2(nn.Module):
         loss = -alpha * beta * (pt + self.eps).log()
         
         return loss.mean(), scale
+
+class FocalLossGeneral(nn.Module):
     
+    def __init__(self, alpha=0.5, gamma=2.0, eps=torch.finfo(torch.float).eps, label_smooth=0.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.eps = eps
+        self.label_smooth = label_smooth
+        self.ce = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')
+        self.reduction = reduction    
+    def forward(self, pred, target):
+        ce_loss = self.ce(pred, target)
+        pt = torch.exp(-ce_loss)
+        loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'none':
+            return loss
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            raise ValueError(f'Invalid reduction: {self.reduction}')
+
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.5, gamma=2.0, eps=torch.finfo(torch.float).eps):
         """

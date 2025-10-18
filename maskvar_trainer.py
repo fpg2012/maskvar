@@ -22,6 +22,7 @@ from utils.misc import MetricLogger, TensorboardLogger
 
 from utils.clicker import init_clicks, predict_next_click, to_sam_format
 from utils import resize_longest_side
+from utils.loss import FocalLossGeneral
 
 from datasets.mask_level_dataset import MaskLevelDataset
 
@@ -60,8 +61,9 @@ class MaskVarTrainer(object):
         
         # 损失函数配置
         self.label_smooth = label_smooth  # 标签平滑系数
-        self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')  # 训练用损失函数（带标签平滑）
+        # self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')  # 训练用损失函数（带标签平滑）
         self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')  # 验证用损失函数（无标签平滑）
+        self.train_loss = FocalLossGeneral(alpha=0.1, gamma=2.0, label_smooth=label_smooth, reduction='none')
         
         # Patch 相关配置
         self.L = sum(pn * pn for pn in patch_nums)  # 总 token 数（所有 patch 的 token 数之和）

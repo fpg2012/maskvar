@@ -57,8 +57,9 @@ class NeckFPN(nn.Module):
             x1_interpolated = x1_interpolated.view(B, -1, C).contiguous()
             multiscale_feats.append(x1_interpolated)
             
-            x1_resi = x1 - x1_reverse
-            x1 = x1_resi
+            # residual
+            # x1_resi = x1 - x1_reverse
+            # x1 = x1_resi
         
         # for i, conv in enumerate(self.adapt_convs):
         #     pn = self.patch_nums[i]

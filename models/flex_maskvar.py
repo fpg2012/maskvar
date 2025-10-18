@@ -275,10 +275,10 @@ class FlexMaskVAR(nn.Module):
                 
                 for b in self.blocks:
                     with record_function(f'autogressive pass {si} block {b}'):
-                        # remenber! x is kv_cached in the self-attn!
+                        # remember! x is kv_cached in the self-attn!
                         # just try using only the cond corresponding to the current scale
                         # TODO: use the entire cond with more complicated block mask
-                        x = b(x=x, cond=image_multiscale_feats[:, last_L:cur_L, :], prompt_cond=prompt_embedding, block_mask=None)
+                        x = b(x=x, cond=image_multiscale_feats[:, :cur_L, :], prompt_cond=prompt_embedding, block_mask=None)
                 with record_function(f'autogressive pass {si} logits'):
                     logits_BlV = self.get_logits(x, cond_BD)
                 
