@@ -11,6 +11,7 @@ from .hqseg44k import HQSeg44KTrainDataset
 from utils import resize_longest_side
 from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
 from tqdm import tqdm
+import numpy as np
 
 def count_masks(dataset: LvisDataset | HQSeg44KTrainDataset, world_size=1, rank=0):
     count = 0
@@ -26,11 +27,19 @@ def count_masks(dataset: LvisDataset | HQSeg44KTrainDataset, world_size=1, rank=
 
 class MaskLevelDataset(IterableDataset):
 
-    def __init__(self, dataset: Optional[LvisDataset | HQSeg44KTrainDataset], sam_encoder: Optional[SamImageEncoder], device: str, with_image_embed=True):
+    def __init__(
+        self, 
+        dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
+        sam_encoder: Optional[SamImageEncoder], 
+        device: str, 
+        with_image_embed=True,
+        mask_filter_thresh=0.1
+    ):
         self.dataset = dataset
         self.sam_encoder = sam_encoder
         self.device = device
         self.with_image_embed = with_image_embed
+        self.mask_filter_thresh = mask_filter_thresh
         
         if self.with_image_embed:
             assert self.sam_encoder is not None
@@ -61,8 +70,8 @@ class MaskLevelDataset(IterableDataset):
             image, image_embed_sam = self.preprocess_image(image)
             for instance_idx in instance_info.keys():
                 single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
-                # print(f'image.dtype, single_mask_normalized.dtype, single_mask.dtype: {image.dtype, single_mask_normalized.dtype, single_mask.dtype}')
-                # 确保返回的tensor已经detach，避免保留计算图
+                if not self.filter_mask(single_mask, self.mask_filter_thresh):
+                    continue
                 yield image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach()
 
     def preprocess_image(self, image):
@@ -117,3 +126,56 @@ class MaskLevelDataset(IterableDataset):
             mask_normalized = mask * 2 - 1
 
         return mask_normalized, mask
+    
+    def filter_mask(self, mask, thresh=0.1):
+        """
+        Drop mask if it is too small
+
+        mask: (1, H, W) torch.tensor
+        """
+        _, H, W = mask.shape
+        # count number of pixels > 0 in mask
+        num_pixels = torch.sum(mask > 0)
+        if num_pixels / (H * W) < thresh:
+            return False
+        return True
+
+class MaskLevelDatasetRandom(MaskLevelDataset):
+
+    def __init__(
+        self, 
+        dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
+        sam_encoder: Optional[SamImageEncoder], 
+        device: str, 
+        with_image_embed=True,
+        mask_filter_thresh=0.1,
+        seed=42,
+        infinite=False,
+    ):
+        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh)
+        self.rng = np.random.default_rng(seed)
+        self.infinite = infinite
+    
+    def __sample_image(self):
+        # sample a data point from dataset
+        index = self.rng.integers(0, len(self.dataset) - 1)
+        image, mask, instance_info = self.dataset[index]
+        image, image_embed_sam = self.preprocess_image(image)
+        for instance_idx in instance_info.keys():
+            single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
+            if not self.filter_mask(single_mask, self.mask_filter_thresh):
+                continue
+            yield image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach()
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Iterate through the dataset
+
+        Returns:
+            image, image_embed_sam, single_mask_normalized, single_mask
+        """
+
+        yield from self.__sample_image()
+
+        while self.infinite:
+            yield from self.__sample_image()
