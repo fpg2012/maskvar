@@ -185,7 +185,7 @@ class FlexMaskVAR(nn.Module):
     def init_block_mask(self, length=None):
         def mask_mod(b, h, q_idx, k_idx) -> bool:
             # return (self.level_idx[q_idx] == self.level_idx[k_idx])
-            return (q_idx >= k_idx) | (self.level_idx[q_idx] == self.level_idx[k_idx])
+            return (self.level_idx[q_idx] >= self.level_idx[k_idx])
         
         # print("level_idx.device =", self.level_idx.device)
         # if length is None and self.block_masks.get(self.L) is None:
@@ -262,6 +262,7 @@ class FlexMaskVAR(nn.Module):
         
         for b in self.blocks:
             b.attn.kv_caching(True)
+            b.self_attn.kv_caching(True)
         
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             with record_function(f'autogressive pass {si}'):
@@ -302,6 +303,7 @@ class FlexMaskVAR(nn.Module):
         
         for b in self.blocks:
             b.attn.kv_caching(False)
+            b.self_attn.kv_caching(False)
         
         with record_function("vae_proxy"):
             ret = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]

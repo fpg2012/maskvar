@@ -51,7 +51,7 @@ class NeckFPN(nn.Module):
         
         for i, pn in enumerate(self.patch_nums):
             x1_interpolated = F.interpolate(x1, size=(pn, pn), mode='bilinear', align_corners=False)
-            x1_reverse = F.interpolate(x1_interpolated, size=(H, W), mode='bilinear', align_corners=False)
+            # x1_reverse = F.interpolate(x1_interpolated, size=(H, W), mode='bilinear', align_corners=False)
             
             x1_interpolated = x1_interpolated.permute(0, 2, 3, 1) + pe_grids[i].unsqueeze(0).to(x1_interpolated.device)
             x1_interpolated = x1_interpolated.view(B, -1, C).contiguous()
