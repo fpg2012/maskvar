@@ -211,14 +211,15 @@ def init_dist_and_get_args():
             break
     args = Args(explicit_bool=True).parse_args(known_only=True)
     if args.local_debug:
-        args.pn = '1_2_3'
+        # args.pn = '1_2_3'
         args.seed = 1
-        args.aln = 1e-2
-        args.alng = 1e-5
-        args.saln = False
-        args.afuse = False
-        args.pg = 0.8
-        args.pg0 = 1
+        # args.aln = 1e-2
+        # args.alng = 1e-5
+        # args.saln = False
+        # args.afuse = False
+        # args.pg = 0.8
+        # args.pg0 = 1
+        pass
     else:
         pass
         # if args.data_path == '/path/to/imagenet':

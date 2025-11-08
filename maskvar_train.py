@@ -96,15 +96,24 @@ def build_everything(args: arg_util.Args):
     train_set, val_set = build_cocolvis_dataset()
     train_set_masklevel = MaskLevelDataset(train_set, sam_image_encoder, args.device)
     val_set_masklevel = MaskLevelDataset(val_set, sam_image_encoder, args.device)
+    
     print(f'[INIT] counting masks...')
     # Per-rank minimum masks across splits (ensures all ranks have at least this many masks)
     min_masks = train_set.max_count_masks(world_size=tdist.get_world_size())
     # Convert mask count to batch iteration count
     iters_train = min_masks // args.batch_size
-    # iters_train = 2 # for debug only
-    # Build dataloaders; drop_last to ensure exact number of full batches
-    train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
-    val_dataloader = DataLoader(val_set_masklevel, batch_size=args.batch_size, drop_last=True)
+    
+    if args.local_debug:
+        iters_train = 256
+        iters_val = 64
+        train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
+        val_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
+        train_dataloader = islice(cycle(islice(train_dataloader, 1)), iters_train)
+        val_dataloader = islice(cycle(islice(val_dataloader, 1)), iters_val)
+    else:
+        # Build dataloaders; drop_last to ensure exact number of full batches
+        train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
+        val_dataloader = DataLoader(val_set_masklevel, batch_size=args.batch_size, drop_last=True)
     
     # 构建优化器
     # 过滤参数，为不同的参数组设置不同的优化策略
@@ -152,8 +161,8 @@ def build_everything(args: arg_util.Args):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
     del vae_local, var_wo_ddp, var, var_optim
     
-    if args.local_debug:
-        raise NotImplementedError
+    # if args.local_debug:
+    #     raise NotImplementedError
         # rng = torch.Generator('cpu')
         # rng.manual_seed(0)
         # B = 4
@@ -249,6 +258,8 @@ def main_training():
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
         # is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
         is_val_and_also_saving = True
+        if args.local_debug:
+            is_val_and_also_saving = False
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
