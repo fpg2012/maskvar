@@ -7,15 +7,17 @@ import warnings
 from functools import partial
 from itertools import islice, cycle
 
-from maskvar.models.vqvae_single import VQVAE_Single
+
 import torch
+import torch.distributed as tdist
 from torch.utils.data import DataLoader
 
+
 import dist
-import torch.distributed as tdist
-from utils import arg_util, misc
-from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
-from utils.misc import auto_resume
+from maskvar.models.vqvae_single import VQVAE_Single
+from maskvar.utils import arg_util, misc
+from maskvar.utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
+from maskvar.utils.misc import auto_resume
 
 from maskseg_build_everything import (
     build_cocolvis_dataset,
@@ -65,8 +67,8 @@ def build_everything(args: arg_util.Args):
     
     # 构建模型组件
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from utils.amp_sc import AmpOptimizer
-    from utils.lr_control import filter_params
+    from maskvar.utils.amp_sc import AmpOptimizer
+    from maskvar.utils.lr_control import filter_params
 
     # !TODO: replace with custom model
     # 构建VAE和VAR模型
@@ -323,9 +325,9 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         time_preds: time predictions
     """
     # import heavy packages after Dataloader object creation
-    from trainer import VARTrainer
-    from utils.lr_control import lr_wd_annealing
-    trainer: VARTrainer
+    from maskvar_trainer import MaskVarTrainer
+    from maskvar.utils.lr_control import lr_wd_annealing
+    trainer: MaskVarTrainer
     
     step_cnt = 0
     me = misc.MetricLogger(delimiter='  ')

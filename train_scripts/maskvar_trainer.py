@@ -6,18 +6,18 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import IterableDataset, Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
-import dist
 import time
 from tqdm import tqdm
 import numpy as np
 import gc
 
+import dist
 from maskvar.models import sam_image_encoder
 from maskvar.models.maskvar import MaskVAR
 from maskvar.models.flex_maskvar import FlexMaskVAR
 from maskvar.models.image_encoder import ImageEncoder
 from maskvar.models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
-from maskvar.models import VAR, VQVAE, VectorQuantizer2
+from maskvar.models.vqvae_single import VQVAE_Single
 from maskvar.utils.amp_sc import AmpOptimizer
 from maskvar.utils.clicker import Clicker
 from maskvar.utils.misc import MetricLogger, TensorboardLogger
@@ -41,7 +41,7 @@ class InteractiveConfig:
 class MaskVarTrainer(object):
     def __init__(
         self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
-        vae_local: VQVAE, var_wo_ddp: MaskVAR | FlexMaskVAR, var: DDP,
+        vae_local: VQVAE_Single, var_wo_ddp: MaskVAR | FlexMaskVAR, var: DDP,
         var_opt: AmpOptimizer, label_smooth: float, interactive_config: InteractiveConfig,
         sam_image_encoder = None
     ):
