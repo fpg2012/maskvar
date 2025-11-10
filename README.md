@@ -41,3 +41,18 @@ From SAM:
 | `models/sam_image_encoder.py` | image encoder (from SAM) |
 | `models/prompt_encoder.py` | prompt encoder (from SAM) |
 | `models/positional_embedding_random.py` | PE (from SAM) |
+
+## Dataset Placement
+
+```
+data
+├── coco_lvis
+│   ├── cocolvis_annotation
+│   ├── train
+│   └── val
+└── sam-hq
+    ├── cascade_psp
+    ├── DIS5K
+    ├── hqseg44k_ignore_prefix.json
+    └── thin_object_detection
+```
