@@ -2,17 +2,31 @@
 
 ## Environment Setup
 
+Change directory to the project root and then
+
 ```
 conda env create -f environment.yml
 ```
 
+and then
+
+```
+pip install -e maskvar
+```
+
 ## Code Structure
+
+| important scripts | |
+|-------------------|---|
+| `train_scripts/maskvar_train.py` | train script (adpated from VAR) |
+| `train_scripts/maskvar_trainer.py` | trainer (adapted from VAR) |
+| `train_scripts/train_vqvae_example.py` | train VQVAE  |
+
+under `maskvar` directory:
 
 | important file |  |
 |----------------|----------|
 | `maskseg_build_everything.py` | configuration builder/manager |
-| `maskvar_train.py` | train script (adpated from VAR) |
-| `maskvar_trainer.py` | trainer (adapted from VAR) |
 | `models/flex_maskvar.py` | maskvar backbone (w/ flex attn) |
 | `models/maskvar.py` | maskvar backbone (w/o flex attn) |
 | `models/vqvae_single.py` | single channel VQVAE implementation (adapted from VAR) |
