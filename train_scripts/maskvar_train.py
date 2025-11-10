@@ -7,7 +7,7 @@ import warnings
 from functools import partial
 from itertools import islice, cycle
 
-from models.vqvae_single import VQVAE_Single
+from maskvar.models.vqvae_single import VQVAE_Single
 import torch
 from torch.utils.data import DataLoader
 
@@ -27,9 +27,9 @@ from maskseg_build_everything import (
     build_maskvar_flex_mobile_5_stages
 )
 from maskvar_trainer import InteractiveConfig, MaskVarTrainer
-from models.maskvar import MaskVAR
-from models.flex_maskvar import FlexMaskVAR
-from datasets.mask_level_dataset import MaskLevelDataset, count_masks
+from maskvar.models.maskvar import MaskVAR
+from maskvar.models.flex_maskvar import FlexMaskVAR
+from maskvar.datasets.mask_level_dataset import MaskLevelDataset, count_masks
 
 def build_everything(args: arg_util.Args):
     """

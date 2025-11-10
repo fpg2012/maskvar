@@ -1,5 +1,5 @@
 from typing import List, Tuple, Optional, Iterator, Union
-from models import sam_image_encoder
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,19 +12,21 @@ from tqdm import tqdm
 import numpy as np
 import gc
 
-from models.maskvar import MaskVAR
-from models.image_encoder import ImageEncoder
-from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
-from models import VAR, VQVAE, VectorQuantizer2
-from utils.amp_sc import AmpOptimizer
-from utils.clicker import Clicker
-from utils.misc import MetricLogger, TensorboardLogger
+from maskvar.models import sam_image_encoder
+from maskvar.models.maskvar import MaskVAR
+from maskvar.models.flex_maskvar import FlexMaskVAR
+from maskvar.models.image_encoder import ImageEncoder
+from maskvar.models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
+from maskvar.models import VAR, VQVAE, VectorQuantizer2
+from maskvar.utils.amp_sc import AmpOptimizer
+from maskvar.utils.clicker import Clicker
+from maskvar.utils.misc import MetricLogger, TensorboardLogger
 
-from utils.clicker import init_clicks, predict_next_click, to_sam_format
-from utils import resize_longest_side
-from utils.loss import FocalLossGeneral
+from maskvar.utils.clicker import init_clicks, predict_next_click, to_sam_format
+from maskvar.utils import resize_longest_side
+from maskvar.utils.loss import FocalLossGeneral
 
-from datasets.mask_level_dataset import MaskLevelDataset
+from maskvar.datasets.mask_level_dataset import MaskLevelDataset
 
 Ten = torch.Tensor
 FTen = torch.Tensor
@@ -39,7 +41,7 @@ class InteractiveConfig:
 class MaskVarTrainer(object):
     def __init__(
         self, device, patch_nums: Tuple[int, ...], resos: Tuple[int, ...],
-        vae_local: VQVAE, var_wo_ddp: MaskVAR, var: DDP,
+        vae_local: VQVAE, var_wo_ddp: MaskVAR | FlexMaskVAR, var: DDP,
         var_opt: AmpOptimizer, label_smooth: float, interactive_config: InteractiveConfig,
         sam_image_encoder = None
     ):

@@ -16,11 +16,11 @@ import argparse
 import tensorboard
 from torch.utils.tensorboard import SummaryWriter
 
-from maskseg_build_everything import build_vqvae_single_4_stages, build_vqvae_single_fewer_stages, build_cocolvis_dataset
-from models.vqvae_single import VQVAE_Single
-from datasets.hqseg44k import HQSeg44KTrainDataset
-from datasets.coco_lvis import LvisDataset
-from datasets.mask_level_dataset import MaskLevelDataset
+from maskvar.maskseg_build_everything import build_vqvae_single_4_stages, build_vqvae_single_fewer_stages, build_cocolvis_dataset
+from maskvar.models.vqvae_single import VQVAE_Single
+from maskvar.datasets.hqseg44k import HQSeg44KTrainDataset
+from maskvar.datasets.coco_lvis import LvisDataset
+from maskvar.datasets.mask_level_dataset import MaskLevelDataset
 
 # 添加命令行参数解析
 parser = argparse.ArgumentParser(description='训练VQVAE模型')

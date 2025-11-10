@@ -18,7 +18,7 @@ import argparse
 import tensorboard
 from torch.utils.tensorboard import SummaryWriter
 
-from maskseg_build_everything import (
+from maskvar.maskseg_build_everything import (
     build_vqvae_single_4_stages, 
     build_vqvae_single_fewer_stages, 
     build_vqvae_single_4_stages_v2,
@@ -26,8 +26,8 @@ from maskseg_build_everything import (
     build_vqvae_single_4_stages_4_slices_v2,
     build_vqvae_single_5_stages_v1
 )
-from models.vqvae_single import VQVAE_Single
-from datasets.hqseg44k import HQSeg44KTrainDataset
+from maskvar.models.vqvae_single import VQVAE_Single
+from maskvar.datasets.hqseg44k import HQSeg44KTrainDataset
 
 # 添加命令行参数解析
 parser = argparse.ArgumentParser(description='训练VQVAE模型')
