@@ -11,7 +11,7 @@ from tqdm import tqdm
 import numpy as np
 import gc
 
-import dist
+import maskvar.dist
 from maskvar.models import sam_image_encoder
 from maskvar.models.maskvar import MaskVAR
 from maskvar.models.flex_maskvar import FlexMaskVAR

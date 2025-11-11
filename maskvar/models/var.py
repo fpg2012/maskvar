@@ -6,10 +6,10 @@ import torch
 import torch.nn as nn
 # from huggingface_hub import PyTorchModelHubMixin
 
-import dist
-from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
-from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
-from models.vqvae import VQVAE, VectorQuantizer2
+from .. import dist
+from .basic_var import AdaLNBeforeHead, AdaLNSelfAttn
+from .helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
+from .vqvae import VQVAE, VectorQuantizer2
 
 
 class SharedAdaLin(nn.Linear):

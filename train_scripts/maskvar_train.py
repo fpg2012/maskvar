@@ -13,7 +13,7 @@ import torch.distributed as tdist
 from torch.utils.data import DataLoader
 
 
-import dist
+import maskvar.dist
 from maskvar.models.vqvae_single import VQVAE_Single
 from maskvar.utils import arg_util, misc
 from maskvar.utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler

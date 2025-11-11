@@ -2,21 +2,22 @@ import math
 from functools import partial
 from typing import Optional, Tuple, Union, List
 
-from models.prompt_encoder import PromptEncoder
+
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin
-
-import dist
-from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn, CrossAttnBlock
-from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
-from models.vqvae import VQVAE, VectorQuantizer2
-from .var import SharedAdaLin
-from .image_encoder import VarImageEncoder
-from torch.profiler import record_function
-from utils.timer import profile_timer
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.utils.checkpoint import checkpoint
+from torch.profiler import record_function
+
+from .. import dist
+from .prompt_encoder import PromptEncoder
+from .basic_var import AdaLNBeforeHead, AdaLNSelfAttn, CrossAttnBlock
+from .helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
+from .vqvae import VQVAE, VectorQuantizer2
+from .var import SharedAdaLin
+from .image_encoder import VarImageEncoder
+from ..utils.timer import profile_timer
+
 
 class FlexMaskVAR(nn.Module):
     """

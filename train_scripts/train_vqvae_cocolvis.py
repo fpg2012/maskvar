@@ -1,3 +1,10 @@
+import os
+import argparse
+
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,14 +13,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torchvision import transforms
-import numpy as np
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from pathlib import Path
-from PIL import Image
-import os
-import argparse
-import tensorboard
 from torch.utils.tensorboard import SummaryWriter
 
 from maskvar.maskseg_build_everything import build_vqvae_single_4_stages, build_vqvae_single_fewer_stages, build_cocolvis_dataset

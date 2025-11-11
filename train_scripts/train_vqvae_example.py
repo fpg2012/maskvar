@@ -1,22 +1,21 @@
 # Example usgae
 # torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=11134 train_vqvae_example.py --num_epochs 50 --batch_size 4 --out_dir out_vqvae_4_slices --division 2
+import os
+import argparse
+
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 import torch.distributed as dist
 from torchvision import transforms
+
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from pathlib import Path
-from PIL import Image
-import os
-import argparse
-import tensorboard
-from torch.utils.tensorboard import SummaryWriter
 
 from maskvar.maskseg_build_everything import (
     build_vqvae_single_4_stages, 

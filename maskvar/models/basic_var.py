@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention
 from torch.profiler import record_function
 
-from models.helpers import DropPath, drop_path
+from .helpers import DropPath, drop_path
 
 
 # this file only provides the 3 blocks used in VAR transformer

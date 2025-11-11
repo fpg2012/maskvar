@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Type
 import torch
 from torch import nn
 
-from models.positional_embedding_random import PositionEmbeddingRandom
+from .positional_embedding_random import PositionEmbeddingRandom
 
 # From https://github.com/facebookresearch/detectron2/blob/main/detectron2/layers/batch_norm.py # noqa
 # Itself from https://github.com/facebookresearch/ConvNeXt/blob/d1fa8f6fef0a165b27399986cc2bdacc92777e40/models/convnext.py#L119  # noqa

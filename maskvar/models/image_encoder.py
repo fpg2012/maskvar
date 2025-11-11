@@ -2,6 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from typing import List
+
+
 from .sam_image_encoder import ImageEncoderViT as SamImageEncoder
 
 class ImageEncoder(nn.Module):
