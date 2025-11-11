@@ -7,7 +7,9 @@ from PIL import Image
 import os
 import argparse
 import cv2
-from datasets.instance_info import InstanceInfo
+
+
+from .instance_info import InstanceInfo
 
 class HQSeg44KTrainDataset(torch.utils.data.Dataset):
     def __init__(self, data_root='datasets/sam-hq', transform=None, img_size=(256, 256)):

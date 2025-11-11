@@ -7,7 +7,7 @@ import pickle
 import cv2
 from copy import deepcopy
 
-from datasets.instance_info import InstanceInfo
+from .instance_info import InstanceInfo
 
 class LvisDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path, split='train', img_split='train2017', stuff_prob=0.0,

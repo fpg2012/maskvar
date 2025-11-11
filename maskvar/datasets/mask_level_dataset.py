@@ -8,8 +8,8 @@ from typing import Optional, Iterator, Tuple
 
 from .coco_lvis import LvisDataset
 from .hqseg44k import HQSeg44KTrainDataset
-from utils import resize_longest_side
-from models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
+from ..utils import resize_longest_side
+from ..models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
 from tqdm import tqdm
 import numpy as np
 

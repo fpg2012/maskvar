@@ -166,8 +166,7 @@ def predict_next_click(gt_mask, pred_mask, click_list=[], not_clicked_map=None):
     Returns:
         Tuple[int, int, int]: (y, x, is_positive) coordinates of next click
     """
-    if gt_mask is None:
-        raise ValueError("Ground truth mask not set. Call set_gt_mask first.")
+    assert gt_mask is not None, "Ground truth mask not given."
     
     if not_clicked_map is None:
         not_clicked_map = np.ones_like(gt_mask, dtype=bool)
