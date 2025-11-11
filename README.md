@@ -11,7 +11,7 @@ conda env create -f environment.yml
 and then
 
 ```
-pip install -e maskvar
+pip install -e .
 ```
 
 ## Code Structure
