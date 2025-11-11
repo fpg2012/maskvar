@@ -8,7 +8,7 @@ TODO List
 
 unit test (easy to hard)
 
-- [ ] clicker
+- [x] clicker
 - [ ] sam
 - [ ] tinyvit.py (mobile sam)
 - [ ] vqvae_single, idx to model input
