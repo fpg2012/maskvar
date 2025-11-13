@@ -10,7 +10,7 @@ unit test (easy to hard)
 
 - [x] clicker
 - [x] sam
-- [ ] tinyvit.py (mobile sam)
+- [x] tinyvit.py (mobile sam)
 - [ ] vqvae_single, idx to model input
 - [ ] maskvar
 - [ ] flex_maskvar
