@@ -34,13 +34,7 @@ under `maskvar` directory:
 
 Dataset implementation: `datasets/mask_level_dataset.py`
 
-From SAM:
-
-| file |  |
-|-----|---|
-| `models/sam_image_encoder.py` | image encoder (from SAM) |
-| `models/prompt_encoder.py` | prompt encoder (from SAM) |
-| `models/positional_embedding_random.py` | PE (from SAM) |
+From SAM: `models/sam`
 
 ## Dataset Placement
 

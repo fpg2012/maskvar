@@ -1,7 +1,7 @@
 TODO List
 ---
 
-10.5
+11.11
 
 1. do unit test (IMPORTANT)
 2. profile new model
@@ -9,7 +9,7 @@ TODO List
 unit test (easy to hard)
 
 - [x] clicker
-- [ ] sam
+- [x] sam
 - [ ] tinyvit.py (mobile sam)
 - [ ] vqvae_single, idx to model input
 - [ ] maskvar
