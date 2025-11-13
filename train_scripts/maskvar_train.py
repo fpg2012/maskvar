@@ -13,13 +13,13 @@ import torch.distributed as tdist
 from torch.utils.data import DataLoader
 
 
-import maskvar.dist
+import maskvar.dist as dist
 from maskvar.models.vqvae_single import VQVAE_Single
 from maskvar.utils import arg_util, misc
-from maskvar.utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
+# from maskvar.utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from maskvar.utils.misc import auto_resume
 
-from maskseg_build_everything import (
+from maskvar.maskseg_build_everything import (
     build_cocolvis_dataset,
     build_vqvae_single,
     build_maskvar,
@@ -31,7 +31,7 @@ from maskseg_build_everything import (
 from maskvar_trainer import InteractiveConfig, MaskVarTrainer
 from maskvar.models.maskvar import MaskVAR
 from maskvar.models.flex_maskvar import FlexMaskVAR
-from maskvar.datasets.mask_level_dataset import MaskLevelDataset, count_masks
+from maskvar.datasets import MaskLevelDataset, MaskLevelDatasetRandom
 
 def build_everything(args: arg_util.Args):
     """
@@ -72,7 +72,7 @@ def build_everything(args: arg_util.Args):
 
     # !TODO: replace with custom model
     # 构建VAE和VAR模型
-    vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_flex_mobile_5_stages('out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', 'ckpt/mobile_sam.pt', device=args.device) 
+    vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_flex_mobile_5_stages('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', 'ckpt/mobile_sam.pt', device=args.device) 
     # vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_flex('ckpt/vqvae_single.pth', 'ckpt/sam_vit_b_01ec64.pth', device=args.device) 
     # vae_local, var_wo_ddp, sam_image_encoder = build_maskvar_v2('out_vqvae_4_stages_2/ckpt/vqvae_single_epoch_40.pth', 'ckpt/sam_vit_b_01ec64.pth', flash_if_available=True, device=args.device) 
     
@@ -96,7 +96,7 @@ def build_everything(args: arg_util.Args):
     # dataset
     print(f'[INIT] Building dataset...')
     train_set, val_set = build_cocolvis_dataset()
-    train_set_masklevel = MaskLevelDataset(train_set, sam_image_encoder, args.device)
+    train_set_masklevel = MaskLevelDatasetRandom(train_set, sam_image_encoder, args.device)
     val_set_masklevel = MaskLevelDataset(val_set, sam_image_encoder, args.device)
     
     print(f'[INIT] counting masks...')

@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.profiler import record_function
 
 from .. import dist
-from .prompt_encoder import PromptEncoder
+from .sam import PromptEncoder
 from .basic_var import AdaLNBeforeHead, AdaLNSelfAttn, CrossAttn
 from .helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from .vqvae import VQVAE, VectorQuantizer2

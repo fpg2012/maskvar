@@ -3,8 +3,8 @@ from functools import partial
 from typing import Optional, Tuple
 
 from .models.vqvae_single import VQVAE_Single
-from .models.maskgit import MaskGIT
-from .models.maskseg import MaskSeg
+# from .models.maskgit import MaskGIT
+# from .models.maskseg import MaskSeg
 from .models.flex_maskvar import FlexMaskVAR
 from .models.sam import ImageEncoderViT as SamImageEncoder
 from .models.sam import PromptEncoder
@@ -17,19 +17,19 @@ from .datasets.coco_lvis import LvisDataset
 from .datasets.hqseg44k import HQSeg44KTrainDataset
 
 
-def build_maskseg(vqvae_checkpoint_path: Optional[str] = None, maskgit_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None) -> MaskSeg:
-    vqvae = build_vqvae_single(vqvae_checkpoint_path)
+# def build_maskseg(vqvae_checkpoint_path: Optional[str] = None, maskgit_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None) -> MaskSeg:
+#     vqvae = build_vqvae_single(vqvae_checkpoint_path)
 
-    prompt_encoder = build_prompt_encoder(sam_checkpoint_path)
-    image_encoder = build_image_encoder(sam_checkpoint_path)
-    maskgit = build_maskgit(vqvae, maskgit_checkpoint_path)
+#     prompt_encoder = build_prompt_encoder(sam_checkpoint_path)
+#     image_encoder = build_image_encoder(sam_checkpoint_path)
+#     maskgit = build_maskgit(vqvae, maskgit_checkpoint_path)
 
-    maskseg = MaskSeg(maskgit=maskgit, 
-                      prompt_encoder=prompt_encoder, 
-                      image_encoder=image_encoder, 
-                      freeze_prompt_encoder=True)
+#     maskseg = MaskSeg(maskgit=maskgit, 
+#                       prompt_encoder=prompt_encoder, 
+#                       image_encoder=image_encoder, 
+#                       freeze_prompt_encoder=True)
 
-    return maskseg
+#     return maskseg
 
 def build_maskvar(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, flash_if_available: bool = False, device='cpu'):
     vqvae = build_vqvae_single(vqvae_checkpoint_path).to(device)
@@ -721,45 +721,45 @@ def build_prompt_encoder(sam_checkpoint_path: Optional[str] = None) -> PromptEnc
 
     return prompt_encoder
 
-def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
-    maskgit = MaskGIT(
-        vqvae=vqvae,
-        image_size=256,
-        patch_size=8,
-        dim=256,
-        num_heads=8,
-        num_blocks=8,
-        vocab_size=4096,
-        image_cross_layers=[0, 4],
-        click_cross_layers=[2, 6],
-        freeze_vqvae=True,
-    )
+# def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
+#     maskgit = MaskGIT(
+#         vqvae=vqvae,
+#         image_size=256,
+#         patch_size=8,
+#         dim=256,
+#         num_heads=8,
+#         num_blocks=8,
+#         vocab_size=4096,
+#         image_cross_layers=[0, 4],
+#         click_cross_layers=[2, 6],
+#         freeze_vqvae=True,
+#     )
 
-    if maskgit_checkpoint_path is not None:
-        maskgit_state_dict = torch.load(maskgit_checkpoint_path)
-        maskgit.load_state_dict(maskgit_state_dict)
+#     if maskgit_checkpoint_path is not None:
+#         maskgit_state_dict = torch.load(maskgit_checkpoint_path)
+#         maskgit.load_state_dict(maskgit_state_dict)
 
-    return maskgit
+#     return maskgit
 
-def build_maskgit_v0(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
-    maskgit = MaskGIT(
-        vqvae=vqvae,
-        image_size=256,
-        patch_size=8,
-        dim=256,
-        num_heads=8,
-        num_blocks=6,
-        vocab_size=4096,
-        image_cross_layers=[0, 3],
-        click_cross_layers=[1, 4],
-        freeze_vqvae=True,
-    )
+# def build_maskgit_v0(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
+#     maskgit = MaskGIT(
+#         vqvae=vqvae,
+#         image_size=256,
+#         patch_size=8,
+#         dim=256,
+#         num_heads=8,
+#         num_blocks=6,
+#         vocab_size=4096,
+#         image_cross_layers=[0, 3],
+#         click_cross_layers=[1, 4],
+#         freeze_vqvae=True,
+#     )
 
-    if maskgit_checkpoint_path is not None:
-        maskgit_state_dict = torch.load(maskgit_checkpoint_path)
-        maskgit.load_state_dict(maskgit_state_dict)
+#     if maskgit_checkpoint_path is not None:
+#         maskgit_state_dict = torch.load(maskgit_checkpoint_path)
+#         maskgit.load_state_dict(maskgit_state_dict)
 
-    return maskgit
+#     return maskgit
 
 def build_cocolvis_dataset(dataset_path='data/coco_lvis') -> Tuple[LvisDataset, LvisDataset]:
     trainset = LvisDataset(

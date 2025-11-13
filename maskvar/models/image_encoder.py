@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import List
 
 
-from .sam_image_encoder import ImageEncoderViT as SamImageEncoder
+from .sam import ImageEncoderViT as SamImageEncoder
 
 class ImageEncoder(nn.Module):
     def __init__(self, sam_embed_dim: int, embed_dim: int, sam_encoder: SamImageEncoder, freeze_sam_encoder: bool = True):

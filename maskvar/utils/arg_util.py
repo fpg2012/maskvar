@@ -19,7 +19,7 @@ except ImportError as e:
     time.sleep(5)
     raise e
 
-import dist
+from .. import dist
 
 
 class Args(Tap):
@@ -233,7 +233,7 @@ def init_dist_and_get_args():
         print(f'======================================================================================\n\n')
     
     # init torch distributed
-    from utils import misc
+    from . import misc
     os.makedirs(args.local_out_dir_path, exist_ok=True)
     misc.init_distributed_mode(local_out_path=args.local_out_dir_path, timeout=30)
     
