@@ -90,7 +90,11 @@ class MaskVarTrainer(object):
     @torch.no_grad()
     def eval_ep(self, ld_val: DataLoader):
         tot = 0
-        L_mean, L_tail, acc_mean, acc_tail = 0, 0, 0, 0
+        device = dist.get_device()
+        L_mean = torch.tensor(0.0, device=device)
+        L_tail = torch.tensor(0.0, device=device) 
+        acc_mean = torch.tensor(0.0, device=device)
+        acc_tail = torch.tensor(0.0, device=device)
         stt = time.time()
         training = self.var_wo_ddp.training
         self.var_wo_ddp.eval()

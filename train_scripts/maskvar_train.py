@@ -106,8 +106,8 @@ def build_everything(args: arg_util.Args):
     iters_train = min_masks // args.batch_size
     
     if args.local_debug:
-        iters_train = 256
-        iters_val = 64
+        iters_train = 64
+        iters_val = 32
         train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
         val_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
         train_dataloader = islice(cycle(islice(train_dataloader, 1)), iters_train)
@@ -261,7 +261,8 @@ def main_training():
         # is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
         is_val_and_also_saving = True
         if args.local_debug:
-            is_val_and_also_saving = False
+            is_val_and_also_saving = (ep % 20 == 0 and ep > 0)
+            
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
