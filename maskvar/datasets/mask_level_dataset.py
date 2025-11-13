@@ -1,17 +1,16 @@
-from json.encoder import py_encode_basestring
 import torch
 from torch.utils.data import IterableDataset
 import torch.distributed as dist
 import torch.nn.functional as F
+from tqdm import tqdm
+import numpy as np
 
 from typing import Optional, Iterator, Tuple
 
 from .coco_lvis import LvisDataset
 from .hqseg44k import HQSeg44KTrainDataset
 from ..utils import resize_longest_side
-from ..models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
-from tqdm import tqdm
-import numpy as np
+from ..models.sam import ImageEncoderViT as SamImageEncoder
 
 def count_masks(dataset: LvisDataset | HQSeg44KTrainDataset, world_size=1, rank=0):
     count = 0
@@ -33,13 +32,18 @@ class MaskLevelDataset(IterableDataset):
         sam_encoder: Optional[SamImageEncoder], 
         device: str, 
         with_image_embed=True,
-        mask_filter_thresh=0.1
+        mask_filter_thresh=0.1,
+        image_size_encoder=1024,
+        image_size_mask=256,
     ):
         self.dataset = dataset
         self.sam_encoder = sam_encoder
         self.device = device
         self.with_image_embed = with_image_embed
         self.mask_filter_thresh = mask_filter_thresh
+
+        self.image_size_encoder = image_size_encoder
+        self.image_size_mask = image_size_mask
         
         if self.with_image_embed:
             assert self.sam_encoder is not None
@@ -81,19 +85,18 @@ class MaskLevelDataset(IterableDataset):
         image: (H, W, 3)
         """
         with torch.no_grad():  # 整个预处理过程都不需要梯度
-            image = torch.from_numpy(image).to(self.device, dtype=torch.float32, non_blocking=True) / 255.0
+            # !MUST NOT DIVIDE 255 HERE
+            image = torch.from_numpy(image).to(self.device, dtype=torch.float32, non_blocking=True)
             image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
-            image = resize_longest_side(image.unsqueeze(0), 1024).squeeze(0)
+            image = resize_longest_side(image.unsqueeze(0), self.image_size_encoder).squeeze(0)
 
             # normalize image
-            image = image.permute(1, 2, 0) # (3, H, W) -> (H, W, 3)
-            image = (image - self.pixel_mean) / self.pixel_std
-            image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
+            image = (image - self.pixel_mean.view(-1, 1, 1)) / self.pixel_std.view(-1, 1, 1)
 
-            # pad image to 1024
+            # pad image to image_size_encoder (default 1024)
             h, w = image.shape[-2:]
-            padh = 1024 - h
-            padw = 1024 - w
+            padh = self.image_size_encoder - h
+            padw = self.image_size_encoder - w
             image = F.pad(image, (0, padw, 0, padh), value=0)
 
             # print(f'image shape: {image.shape}')
@@ -113,13 +116,13 @@ class MaskLevelDataset(IterableDataset):
             # to tensor
             mask = torch.from_numpy(mask).to(self.device, dtype=torch.float32, non_blocking=True).unsqueeze(0)
 
-            mask = resize_longest_side(mask.unsqueeze(0), 256, 'nearest').squeeze(0)
+            mask = resize_longest_side(mask.unsqueeze(0), self.image_size_mask, 'nearest').squeeze(0)
             # mask = mask.long()
 
-            # pad mask to 256
+            # pad mask to image_size_mask (default 256)
             h, w = mask.shape[-2:]
-            padh = 256 - h
-            padw = 256 - w
+            padh = self.image_size_mask - h
+            padw = self.image_size_mask - w
             mask = F.pad(mask, (0, padw, 0, padh), value=0)
 
             # normalize mask
@@ -151,8 +154,10 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
         mask_filter_thresh=0.1,
         seed=42,
         infinite=False,
+        image_size_encoder=1024,
+        image_size_mask=256
     ):
-        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh)
+        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask)
         self.rng = np.random.default_rng(seed)
         self.infinite = infinite
     
