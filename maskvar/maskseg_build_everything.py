@@ -1,11 +1,13 @@
 import torch
+from functools import partial
+from typing import Optional, Tuple
 
 from .models.vqvae_single import VQVAE_Single
 from .models.maskgit import MaskGIT
 from .models.maskseg import MaskSeg
 from .models.flex_maskvar import FlexMaskVAR
-from .models.sam_image_encoder import ImageEncoderViT as SamImageEncoder
-from .models.prompt_encoder import PromptEncoder
+from .models.sam import ImageEncoderViT as SamImageEncoder
+from .models.sam import PromptEncoder
 from .models.image_encoder import ImageEncoder, VarImageEncoder, NeckFPN
 from .models.maskvar import MaskVAR
 from .models.tinyvit import TinyViT
@@ -13,9 +15,6 @@ from .models.tinyvit import TinyViT
 from .datasets.mask_level_dataset import MaskLevelDataset
 from .datasets.coco_lvis import LvisDataset
 from .datasets.hqseg44k import HQSeg44KTrainDataset
-
-from functools import partial
-from typing import Optional, Tuple
 
 
 def build_maskseg(vqvae_checkpoint_path: Optional[str] = None, maskgit_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None) -> MaskSeg:

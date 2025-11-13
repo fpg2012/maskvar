@@ -97,12 +97,12 @@ def predict_next_click(gt_mask, pred_mask, click_list=[], not_clicked_map=None):
     
     return click, click_list, not_clicked_map
 
-def to_sam_format(click_list, pad_size=0):
-    coords = torch.tensor([(click[1], click[0]) for click in click_list])
+def to_sam_format(click_list, pad_size=0, device='cpu'):
+    coords = torch.tensor([(click[1], click[0]) for click in click_list], device=device)
     # label: 1 for positive, 0 for negative, -1 for padding
-    label = torch.tensor([click[2] for click in click_list])
+    label = torch.tensor([click[2] for click in click_list], device=device)
     L_clicks = len(click_list)
     if pad_size > 0 and pad_size > L_clicks:
-        coords = torch.cat([coords, torch.zeros(pad_size - L_clicks, 2)], dim=0)
-        label = torch.cat([label, torch.zeros(pad_size - L_clicks, dtype=torch.long) - 1], dim=0)
+        coords = torch.cat([coords, torch.zeros(pad_size - L_clicks, 2, device=device)], dim=0).to(dtype=torch.float)
+        label = torch.cat([label, torch.zeros(pad_size - L_clicks, dtype=torch.long, device=device) - 1], dim=0).to(dtype=torch.int)
     return coords, label

@@ -31,3 +31,15 @@ def merge_image(x_0, division):
     x = x_0.view(division**2, B, C, h, w).permute(1, 2, 0, 3, 4).contiguous() # (B, C, 4, h, w)
     x = x.view(B, C, 2, 2, h, w).permute(0, 1, 2, 4, 3, 5).contiguous().view(B, C, H, W) # (B, C, H, W)
     return x
+
+def restore_normalized_image(image: torch.Tensor):
+    """
+    Restore normalized image to original image
+
+    image: (C, H, W)
+    """
+    device = image.device
+    pixel_mean = torch.tensor([123.675, 116.28, 103.53], device=device) # copied from sam
+    pixel_std = torch.tensor([58.395, 57.12, 57.375], device=device) # copied from sam
+    restored_image = image * pixel_std + pixel_mean
+    return restored_image
