@@ -14,7 +14,7 @@ from .models.tinyvit import TinyViT
 
 from .datasets.mask_level_dataset import MaskLevelDataset
 from .datasets.coco_lvis import LvisDataset
-from .datasets.hqseg44k import HQSeg44KTrainDataset
+from .datasets.hqseg44k import HQSeg44KTestDataset, HQSeg44KTrainDataset
 
 
 # def build_maskseg(vqvae_checkpoint_path: Optional[str] = None, maskgit_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None) -> MaskSeg:
@@ -777,4 +777,16 @@ def build_cocolvis_dataset(dataset_path='data/coco_lvis') -> Tuple[LvisDataset, 
     )
 
     return trainset, valset
-    
+
+def build_hqseg44k_dataset(dataset_path='data/sam-hq') -> Tuple[HQSeg44KTrainDataset, HQSeg44KTestDataset]:
+    trainset = HQSeg44KTrainDataset(
+        data_root=dataset_path,
+        img_size=(1024, 1024)
+    )
+
+    testset = HQSeg44KTestDataset(
+        data_root=dataset_path,
+        img_size=(1024, 1024)
+    )
+
+    return trainset, testset
