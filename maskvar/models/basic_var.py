@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention
 from torch.profiler import record_function
+from einops import rearrange
 
 from .helpers import DropPath, drop_path
 
@@ -158,11 +159,14 @@ class SelfAttention_v2(nn.Module):
     def forward(self, x, block_mask=None):
         B, L, C = x.shape
         
-        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)
+        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias)))
         main_type = qkv.dtype
         # qkv: BL3Hc
+
+        qkv = rearrange(qkv, 'B L (QKV H c) -> QKV B H L c', QKV=3, H=self.num_heads, c=self.head_dim)
         
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).contiguous().unbind(dim=0); dim_cat = 2               # q or k or v: BHLc
+        q, k, v = qkv.unbind(dim=0) # q or k or v: B H L c
+        dim_cat = 2 # dim of L, for kv_cache
         
         if self.attn_l2_norm:
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
@@ -174,7 +178,8 @@ class SelfAttention_v2(nn.Module):
             else: k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat); v = self.cached_v = torch.cat((self.cached_v, v), dim=dim_cat)
         
         # BHLc => BLHc => BLC
-        oup = flex_attention(q, k, v, block_mask=block_mask).transpose(1, 2).reshape(B, L, C)
+        oup = flex_attention(q, k, v, block_mask=block_mask) # B H L c
+        oup = rearrange(oup, 'B H L c -> B L (H c)')
         
         return self.proj_drop(self.proj(oup))
         # attn = (q @ k.transpose(-2, -1)).add_(attn_bias + self.local_rpb())  # BHLc @ BHcL => BHLL
@@ -291,8 +296,8 @@ class CrossAttention_v2(nn.Module):
             self.scale = 0.25 / math.sqrt(self.head_dim)
         
         self.mat_q = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.mat_k = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.mat_v = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.mat_kv = nn.Linear(embed_dim, embed_dim*2, bias=False)
+        # self.mat_v = nn.Linear(embed_dim, embed_dim, bias=False)
         self.q_bias = nn.Parameter(torch.zeros(embed_dim))
         self.v_bias = nn.Parameter(torch.zeros(embed_dim))
         self.register_buffer('zero_k_bias', torch.zeros(embed_dim))
@@ -312,21 +317,19 @@ class CrossAttention_v2(nn.Module):
         # print(f'CrossAttention: x.shape: {x.shape}, cond.shape: {cond.shape}')
         # print(f'CrossAttention: cond.shape: {cond.shape}')
         
-        q = F.linear(input=x, weight=self.mat_q.weight, bias=self.q_bias).view(B, L, 1, self.num_heads, self.head_dim)
+        q = F.linear(input=x, weight=self.mat_q.weight, bias=self.q_bias) # B L C
         # print(f'CrossAttention_v2: q.shape: {q.shape}')
-    
-        k = F.linear(input=cond, weight=self.mat_k.weight, bias=self.zero_k_bias).view(B, L_cond, 1, self.num_heads, self.head_dim)
-        v = F.linear(input=cond, weight=self.mat_v.weight, bias=self.v_bias).view(B, L_cond, 1, self.num_heads, self.head_dim)
-        # print(f'CrossAttention_v2: k.shape: {k.shape}, v.shape: {v.shape}')
-        # qkv = torch.cat((q, k, v), dim=2) 
-
         main_type = q.dtype
+    
+        kv = F.linear(input=cond, weight=self.mat_kv.weight, bias=torch.cat((self.zero_k_bias, self.v_bias))) # B L C*2
+        # v = F.linear(input=cond, weight=self.mat_v.weight, bias=self.v_bias).view(B, L_cond, 1, self.num_heads, self.head_dim)
+        # print(f'CrossAttention_v2: k.shape: {k.shape}, v.shape: {v.shape}')
+
+        q = rearrange(q, 'B L (H c) -> B H L c', H=self.num_heads, c=self.head_dim)
+        kv = rearrange(kv, 'B L (kv H c) -> kv B H L c', kv=2, H=self.num_heads, c=self.head_dim)
+        k, v = kv.unbind(dim=0)
         
-        # q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0)
-        q = q.permute(2, 0, 3, 1, 4).view(B, self.num_heads, L, self.head_dim).contiguous()
-        k = k.permute(2, 0, 3, 1, 4).view(B, self.num_heads, -1, self.head_dim).contiguous()
-        v = v.permute(2, 0, 3, 1, 4).view(B, self.num_heads, -1, self.head_dim).contiguous()
-        dim_cat = 2  # q or k or v: BHLc
+        dim_cat = 2  # q or k or v: B H L c
         
         if self.attn_l2_norm:
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
@@ -342,7 +345,7 @@ class CrossAttention_v2(nn.Module):
         # print(f'CrossAttention_v2: oup.shape: {oup.shape}')
         # print(f'CrossAttention_v2: proj.shape: {self.proj.weight.shape}')
         
-        oup = oup.transpose(1, 2).reshape(B, L, C) # BHLc => BLHc => BLC
+        oup = rearrange(oup, 'B H L c -> B L (H c)')
         # print(f'CrossAttention_v2: oup.shape: {oup.shape}')
         
         return self.proj_drop(self.proj(oup))
