@@ -21,6 +21,7 @@ from maskvar.utils.misc import auto_resume
 
 from maskvar.maskseg_build_everything import (
     build_cocolvis_dataset,
+    build_hqseg44k_dataset,
     build_vqvae_single,
     build_maskvar,
     build_maskvar_v2,
@@ -31,7 +32,7 @@ from maskvar.maskseg_build_everything import (
 from maskvar_trainer import InteractiveConfig, MaskVarTrainer
 from maskvar.models.maskvar import MaskVAR
 from maskvar.models.flex_maskvar import FlexMaskVAR
-from maskvar.datasets import MaskLevelDataset, MaskLevelDatasetRandom
+from maskvar.datasets import MaskLevelDataset, MaskLevelDatasetRandom, MaskLevelDatasetDummy
 
 def build_everything(args: arg_util.Args):
     """
@@ -95,27 +96,61 @@ def build_everything(args: arg_util.Args):
     
     # dataset
     print(f'[INIT] Building dataset...')
-    train_set, val_set = build_cocolvis_dataset()
-    train_set_masklevel = MaskLevelDatasetRandom(train_set, sam_image_encoder, args.device)
-    val_set_masklevel = MaskLevelDataset(val_set, sam_image_encoder, args.device)
+    if args.local_debug:
+        # for debug, overfit on one image
+        train_set, _ = build_hqseg44k_dataset() # validate on train set
+        train_set_masklevel = MaskLevelDatasetDummy(
+            dataset=train_set,
+            sam_encoder=sam_image_encoder,
+            device=args.device,
+            mask_filter_thresh=0.1,
+            seed=42,
+        )
+        val_set_masklevel = MaskLevelDatasetDummy(
+            dataset=train_set,
+            sam_encoder=sam_image_encoder,
+            device=args.device,
+            mask_filter_thresh=0.1,
+            seed=42,
+        )
+    else:
+        train_set, val_set = build_cocolvis_dataset()
+        train_set_masklevel = MaskLevelDatasetRandom(
+            dataset=train_set,
+            sam_encoder=sam_image_encoder,
+            device=args.device,
+            mask_filter_thresh=0.1,
+            seed=42,
+            infinite=True,
+        )
+        val_set_masklevel = MaskLevelDatasetRandom(
+            dataset=val_set,
+            sam_encoder=sam_image_encoder,
+            device=args.device,
+            mask_filter_thresh=0.1,
+            seed=42,
+            infinite=True,
+        )
     
     print(f'[INIT] counting masks...')
     # Per-rank minimum masks across splits (ensures all ranks have at least this many masks)
-    min_masks = train_set.max_count_masks(world_size=tdist.get_world_size())
+    # min_masks = train_set.max_count_masks(world_size=tdist.get_world_size())
     # Convert mask count to batch iteration count
-    iters_train = min_masks // args.batch_size
+    # iters_train = min_masks // args.batch_size
     
     if args.local_debug:
-        iters_train = 64
-        iters_val = 32
+        iters_train = 32
+        iters_val = 16
         train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
         val_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
-        train_dataloader = islice(cycle(islice(train_dataloader, 1)), iters_train)
-        val_dataloader = islice(cycle(islice(val_dataloader, 1)), iters_val)
+        val_dataloader = islice(val_dataloader, iters_val)
     else:
+        iters_train = 8000
+        iters_val = 64
         # Build dataloaders; drop_last to ensure exact number of full batches
         train_dataloader = DataLoader(train_set_masklevel, batch_size=args.batch_size, drop_last=True)
         val_dataloader = DataLoader(val_set_masklevel, batch_size=args.batch_size, drop_last=True)
+        val_dataloader = islice(val_dataloader, iters_val)
     
     # 构建优化器
     # 过滤参数，为不同的参数组设置不同的优化策略
@@ -157,7 +192,10 @@ def build_everything(args: arg_util.Args):
         device=args.device, patch_nums=patch_nums, resos=args.resos,
         vae_local=vae_local, var_wo_ddp=var_wo_ddp, var=var,
         var_opt=var_optim, label_smooth=args.ls,
-        interactive_config=InteractiveConfig(2, 10),
+        interactive_config=InteractiveConfig(
+            num_random_clicks=1,
+            num_interactive_clicks=10,
+        ),
     )
     if trainer_state is not None and len(trainer_state):
         trainer.load_state_dict(trainer_state, strict=False, skip_vae=True) # don't load vae again
@@ -245,14 +283,15 @@ def main_training():
         # cycle()会保留所有元素的引用，导致显存累积
         ld_train_iter = islice(ld_train, iters_train)
         
-        print(f"[rank{tdist.get_rank()}][MEM USAGE]\n{torch.cuda.memory_summary(device=None, abbreviated=False)}")
+        # print(f"[rank{tdist.get_rank()}][MEM USAGE]\n{torch.cuda.memory_summary(device=None, abbreviated=False)}")
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train_iter, iters_train, trainer
         )
         
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
-        if L_tail != -1: best_L_tail, best_acc_tail = min(best_L_tail, L_tail), max(best_acc_tail, acc_tail)
+        if L_tail != -1:
+            best_L_tail, best_acc_tail = min(best_L_tail, L_tail), max(best_acc_tail, acc_tail)
         args.L_mean, args.L_tail, args.acc_mean, args.acc_tail, args.grad_norm = L_mean, L_tail, acc_mean, acc_tail, grad_norm
         args.cur_ep = f'{ep+1}/{args.ep}'
         args.remain_time, args.finish_time = remain_time, finish_time
@@ -265,6 +304,7 @@ def main_training():
             
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
+
             best_updated = best_val_loss_tail > val_loss_tail
             best_val_loss_mean, best_val_loss_tail = min(best_val_loss_mean, val_loss_mean), min(best_val_loss_tail, val_loss_tail)
             best_val_acc_mean, best_val_acc_tail = max(best_val_acc_mean, val_acc_mean), max(best_val_acc_tail, val_acc_tail)

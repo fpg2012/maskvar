@@ -17,6 +17,7 @@ from maskvar.models.flex_maskvar import FlexMaskVAR
 from maskvar.models.image_encoder import ImageEncoder
 from maskvar.models.sam import ImageEncoderViT as SamImageEncoder
 from maskvar.models.vqvae_single import VQVAE_Single
+from maskvar.models.quant import VectorQuantizer2
 from maskvar.utils.amp_sc import AmpOptimizer
 from maskvar.utils.misc import MetricLogger, TensorboardLogger
 
@@ -48,8 +49,8 @@ class MaskVarTrainer(object):
         # 模型相关组件
         self.var = var  # 主模型（可能是 DDP 包装后的）
         self.vae_local = vae_local  # VAE 模型
-        self.quantize_local = vae_local.quantize  # VAE 的量化器
-        self.quantize_local: VectorQuantizer2  # 类型注解：向量量化器
+        self.quantize_local: VectorQuantizer2 = vae_local.quantize  # VAE 的量化器
+        # self.quantize_local: VectorQuantizer2  # 类型注解：向量量化器
         # 确保在验证时可以直接访问未 DDP 包装的模型实例
         self.var_wo_ddp = var_wo_ddp  # 未包装的模型实例（用于 torch.compile 优化后）
         self.var_opt = var_opt  # 优化器
@@ -61,9 +62,9 @@ class MaskVarTrainer(object):
         
         # 损失函数配置
         self.label_smooth = label_smooth  # 标签平滑系数
-        # self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')  # 训练用损失函数（带标签平滑）
+        self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')  # 训练用损失函数（带标签平滑）
         self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')  # 验证用损失函数（无标签平滑）
-        self.train_loss = FocalLossGeneral(alpha=0.1, gamma=2.0, label_smooth=label_smooth, reduction='none')
+        # self.train_loss = FocalLossGeneral(alpha=0.1, gamma=2.0, label_smooth=label_smooth, reduction='none')
         
         # Patch 相关配置
         self.L = sum(pn * pn for pn in patch_nums)  # 总 token 数（所有 patch 的 token 数之和）
@@ -116,7 +117,12 @@ class MaskVarTrainer(object):
             single_mask_cpu = single_mask.cpu().numpy()
             click_lists = []
             for i in range(B):
-                click_list, eroded_mask, dt = init_clicks(single_mask_cpu[i][0], num_random_clicks=self.interactive_config.num_random_clicks)
+                click_list, eroded_mask, dt = init_clicks(
+                    gt_mask=single_mask_cpu[i][0],
+                    num_random_clicks=self.interactive_config.num_random_clicks,
+                    random_sample=False,
+                    not_clicked_map=None,
+                )
                 click_lists.append(click_list)
             point_coords = []
             point_labels = []
@@ -188,7 +194,12 @@ class MaskVarTrainer(object):
         gt_mask_cpu = gt_mask_B1HW.detach().cpu().numpy()
         click_lists = []
         for i in range(B):
-            click_list, eroded_mask, dt = init_clicks(gt_mask_cpu[i][0], num_random_clicks=self.interactive_config.num_random_clicks)
+            click_list, eroded_mask, dt = init_clicks(
+                gt_mask=gt_mask_cpu[i][0], 
+                num_random_clicks=self.interactive_config.num_random_clicks,
+                not_clicked_map=None,
+                random_sample=False,
+            )
             click_lists.append(click_list)
 
         point_coords = []
