@@ -11,11 +11,19 @@ unit test (easy to hard)
 - [x] clicker
 - [x] sam
 - [x] tinyvit.py (mobile sam)
-- [ ] vqvae_single, idx to model input
-- [ ] maskvar
+- [x] vqvae_single
+  - [x] img2img, idx2img, img2idx
+  - [x] to model input (likely correct) (considering a simpler one)
 - [ ] flex_maskvar
-- [ ] positional embedding
+  - [x] self attention (v2)
+  - [x] cross attention (v2) (likely correct)
+  - [ ] positional embedding
+  - [ ] prompt encoder pe
+  - [ ] image feature adapter
+  - [ ] autogressive inference
+  - [ ] layer norm (should be added)
 - [ ] loss function
+- [ ] maskvar (low priority)
 
 ----
 
