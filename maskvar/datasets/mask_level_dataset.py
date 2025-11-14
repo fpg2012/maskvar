@@ -143,6 +143,46 @@ class MaskLevelDataset(IterableDataset):
             return False
         return True
 
+class MaskLevelDatasetDummy(MaskLevelDataset):
+
+    def __init__(
+        self, 
+        dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
+        sam_encoder: Optional[SamImageEncoder], 
+        device: str, 
+        with_image_embed=True,
+        mask_filter_thresh=0.1,
+        seed=42,
+        image_size_encoder=1024,
+        image_size_mask=256,
+    ):
+        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask)
+        self.rng = np.random.default_rng(seed)
+        self.seed = seed
+
+        # sample a data point from dataset
+        index = self.rng.integers(0, len(self.dataset))
+        image, mask, instance_info = self.dataset[index]
+        image, image_embed_sam = self.preprocess_image(image)
+
+        for instance_idx in instance_info.keys():
+            single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
+            if not self.filter_mask(single_mask, self.mask_filter_thresh):
+                continue
+            self.result = (image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach())
+            break
+    
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Iterate through the dataset
+
+        Returns:
+            image, image_embed_sam, single_mask_normalized, single_mask
+        """
+
+        yield self.result
+
 class MaskLevelDatasetRandom(MaskLevelDataset):
 
     def __init__(
@@ -153,24 +193,43 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
         with_image_embed=True,
         mask_filter_thresh=0.1,
         seed=42,
+        num_masks=-1, # -1表示无限制
         infinite=False,
         image_size_encoder=1024,
-        image_size_mask=256
+        image_size_mask=256,
+        shuffle=True, # 是否每次顺序都相同
     ):
         super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask)
         self.rng = np.random.default_rng(seed)
+        self.num_masks = num_masks
         self.infinite = infinite
+        self.seed = seed
+        self.counter = 0
+        self.shuffle = shuffle
+
+    def __reset_rng_and_counter(self):
+        self.rng = np.random.default_rng(self.seed)
+        self.counter = 0
     
     def __sample_image(self):
+        if not self.shuffle:
+            self.__reset_rng_and_counter()
+
         # sample a data point from dataset
-        index = self.rng.integers(0, len(self.dataset) - 1)
+        index = self.rng.integers(0, len(self.dataset))
         image, mask, instance_info = self.dataset[index]
         image, image_embed_sam = self.preprocess_image(image)
+
         for instance_idx in instance_info.keys():
+            if self.num_masks > 0 and self.counter >= self.num_masks:
+                break
+
             single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
             if not self.filter_mask(single_mask, self.mask_filter_thresh):
                 continue
             yield image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach()
+            
+            self.counter += 1
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
