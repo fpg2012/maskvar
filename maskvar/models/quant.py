@@ -253,7 +253,8 @@ class VectorQuantizer2(nn.Module):
         f_hat = gt_ms_idx_Bl[0].new_zeros(B, C, H, W, dtype=torch.float32)
         pn_next: int = self.v_patch_nums[0]
         for si in range(SN-1):
-            if self.prog_si == 0 or (0 <= self.prog_si-1 < si): break   # 渐进式训练（目前不支持）
+            if self.prog_si == 0 or (0 <= self.prog_si-1 < si):
+                break   # 渐进式训练（目前不支持）
             h_BChw = F.interpolate(self.embedding(gt_ms_idx_Bl[si]).transpose_(1, 2).view(B, C, pn_next, pn_next), size=(H, W), mode='bicubic')
             if SN - 1 > 0:
                 f_hat.add_(self.quant_resi[si/(SN-1)](h_BChw))

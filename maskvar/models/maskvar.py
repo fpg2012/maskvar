@@ -338,7 +338,7 @@ class MaskVAR(nn.Module):
         
         with record_function("class_emb"):
             # 使用FP32精度处理类别嵌入和位置编码
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.autocast('cuda', enabled=False):
                 # 标签dropout：以cond_drop_rate概率将标签替换为num_classes（表示无类别）
                 # label_B = torch.where(
                 #     torch.rand(B, device=label_B.device) < self.cond_drop_rate,
