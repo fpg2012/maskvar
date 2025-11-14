@@ -5,7 +5,17 @@ import torch
 import traceback
 
 
-def init_clicks(gt_mask, num_random_clicks=2, click_list=[], not_clicked_map=None):
+def init_clicks(gt_mask, num_random_clicks=1, not_clicked_map=None, random_sample=True):
+    """
+    init positive clicks for interactive segmentation
+
+    gt_mask:            0-1 mask. np.ndarray of shape [H, W]
+    num_random_clicks:  number of init clicks
+    not_clicked_map:    1 means not clicked, 0 mean clicked. used to avoid duplicate click. np.ndarray of shape [H, W]
+    random_sample:      whether sample from the probability map. num_random_clicks must be 1 if random_sample set to False
+    """
+    assert random_sample or (not random_sample and num_random_clicks == 1), \
+        f"num_random_clicks must be 1 if random_sample set to False, got {num_random_clicks}"
     click_list = []
     if not_clicked_map is None:
         not_clicked_map = np.ones_like(gt_mask, dtype=bool)
@@ -24,11 +34,17 @@ def init_clicks(gt_mask, num_random_clicks=2, click_list=[], not_clicked_map=Non
             # unpad dt
             dt = dt[1:-1, 1:-1]
 
-            # Sample a point based on the probability map
-            flat_probs = ((dt*not_clicked_map)**2).flatten()
-            flat_probs = flat_probs / flat_probs.sum()  # Normalize to probabilities
-            idx = np.random.choice(len(flat_probs), p=flat_probs)
-            y, x = np.unravel_index(idx, dt.shape)
+            if random_sample:
+                # Sample a point based on the probability map
+                flat_probs = ((dt*not_clicked_map)**2).flatten()
+                flat_probs = flat_probs / flat_probs.sum()  # Normalize to probabilities
+                idx = np.random.choice(len(flat_probs), p=flat_probs)
+                y, x = np.unravel_index(idx, dt.shape)
+            else:
+                # Sample the fixed probability
+                flat_probs = (dt*not_clicked_map).flatten()
+                idx = np.argmax(flat_probs)
+                y, x = np.unravel_index(idx, dt.shape)    
             
             # Add random click (1 for positive since sampling from gt_mask)
             click_list.append((y, x, 1))
