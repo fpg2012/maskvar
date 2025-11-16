@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.utils.data import IterableDataset, Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 import time
+from einops import rearrange
 from tqdm import tqdm
 import numpy as np
 import gc
@@ -349,7 +350,9 @@ class MaskVarTrainer(object):
             # torch.cuda.synchronize()
             # print(f"[rank{dist.get_rank()}][MEM USAGE] after!! \n {torch.cuda.memory_summary(device=dist.get_device(), abbreviated=True)}")
             # 计算每个token的loss (B, L)
-            loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
+            
+            # loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
+            loss = self.train_loss(rearrange(logits_BLV, 'B L V -> B V L'), gt_BL)
             
             # 应用progressive training的loss权重
             if prog_si >= 0:  # progressive training阶段
