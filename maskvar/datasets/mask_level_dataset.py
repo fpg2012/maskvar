@@ -180,8 +180,8 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
         Returns:
             image, image_embed_sam, single_mask_normalized, single_mask
         """
-
-        yield self.result
+        while True:
+            yield self.result
 
 class MaskLevelDatasetRandom(MaskLevelDataset):
 
