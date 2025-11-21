@@ -6,11 +6,13 @@ from .models.vqvae_single import VQVAE_Single
 # from .models.maskgit import MaskGIT
 # from .models.maskseg import MaskSeg
 from .models.flex_maskvar import FlexMaskVAR
+from .models.flex_maskvar_simple import FlexMaskVARSimple
 from .models.sam import ImageEncoderViT as SamImageEncoder
 from .models.sam import PromptEncoder
 from .models.image_encoder import ImageEncoder, VarImageEncoder, NeckFPN
 from .models.maskvar import MaskVAR
 from .models.tinyvit import TinyViT
+from .models.simple_ar import SimpleAR
 
 from .datasets.mask_level_dataset import MaskLevelDataset
 from .datasets.coco_lvis import LvisDataset
@@ -140,6 +142,30 @@ def build_maskvar_flex_mobile_5_stages(vqvae_checkpoint_path: Optional[str] = No
         patch_nums=patch_nums,
         # fused_if_available=True,
         image_encoder_requires_grad=True,
+        prompt_encoder_requires_grad=False,
+    ).to(device)
+    return vqvae, maskvar, sam_image_encoder
+
+def build_maskvar_flex_simple_mobile_5_stages(vqvae_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None, device='cpu'):
+    patch_nums = (1, 8, 16, 24, 32)
+    vqvae = build_vqvae_single_5_stages_v1(vqvae_checkpoint_path).to(device)
+    sam_image_encoder = build_mobile_sam_image_encoder(sam_checkpoint_path).to(device)
+    prompt_encoder = build_prompt_encoder(sam_checkpoint_path).to(device)
+    maskvar = FlexMaskVARSimple(
+        vae_local=vqvae, 
+        prompt_encoder=prompt_encoder,
+        num_classes=1,
+        depth=4,
+        embed_dim=256,
+        num_heads=4,
+        mlp_ratio=4,
+        drop_rate=0.1,
+        drop_path_rate=0.1,
+        norm_eps=1e-6,
+        shared_aln=False,
+        cond_drop_rate=0.1,
+        attn_l2_norm=False,
+        patch_nums=patch_nums,
         prompt_encoder_requires_grad=False,
     ).to(device)
     return vqvae, maskvar, sam_image_encoder
@@ -720,6 +746,22 @@ def build_prompt_encoder(sam_checkpoint_path: Optional[str] = None) -> PromptEnc
         prompt_encoder.load_state_dict(prompt_encoder_state_dict)
 
     return prompt_encoder
+
+def build_simple_ar(simple_ar_checkpoint_path: Optional[str] = None, device: str = 'cpu') -> SimpleAR:
+    simple_ar = SimpleAR(
+        dim=256,
+        depth=2,
+        vocab_size=4096,
+        device=device,
+        patch_num=[1, 8, 16, 24, 32],
+        num_heads=4,
+    )
+
+    if simple_ar_checkpoint_path is not None:
+        simple_ar_state_dict = torch.load(simple_ar_checkpoint_path)
+        simple_ar.load_state_dict(simple_ar_state_dict)
+
+    return simple_ar.to(device)
 
 # def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
 #     maskgit = MaskGIT(

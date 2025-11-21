@@ -10,6 +10,7 @@ import argparse
 
 from maskvar.models.basic_var import SelfAttention_v2
 from maskvar.models.basic_var import CrossAttnBlock
+from maskvar.utils.loss import FocalLossGeneral
 
 device = 'cuda'
 
@@ -58,7 +59,7 @@ class DummyTransformerBlock(nn.Module):
         self.layer_norm2 = nn.LayerNorm(dim)
         # self.layer_norm = nn.Identity()
     
-    def forward(self, x: torch.Tensor, block_mask):
+    def forward(self, x: torch.Tensor, cond=None, prompt_cond=None, block_mask=None):
         """
         x: [B, L, C]
         """
@@ -69,19 +70,19 @@ class DummyTransformerBlock(nn.Module):
 class DummyTransformer(nn.Module):
     def __init__(self, dim=256, depth=2, vocab_size=50, device='cpu', max_len=20, num_heads=4):
         super().__init__()
-        # self.blocks = nn.ModuleList([
-        #     DummyTransformerBlock(dim, num_heads=num_heads)
-        #     for _ in range(depth)
-        # ])
         self.blocks = nn.ModuleList([
-            CrossAttnBlock(
-                cond_dim=dim, shared_aln=False,
-                block_idx=block_idx, embed_dim=dim, norm_layer=nn.LayerNorm, num_heads=num_heads, mlp_ratio=4,
-                drop=0, drop_path=0, last_drop_p=0,
-                attn_l2_norm=False,
-            )
-            for block_idx in range(depth)
+            DummyTransformerBlock(dim, num_heads=num_heads)
+            for _ in range(depth)
         ])
+        # self.blocks = nn.ModuleList([
+        #     CrossAttnBlock(
+        #         cond_dim=dim, shared_aln=False,
+        #         block_idx=block_idx, embed_dim=dim, norm_layer=nn.LayerNorm, num_heads=num_heads, mlp_ratio=4,
+        #         drop=0, drop_path=0, last_drop_p=0,
+        #         attn_l2_norm=False,
+        #     )
+        #     for block_idx in range(depth)
+        # ])
         self.vocab_size = vocab_size
         self.dim = dim
         self.embed = nn.Embedding(self.vocab_size, dim) # pad=10, sos=11, eos=12
@@ -132,10 +133,15 @@ class DummyTransformer(nn.Module):
 
 def overfit(model, loss, n_epoch):
     model.train()
-    dummy_seq = [[11, 1, 0, 3, 8, 4, 3, 2, 1, 4, 3, 0, 4, 2, 3, 4, 12, 10, 10, 10],
-                 [11, 4, 3, 3, 3, 1, 4, 0, 1, 8, 3, 2, 4, 0, 2, 4, 12, 10, 10, 10],
-                 [11, 1, 8, 3, 4, 3, 3, 4, 3, 2, 0, 4, 0, 4, 2, 1, 12, 10, 10, 10],
-                 [11, 3, 2, 8, 1, 3, 3, 0, 2, 4, 4, 4, 4, 1, 3, 0, 12, 10, 10, 10],]
+    # dummy_seq = [[11, 1, 0, 3, 8, 4, 3, 2, 1, 4, 3, 0, 4, 2, 3, 4, 12, 10, 10, 10],
+    #              [11, 4, 3, 3, 3, 1, 4, 0, 1, 8, 3, 2, 4, 0, 2, 4, 12, 10, 10, 10],
+    #              [11, 1, 8, 3, 4, 3, 3, 4, 3, 2, 0, 4, 0, 4, 2, 1, 12, 10, 10, 10],
+    #              [11, 3, 2, 8, 1, 3, 3, 0, 2, 4, 4, 4, 4, 1, 3, 0, 12, 10, 10, 10],]
+    dummy_seq = [[11, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 2, 0, 12, 10, 10, 10],
+                 [11, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 1, 1, 2, 12, 10, 10, 10],
+                 [11, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 2, 2, 2, 12, 10, 10, 10],
+                 [11, 1, 1, 2, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 12, 10, 10, 10],
+                ]
     valid_len = 17
     dummy_seq = torch.tensor(dummy_seq, dtype=torch.long, device=device)
     print('dummy_seq.shape:', dummy_seq.shape)
@@ -150,19 +156,16 @@ def overfit(model, loss, n_epoch):
                 opt.zero_grad()
                 logits = model(dummy_seq)
                 L = loss(logits[:, :valid_len-1, :].permute(0, 2, 1), dummy_seq[:, 1:valid_len])
-                L.backward()
+                Lmean = L.mean()
+                Lmean.backward()
                 opt.step()
                 
                 acc = (logits[:, :valid_len-1, :].argmax(dim=-1) == dummy_seq[:, 1:valid_len]).float().mean()
 
                 # 在进度条中显示损失
-                loss_seq.append(L.item())
-                tqdm_instance.set_postfix(loss=f"{L.item():.4f}", acc=f"{acc.item()*100:.2f}%")
+                loss_seq.append(Lmean.item())
+                tqdm_instance.set_postfix(loss=f"{Lmean.item():.4f}", acc=f"{acc.item()*100:.2f}%")
         return loss_seq
-    
-    loss_seq = overfit(model, loss, n_epoch)
-    with open(f'loss_{exp_name}.json', 'w') as f:
-        json.dump(loss_seq, f)
 
 def autogressive_infer(model, device):
     model.eval()
@@ -189,7 +192,8 @@ if __name__ == '__main__':
     device = args.device
     exp_name = args.exp
 
-    loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')
+    loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='none')
+    # loss = FocalLossGeneral(alpha=0.1, gamma=2.0, label_smooth=0, reduction='none')
 
     model = DummyTransformer(depth=1, dim=128, vocab_size=50, device=device, num_heads=2)
     model.to(device)

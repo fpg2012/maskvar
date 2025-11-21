@@ -98,6 +98,7 @@ def build_everything(args: arg_util.Args):
     print(f'[INIT] Building dataset...')
     if args.local_debug:
         # for debug, overfit on one image
+        print('local debug mode, overfit on one image')
         train_set, _ = build_hqseg44k_dataset() # validate on train set
         train_set_masklevel = MaskLevelDatasetDummy(
             dataset=train_set,
