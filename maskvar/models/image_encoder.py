@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from einops import rearrange
 from typing import List
 
 
@@ -20,7 +21,8 @@ class ImageEncoder(nn.Module):
         sam_image_embedding = self.sam_encoder(x) # (B, sam_embed_dim, H, W) H=W=64
         image_embedding = sam_image_embedding
         # image_embedding = self.adapt_conv(sam_image_embedding) # (B, embed_dim, H/2, W/2) H=W=64
-        image_embedding = image_embedding.permute(0, 2, 3, 1) # (B, H/2, W/2, embed_dim)
+        image_embedding = rearrange(image_embedding, 'B C H W -> B H W C')
+        # image_embedding = image_embedding.permute(0, 2, 3, 1) # (B, H/2, W/2, embed_dim)
         return image_embedding
 
 class NeckFPN(nn.Module):
