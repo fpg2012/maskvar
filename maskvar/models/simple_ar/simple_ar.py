@@ -272,11 +272,35 @@ class SimpleVAR(nn.Module):
         probs = torch.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
         return next_token
+
+
+def simple_var_train_pass(idx, simple_var: SimpleVAR, vqvae: VQVAE_Single):
+    """
+    Training pass for SimpleVAR model.
+
+    1. Convert discrete codes to VQVAE input format
+    2. Preprocess input for SimpleVAR
+    3. Forward pass with block mask
     
+    Args:
+        idx: (B, l) - Input discrete codes from VQVAE
+        simple_var: SimpleVAR model instance
+        vqvae: VQVAE model instance
+
+    Returns: logits (B, l, vocab_size)
+    """
+    with torch.no_grad():
+        x = vqvae.quantize.idxBl_to_var_input(idx)
+    x = simple_var.preprocess(x)
+    logits = simple_var(x, block_mask=simple_var.block_mask)
+    return logits
+
 @torch.no_grad()
-def simple_var_inference(self, simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size: int):
+def simple_var_inference(simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size: int):
     """
     Autoregressive inference using top-k/top-p sampling
+    
+    Returns: sampled token sequences of shape (B, l)
     """
     B = batch_size
     H = W = simple_var.patch_nums[-1]
