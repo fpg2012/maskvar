@@ -241,38 +241,50 @@ class SimpleVAR(nn.Module):
         logits = self.cls(x)
         return logits
     
-    def sample_with_top_k_top_p_(self, logits, top_k=1, top_p=0.95):
+    def sample_with_top_k_(self, logits, top_k=50):
         """
-        Sample from logits using top-k and top-p (nucleus) sampling
-
-        logits: (B, C) - batch of token logits for the next token
-        Returns: (B, 1) - sampled token indices
+        Sample from logits using top-k sampling
+        
+        Args:
+            logits: (B, C) - batch of token logits for the next token
+            top_k: keep only top k tokens for sampling
+        
+        Returns:
+            (B, 1) - sampled token indices
         """
-        # Apply top-k filtering
-        if top_k > 0:
-            values, indices = torch.topk(logits, top_k)
-            mask = torch.full_like(logits, float('-inf'))
-            mask.scatter_(1, indices, 0)
-            logits = logits + mask
+        # 确保top_k不超过词汇表大小
+        vocab_size = logits.shape[-1]
+        top_k = min(top_k, vocab_size)
         
-        # Apply top-p (nucleus) filtering
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            # Create mask for tokens to keep
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            
-            # Scatter sorted tensors to original indexing
-            mask = torch.zeros_like(logits).bool()
-            mask.scatter_(1, sorted_indices, sorted_indices_to_remove)
-            logits = logits.masked_fill(mask, float('-inf'))
+        if top_k <= 0:
+            # 如果top_k无效，直接采样
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            return next_token
         
-        # Sample from the filtered distribution
-        probs = torch.softmax(logits, dim=-1)
+        # 获取top-k的值和索引
+        topk_values, topk_indices = torch.topk(logits, k=top_k, dim=-1)
+        
+        # 创建掩码：只保留top-k位置的logits
+        # 方法1: 使用scatter直接构建新logits
+        batch_size = logits.shape[0]
+        
+        # 创建全为-inf的logits
+        filtered_logits = torch.full_like(logits, float('-inf'))
+        
+        # 使用einops重新排列索引以便scatter操作
+        # 将topk_indices从(B, k)转换为适合scatter的形状
+        batch_indices = torch.arange(batch_size, device=logits.device)
+        batch_indices = rearrange(batch_indices, 'b -> b 1')
+        batch_indices = batch_indices.expand(-1, top_k)
+        
+        # 使用scatter_填充top-k值
+        filtered_logits[batch_indices, topk_indices] = topk_values
+        
+        # 从过滤后的分布中采样
+        probs = torch.softmax(filtered_logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
+        
         return next_token
 
 
@@ -305,36 +317,60 @@ def simple_var_inference(simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size:
     Returns: sampled token sequences of shape (B, l)
     """
     B = batch_size
-    H = W = simple_var.patch_nums[-1]
+    H = W = simple_var.patch_num[-1]
     C = simple_var.vqvae_dim
+
+    pos_embed_to_add, level_embed_to_add = simple_var.calc_embed_to_add() # (1, L, C), (1, L, C)
 
     id_seq = []
     current_token = repeat(
         rearrange(simple_var.sos, 'c -> 1 1 c'), 
-        '1 1 c -> b 1 c', b=B)   # (B, 1, C)
+        '1 1 c -> b 1 c',
+        b=B
+    ) # (B, 1, C)
+    start_pos = 0
+
     f_hat = torch.zeros(B, C, H, W, dtype=torch.float, device=simple_var.device)
 
-    # no need for inference at the finest scale
-    for scale, pn in enumerate(simple_var.patch_num[:-1]):
+    print(f"simple_var.patch_num: {simple_var.patch_num}")
+
+    for scale, pn in enumerate(simple_var.patch_num):
+        print(f"scale, pn: {scale}, {pn}")
+        print(f"current_token shape: {current_token.shape}")
+        # add pos and level embeddings
+        end_pos = start_pos + pn * pn
+
+        pos_embed = pos_embed_to_add[:, start_pos:end_pos]
+        level_embed = level_embed_to_add[:, start_pos:end_pos]
+        current_token = current_token + pos_embed + level_embed
+
         # Forward pass to get logits. No need for block masking during inference
         logits = simple_var.forward(current_token, block_mask=None) # (B, pn*pn, vocab_size)
         # Sample next token
-        next_tokens = simple_var.sample_with_top_k_top_p_(logits[:, -1], top_k=50, top_p=0.95) # (B, pn*pn)
+        logits_flat = rearrange(logits, 'b l v -> (b l) v')
+        print(f"logits_flat shape: {logits_flat.shape}")
+        next_tokens = simple_var.sample_with_top_k_(logits_flat, top_k=1)
+        print(f"next_tokens shape: {next_tokens.shape}")
+        next_tokens = rearrange(next_tokens, '(b l) 1 -> b l', b=B, l=pn*pn)
+        print(f"next_tokens shape: {next_tokens.shape}")
 
         # Append prediction to sequence
         id_seq.append(next_tokens)
 
-        # Convert prediction to feature for next step
-        h = rearrange(vqvae.quantize.embedding(next_tokens), 'B (h w) C -> B C h w', h=pn, w=pn) # B, C, pn, pn
-        h_up = F.interpolate(h, size=(H, W), mode='bicubic', align_corners=False)
-        
-        # Update f_hat for next iteration
-        t = scale / (len(simple_var.patch_nums) - 1)
-        f_hat.add_(vqvae.quantize.quant_resi[t](h_up))
+        if scale < len(simple_var.patch_num) - 1:
+            # Convert prediction to feature for next step
+            h = rearrange(vqvae.quantize.embedding(next_tokens), 'B (h w) C -> B C h w', h=pn, w=pn) # B, C, pn, pn
+            h_up = F.interpolate(h, size=(H, W), mode='bicubic', align_corners=False)
+            
+            # Update f_hat for next iteration
+            t = scale / (len(simple_var.patch_num) - 1)
+            f_hat.add_(vqvae.quantize.quant_resi[t](h_up))
 
-        pn_next = simple_var.patch_nums[scale + 1]
+            pn_next = simple_var.patch_num[scale + 1]
 
-        f_hat_down = F.interpolate(f_hat, size=(pn_next, pn_next), mode='area', align_corners=False)
-        current_token = rearrange(f_hat_down, 'B C h w -> B (h w) C')
+            f_hat_down = F.interpolate(f_hat, size=(pn_next, pn_next), mode='area')
+            current_token = rearrange(f_hat_down, 'B C h w -> B (h w) C')
+            # linear projection
+            current_token = simple_var.linear(current_token)
         
     return id_seq

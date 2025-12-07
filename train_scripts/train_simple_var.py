@@ -66,8 +66,8 @@ class SimpleARTrainer:
 
     def train_step(self, image, image_embed_sam, single_mask_normalized, single_mask):
         self.optimizer.zero_grad()
-        gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
-        gt_idx_flat = torch.cat(gt_idx, dim=1)
+        gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
+        gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
 
         logits = simple_var_train_pass(
             idx=gt_idx,
@@ -77,7 +77,7 @@ class SimpleARTrainer:
 
         acc = (logits.argmax(dim=-1) == gt_idx_flat).float().mean()
 
-        logits = rearrange(logits, 'b l c -> b c l')
+        logits = rearrange(logits, 'B L C -> B C L')
 
         loss = self.loss_function(logits, gt_idx_flat)
         loss = loss.mean()

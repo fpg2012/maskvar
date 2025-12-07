@@ -776,6 +776,13 @@ def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, device: s
 
     if simple_var_checkpoint_path is not None:
         simple_var_state_dict = torch.load(simple_var_checkpoint_path)
+        if any(key.startswith('_orig_mod.') for key in simple_var_state_dict.keys()):
+            # 创建一个新的字典，移除 '_orig_mod.' 前缀
+            new_state_dict = {}
+            for key, value in simple_var_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_var_state_dict = new_state_dict
         simple_var.load_state_dict(simple_var_state_dict)
 
     return simple_var.to(device)
