@@ -12,7 +12,7 @@ from .models.sam import PromptEncoder
 from .models.image_encoder import ImageEncoder, VarImageEncoder, NeckFPN
 from .models.maskvar import MaskVAR
 from .models.tinyvit import TinyViT
-from .models.simple_ar import SimpleAR
+from .models.simple_ar import SimpleAR, SimpleVAR
 
 from .datasets.mask_level_dataset import MaskLevelDataset
 from .datasets.coco_lvis import LvisDataset
@@ -762,6 +762,24 @@ def build_simple_ar(simple_ar_checkpoint_path: Optional[str] = None, device: str
         simple_ar.load_state_dict(simple_ar_state_dict)
 
     return simple_ar.to(device)
+
+def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, device: str = 'cpu') -> SimpleVAR:
+    simple_var = SimpleVAR(
+        dim=256,
+        depth=2,
+        vocab_size=4096,
+        device=device,
+        patch_num=[1, 8, 16, 24, 32],
+        num_heads=4,
+        vqvae_dim=32,
+    )
+
+    if simple_var_checkpoint_path is not None:
+        simple_var_state_dict = torch.load(simple_var_checkpoint_path)
+        simple_var.load_state_dict(simple_var_state_dict)
+
+    return simple_var.to(device)
+
 
 # def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
 #     maskgit = MaskGIT(

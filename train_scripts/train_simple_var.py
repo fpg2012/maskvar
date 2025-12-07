@@ -70,7 +70,7 @@ class SimpleARTrainer:
         gt_idx_flat = torch.cat(gt_idx, dim=1)
 
         logits = simple_var_train_pass(
-            idx=gt_idx_flat, 
+            idx=gt_idx,
             simple_var=self.simple_var, 
             vqvae=self.vqvae
         )
@@ -91,7 +91,7 @@ class SimpleARTrainer:
         if num_iters > 0:
             train_dataloader = islice(train_dataloader, num_iters)
 
-        self.simple_ar.train()
+        self.simple_var.train()
         
         pbar = tqdm.tqdm(enumerate(train_dataloader), desc="Training", total=num_iters)
         for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
@@ -111,7 +111,7 @@ class SimpleARTrainer:
         else:
             val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
         
-        self.simple_ar.eval()
+        self.simple_var.eval()
 
         losses = []
         accs = []
@@ -121,7 +121,7 @@ class SimpleARTrainer:
             gt_idx_flat = torch.cat(gt_idx, dim=1)
 
             logits = simple_var_train_pass(
-                idx=gt_idx_flat,
+                idx=gt_idx,
                 simple_var=self.simple_var, 
                 vqvae=self.vqvae
             )
@@ -141,14 +141,14 @@ class SimpleARTrainer:
     
     def save_checkpoint(self, iters: int):
         torch.save(self.optimizer.state_dict(), self.output_dir / f'.optimizer.{iters}.pt')
-        torch.save(self.simple_ar.state_dict(), self.output_dir / f'.simple_ar.{iters}.pt')
+        torch.save(self.simple_var.state_dict(), self.output_dir / f'.simple_var.{iters}.pt')
 
 
 if __name__ == "__main__":
     import argparse
     from maskvar.maskseg_build_everything import (
         build_hqseg44k_dataset,
-        build_simple_ar,
+        build_simple_var,
         build_vqvae_single_5_stages_v1,
     )
 
@@ -184,11 +184,11 @@ if __name__ == "__main__":
         seed=42,
     )
 
-    simple_ar = build_simple_ar(device=device)
+    simple_var = build_simple_var(device=device)
     vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
 
     trainer = SimpleARTrainer(
-        simple_ar=simple_ar,
+        simple_var=simple_var,
         vqvae=vqvae,
         lr=1e-3,
         train_set=train_set_masklevel,

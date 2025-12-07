@@ -176,12 +176,15 @@ class SimpleVAR(nn.Module):
     def calc_embed_to_add(self):
         # pos emb
         pos_embed_to_add = []
+
+        pos_embed_1chw = rearrange(self.pos_embed, '1 h w c -> 1 c h w')
         for i, pn in enumerate(self.patch_num):
             if pn == self.patch_num[-1]:
-                pos_embed_interpolated = self.pos_embed
+                pos_embed_interpolated = pos_embed_1chw
             else:
-                pos_embed_interpolated = F.interpolate(self.pos_embed, size=(pn, pn), mode='bilinear', align_corners=False)
-            pos_embed_interpolated = rearrange(pos_embed_interpolated, '1 h w c -> 1 (h w) c')
+                pos_embed_interpolated = F.interpolate(pos_embed_1chw, size=(pn, pn), mode='bilinear', align_corners=False)
+            pos_embed_interpolated = rearrange(pos_embed_interpolated, '1 c h w -> 1 (h w) c')
+            # print(f"pn={pn}, interpolated shape: {pos_embed_interpolated.shape}")
             pos_embed_to_add.append(pos_embed_interpolated)
         pos_embed_to_add = torch.cat(pos_embed_to_add, dim=1)
 
@@ -190,7 +193,8 @@ class SimpleVAR(nn.Module):
         for i in range(len(self.patch_num)):
             level_embed = repeat(self.level_embedding.weight[i], 'c -> l c', l=self.patch_num[i]**2)
             level_embed_to_add.append(level_embed)
-        level_embed_to_add = torch.cat(level_embed_to_add, dim=0)
+        level_embed_to_add = torch.cat(level_embed_to_add, dim=0) # L c
+        level_embed_to_add = repeat(level_embed_to_add, 'l c -> b l c', b=1) # 1 L c
 
         return pos_embed_to_add, level_embed_to_add
 
@@ -204,26 +208,24 @@ class SimpleVAR(nn.Module):
     def preprocess(self, x: torch.Tensor):
         """
         1. project x to model dimension
-        2. add positional and level embeddings
-        3. remove first token (corresponding to the first patch)
-        4. prepend SOS token
+        2. prepend SOS token
+        3. add positional and level embeddings
 
-        x: (B, L, C)
+        x: (B, L-1, C) output from quant.idxBl_to_var_input()
         """
-        B, L, C = x.shape
+        B, L_minus_1, C = x.shape
+        L = L_minus_1 + 1
         pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
         
         # map x using linear
         x = self.linear(x)
         x = self.norm(x)
-        
-        x = x + pos_embed_to_add + level_embed_to_add
-
-        # remove first token of x (the one that corresponds to the first patch)
-        x = x[:, 1:]
 
         sos = repeat(self.sos, 'c -> b 1 c', b=B)
         x = torch.cat([sos, x], dim=1)
+        
+        x = x + pos_embed_to_add + level_embed_to_add
+
         return x
     
     def forward(self, x: torch.Tensor, block_mask=None):
@@ -283,7 +285,7 @@ def simple_var_train_pass(idx, simple_var: SimpleVAR, vqvae: VQVAE_Single):
     3. Forward pass with block mask
     
     Args:
-        idx: (B, l) - Input discrete codes from VQVAE
+        idx: List of (B, l) - Input discrete codes from VQVAE
         simple_var: SimpleVAR model instance
         vqvae: VQVAE model instance
 
