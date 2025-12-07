@@ -1,9 +1,11 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from einops import rearrange, repeat
 
 from ..basic_var import SelfAttention_v2
+from ..vqvae_single import VQVAE_Single
 
 class MLP(nn.Module):
 
@@ -128,3 +130,185 @@ class SimpleAR(nn.Module):
             x = block(x, cond=None, prompt_cond=None, block_mask=None)
         logits = self.cls(x)
         return logits
+
+class SimpleVAR(nn.Module):
+    def __init__(self,
+                 dim=256,
+                 depth=2,
+                 vocab_size=4096, 
+                 device='cpu', 
+                 patch_num=[1, 4, 8, 16, 32], 
+                 num_heads=4,
+                 vqvae_dim=256,
+                 ):
+        super().__init__()
+        self.patch_num = patch_num
+        self.blocks = nn.ModuleList([
+            TransformerBlock(dim, num_heads=num_heads)
+            for _ in range(depth)
+        ])
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.vqvae_dim = vqvae_dim
+        # we don't need embed now, replaced with a linear
+        # self.embed = nn.Embedding(self.vocab_size, dim)
+        self.cls = nn.Linear(dim, self.vocab_size)
+
+        self.device = device
+        self.max_len = sum([x**2 for x in self.patch_num])
+        self.block_mask = None
+        
+        pn_last = self.patch_num[-1]
+        
+        self.pos_embed = nn.Parameter(torch.randn(1, pn_last, pn_last, dim))
+        self.level_embedding = nn.Embedding(len(patch_num), dim)
+        
+        self.sos = nn.Parameter(torch.randn(dim))
+
+        self.level_map = []
+        for i in range(len(self.patch_num)):
+            self.level_map.extend([i] * (self.patch_num[i]**2))
+
+        
+        self.linear = nn.Linear(self.vqvae_dim, self.dim)
+        self.norm = nn.LayerNorm(self.dim)
+
+    def calc_embed_to_add(self):
+        # pos emb
+        pos_embed_to_add = []
+        for i, pn in enumerate(self.patch_num):
+            if pn == self.patch_num[-1]:
+                pos_embed_interpolated = self.pos_embed
+            else:
+                pos_embed_interpolated = F.interpolate(self.pos_embed, size=(pn, pn), mode='bilinear', align_corners=False)
+            pos_embed_interpolated = rearrange(pos_embed_interpolated, '1 h w c -> 1 (h w) c')
+            pos_embed_to_add.append(pos_embed_interpolated)
+        pos_embed_to_add = torch.cat(pos_embed_to_add, dim=1)
+
+        # level embed
+        level_embed_to_add = []
+        for i in range(len(self.patch_num)):
+            level_embed = repeat(self.level_embedding.weight[i], 'c -> l c', l=self.patch_num[i]**2)
+            level_embed_to_add.append(level_embed)
+        level_embed_to_add = torch.cat(level_embed_to_add, dim=0)
+
+        return pos_embed_to_add, level_embed_to_add
+
+    def init_block_mask(self, length=None):
+        # block mask
+        def mask_mod(b, h, q_idx, k_idx) -> bool:
+            return self.level_map[q_idx] == self.level_map[k_idx]
+        
+        self.block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=self.max_len+1, KV_LEN=self.max_len+1, device=self.device)
+    
+    def preprocess(self, x: torch.Tensor):
+        """
+        1. project x to model dimension
+        2. add positional and level embeddings
+        3. remove first token (corresponding to the first patch)
+        4. prepend SOS token
+
+        x: (B, L, C)
+        """
+        B, L, C = x.shape
+        pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
+        
+        # map x using linear
+        x = self.linear(x)
+        x = self.norm(x)
+        
+        x = x + pos_embed_to_add + level_embed_to_add
+
+        # remove first token of x (the one that corresponds to the first patch)
+        x = x[:, 1:]
+
+        sos = repeat(self.sos, 'c -> b 1 c', b=B)
+        x = torch.cat([sos, x], dim=1)
+        return x
+    
+    def forward(self, x: torch.Tensor, block_mask=None):
+        """
+        Applies the transformer blocks and outputs logits.
+        When training, set block_mask to `self.block_mask`
+        When inferencing, set block_mask to `None`
+
+        x: (B, L, C)
+        """
+        for block in self.blocks:
+            x = block(x, cond=None, prompt_cond=None, block_mask=block_mask)
+        logits = self.cls(x)
+        return logits
+    
+    def sample_with_top_k_top_p_(self, logits, top_k=1, top_p=0.95):
+        """
+        Sample from logits using top-k and top-p (nucleus) sampling
+
+        logits: (B, C) - batch of token logits for the next token
+        Returns: (B, 1) - sampled token indices
+        """
+        # Apply top-k filtering
+        if top_k > 0:
+            values, indices = torch.topk(logits, top_k)
+            mask = torch.full_like(logits, float('-inf'))
+            mask.scatter_(1, indices, 0)
+            logits = logits + mask
+        
+        # Apply top-p (nucleus) filtering
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            
+            # Create mask for tokens to keep
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            
+            # Scatter sorted tensors to original indexing
+            mask = torch.zeros_like(logits).bool()
+            mask.scatter_(1, sorted_indices, sorted_indices_to_remove)
+            logits = logits.masked_fill(mask, float('-inf'))
+        
+        # Sample from the filtered distribution
+        probs = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        return next_token
+    
+@torch.no_grad()
+def simple_var_inference(self, simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size: int):
+    """
+    Autoregressive inference using top-k/top-p sampling
+    """
+    B = batch_size
+    H = W = simple_var.patch_nums[-1]
+    C = simple_var.vqvae_dim
+
+    id_seq = []
+    current_token = repeat(
+        rearrange(simple_var.sos, 'c -> 1 1 c'), 
+        '1 1 c -> b 1 c', b=B)   # (B, 1, C)
+    f_hat = torch.zeros(B, C, H, W, dtype=torch.float, device=simple_var.device)
+
+    # no need for inference at the finest scale
+    for scale, pn in enumerate(simple_var.patch_num[:-1]):
+        # Forward pass to get logits. No need for block masking during inference
+        logits = simple_var.forward(current_token, block_mask=None) # (B, pn*pn, vocab_size)
+        # Sample next token
+        next_tokens = simple_var.sample_with_top_k_top_p_(logits[:, -1], top_k=50, top_p=0.95) # (B, pn*pn)
+
+        # Append prediction to sequence
+        id_seq.append(next_tokens)
+
+        # Convert prediction to feature for next step
+        h = rearrange(vqvae.quantize.embedding(next_tokens), 'B (h w) C -> B C h w', h=pn, w=pn) # B, C, pn, pn
+        h_up = F.interpolate(h, size=(H, W), mode='bicubic', align_corners=False)
+        
+        # Update f_hat for next iteration
+        t = scale / (len(simple_var.patch_nums) - 1)
+        f_hat.add_(vqvae.quantize.quant_resi[t](h_up))
+
+        pn_next = simple_var.patch_nums[scale + 1]
+
+        f_hat_down = F.interpolate(f_hat, size=(pn_next, pn_next), mode='area', align_corners=False)
+        current_token = rearrange(f_hat_down, 'B C h w -> B (h w) C')
+        
+    return id_seq
