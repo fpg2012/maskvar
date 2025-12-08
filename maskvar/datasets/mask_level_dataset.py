@@ -133,7 +133,7 @@ class MaskLevelDataset(IterableDataset):
     
     def filter_mask(self, mask, thresh=0.1):
         """
-        Drop mask if it is too small
+        Drop mask if it is too small. Return False if dropped.
 
         mask: (1, H, W) torch.tensor
         """
@@ -156,27 +156,38 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
         seed=42,
         image_size_encoder=1024,
         image_size_mask=256,
-        count=5,
+        count=1,
     ):
         super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask)
         self.rng = np.random.default_rng(seed)
         self.seed = seed
         self.count = count
 
-        # sample a data point from dataset
-        index = self.rng.integers(0, len(self.dataset))
-        image, mask, instance_info = self.dataset[index]
-        image, image_embed_sam = self.preprocess_image(image)
-
         self.results = []
 
-        for instance_idx in islice(instance_info.keys(), self.count):  # Take first count instances only
-            single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
-            if not self.filter_mask(single_mask, self.mask_filter_thresh):
-                continue
-            result = (image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach())
-            self.results.append(result)
-    
+        _count = 0
+
+        for _ in range(len(self.dataset)):
+            # sample a data point from dataset
+            index = self.rng.integers(0, len(self.dataset))
+            image, mask, instance_info = self.dataset[index]
+            image, image_embed_sam = self.preprocess_image(image)
+
+            for instance_idx in instance_info.keys():  # Take first count instances only
+                single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
+                if not self.filter_mask(single_mask, self.mask_filter_thresh):
+                    continue
+                result = (image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach())
+                self.results.append(result)
+
+                _count += 1
+                if _count >= self.count:
+                    break
+            
+            if _count >= self.count:
+                break
+        
+        # print(len(self.results))
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
