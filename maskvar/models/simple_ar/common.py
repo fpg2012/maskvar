@@ -117,7 +117,7 @@ class HybridBlock(nn.Module):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        self.fuse_prompt = TransformerCrossBlock(dim, num_heads)
+        # self.fuse_prompt = TransformerCrossBlock(dim, num_heads)
         self.fuse_image = TransformerCrossBlock(dim, num_heads)
         self.self_block = SimpleSelfAttention(embed_dim=dim, num_heads=num_heads)
     
@@ -128,7 +128,7 @@ class HybridBlock(nn.Module):
         prompt_tokens: [B, Lp, C]
         """
 
-        x = self.fuse_prompt(x, prompt_tokens, block_mask=block_mask)
+        # x = self.fuse_prompt(x, prompt_tokens, block_mask=block_mask)
         x = self.fuse_image(x, image_tokens, block_mask=block_mask)
         x = x + self.self_block(x, block_mask=None)
 

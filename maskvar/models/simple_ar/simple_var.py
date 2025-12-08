@@ -5,7 +5,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 from einops import rearrange, repeat
 
 from ..vqvae_single import VQVAE_Single
-from .common import MLP, TransformerBlock
+from .common import TransformerBlock, HybridBlock
 
 
 class SimpleVAR(nn.Module):
@@ -20,8 +20,12 @@ class SimpleVAR(nn.Module):
                  ):
         super().__init__()
         self.patch_num = patch_num
+        # self.blocks = nn.ModuleList([
+        #     TransformerBlock(dim, num_heads=num_heads)
+        #     for _ in range(depth)
+        # ])
         self.blocks = nn.ModuleList([
-            TransformerBlock(dim, num_heads=num_heads)
+            HybridBlock(dim, num_heads=num_heads)
             for _ in range(depth)
         ])
         self.vocab_size = vocab_size
@@ -105,16 +109,44 @@ class SimpleVAR(nn.Module):
 
         return x
     
-    def forward(self, x: torch.Tensor, block_mask=None):
+    def preprocess_image_feat(self, image_feat: torch.Tensor):
+        """
+        convert single scale sam image feats to multiscale image_tokens
+
+        image_feat: (B, C, H, W)
+        """
+        B, C, H, W = image_feat.shape
+
+        pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
+
+        feats = []
+        for i, pn in enumerate(self.patch_num):
+            if i == len(self.patch_num) - 1:
+                feat_down = image_feat 
+            else:
+                feat_down = F.interpolate(image_feat, size=(pn, pn), mode='bilinear')
+            feat_down = rearrange(feat_down, 'B C h w -> B (h w) C')
+            feats.append(feat_down)
+
+        feats = torch.cat(feats, dim=1)
+
+        # add pos embed and level embed to feat
+        feats = feats + pos_embed_to_add + level_embed_to_add
+
+        return feats
+    
+    def forward(self, x: torch.Tensor, image_tokens: torch.Tensor, prompt_tokens=None, block_mask=None):
         """
         Applies the transformer blocks and outputs logits.
         When training, set block_mask to `self.block_mask`
         When inferencing, set block_mask to `None`
 
         x: (B, L, C)
+        image_tokens: (B, Li, C)
+        # prompt_tokens: (B, Lp, C)
         """
         for block in self.blocks:
-            x = block(x, cond=None, prompt_cond=None, block_mask=block_mask)
+            x = block(x, image_tokens=image_tokens, block_mask=block_mask)
         logits = self.cls(x)
         return logits
     
@@ -165,7 +197,7 @@ class SimpleVAR(nn.Module):
         return next_token
 
 
-def simple_var_train_pass(idx, simple_var: SimpleVAR, vqvae: VQVAE_Single, epsilon=0.001):
+def simple_var_train_pass(idx, image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single, epsilon=0.001):
     """
     Training pass for SimpleVAR model.
 
@@ -175,6 +207,7 @@ def simple_var_train_pass(idx, simple_var: SimpleVAR, vqvae: VQVAE_Single, epsil
     
     Args:
         idx: List of (B, l) - Input discrete codes from VQVAE
+        image_feat: (B, C, H, W) - Image features from SAM
         simple_var: SimpleVAR model instance
         vqvae: VQVAE model instance
 
@@ -190,19 +223,24 @@ def simple_var_train_pass(idx, simple_var: SimpleVAR, vqvae: VQVAE_Single, epsil
             x = x + noise
 
     x = simple_var.preprocess(x)
-    logits = simple_var(x, block_mask=simple_var.block_mask)
+    image_tokens = simple_var.preprocess_image_feat(image_feat)
+    logits = simple_var(x, image_tokens=image_tokens, block_mask=simple_var.block_mask)
     return logits
 
 @torch.no_grad()
-def simple_var_inference(simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size: int):
+def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single):
     """
     Autoregressive inference using top-k/top-p sampling
+
+    image_feat: (B, C, H, W) image features from SAM
     
     Returns: sampled token sequences of shape (B, l)
     """
-    B = batch_size
+    B = image_feat.shape[0]
     H = W = simple_var.patch_num[-1]
     C = simple_var.vqvae_dim
+
+    image_tokens = simple_var.preprocess_image_feat(image_feat)
 
     pos_embed_to_add, level_embed_to_add = simple_var.calc_embed_to_add() # (1, L, C), (1, L, C)
 
@@ -225,7 +263,7 @@ def simple_var_inference(simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size:
         current_token = current_token + pos_embed + level_embed
 
         # Forward pass to get logits. No need for block masking during inference
-        logits = simple_var.forward(current_token, block_mask=None) # (B, pn*pn, vocab_size)
+        logits = simple_var.forward(current_token, image_tokens=image_tokens[:, start_pos:end_pos], block_mask=None) # (B, pn*pn, vocab_size)
         # Sample next token
         logits_flat = rearrange(logits, 'b l v -> (b l) v')
         next_tokens = simple_var.sample_with_top_k_(logits_flat, top_k=1)
