@@ -4,6 +4,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
+from itertools import islice
 
 from typing import Optional, Iterator, Tuple
 
@@ -155,22 +156,26 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
         seed=42,
         image_size_encoder=1024,
         image_size_mask=256,
+        count=5,
     ):
         super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask)
         self.rng = np.random.default_rng(seed)
         self.seed = seed
+        self.count = count
 
         # sample a data point from dataset
         index = self.rng.integers(0, len(self.dataset))
         image, mask, instance_info = self.dataset[index]
         image, image_embed_sam = self.preprocess_image(image)
 
-        for instance_idx in instance_info.keys():
+        self.results = []
+
+        for instance_idx in islice(instance_info.keys(), self.count):  # Take first count instances only
             single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
             if not self.filter_mask(single_mask, self.mask_filter_thresh):
                 continue
-            self.result = (image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach())
-            break
+            result = (image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach())
+            self.results.append(result)
     
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -181,7 +186,8 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
             image, image_embed_sam, single_mask_normalized, single_mask
         """
         while True:
-            yield self.result
+            for result in self.results:
+                yield result
 
 class MaskLevelDatasetRandom(MaskLevelDataset):
 
