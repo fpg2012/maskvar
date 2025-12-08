@@ -1,6 +1,20 @@
 TODO List
 ---
 
+12.8
+
+Reimplemented var as `simple_var`. Finally get it converged...
+
+Next:
+
+1. add cross attention to simple_var
+    - prompt encoder
+    - image feature adapter
+    - positional embedding from sam prompt encoder [!important]
+2. train on more than one images
+
+---
+
 11.11
 
 1. do unit test (IMPORTANT)
