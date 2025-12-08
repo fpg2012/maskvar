@@ -174,6 +174,7 @@ if __name__ == "__main__":
         device=args.device,
         mask_filter_thresh=0.1,
         seed=42,
+        # count=5,
     )
     val_set_masklevel = MaskLevelDatasetDummy(
         dataset=train_set,
@@ -182,6 +183,7 @@ if __name__ == "__main__":
         device=args.device,
         mask_filter_thresh=0.1,
         seed=42,
+        # count=5,
     )
 
     simple_var = build_simple_var(device=device)

@@ -168,10 +168,10 @@ class SimpleVAR(nn.Module):
         self.level_map = []
         for i in range(len(self.patch_num)):
             self.level_map.extend([i] * (self.patch_num[i]**2))
-
+        self.level_map_tensor = torch.tensor(self.level_map, device=self.device, dtype=torch.long)
         
         self.linear = nn.Linear(self.vqvae_dim, self.dim)
-        self.norm = nn.LayerNorm(self.dim)
+        # self.norm = nn.LayerNorm(self.dim)
 
     def calc_embed_to_add(self):
         # pos emb
@@ -198,12 +198,12 @@ class SimpleVAR(nn.Module):
 
         return pos_embed_to_add, level_embed_to_add
 
-    def init_block_mask(self, length=None):
+    def init_block_mask(self):
         # block mask
-        def mask_mod(b, h, q_idx, k_idx) -> bool:
-            return self.level_map[q_idx] == self.level_map[k_idx]
+        def mask_mod(b, h, q_idx, k_idx):
+            return self.level_map_tensor[q_idx] == self.level_map_tensor[k_idx]
         
-        self.block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=self.max_len+1, KV_LEN=self.max_len+1, device=self.device)
+        self.block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=self.max_len, KV_LEN=self.max_len, device=self.device)
     
     def preprocess(self, x: torch.Tensor):
         """
@@ -219,7 +219,7 @@ class SimpleVAR(nn.Module):
         
         # map x using linear
         x = self.linear(x)
-        x = self.norm(x)
+        # x = self.norm(x)
 
         sos = repeat(self.sos, 'c -> b 1 c', b=B)
         x = torch.cat([sos, x], dim=1)
@@ -288,7 +288,7 @@ class SimpleVAR(nn.Module):
         return next_token
 
 
-def simple_var_train_pass(idx, simple_var: SimpleVAR, vqvae: VQVAE_Single):
+def simple_var_train_pass(idx, simple_var: SimpleVAR, vqvae: VQVAE_Single, epsilon=0.001):
     """
     Training pass for SimpleVAR model.
 
@@ -303,8 +303,15 @@ def simple_var_train_pass(idx, simple_var: SimpleVAR, vqvae: VQVAE_Single):
 
     Returns: logits (B, l, vocab_size)
     """
+    assert simple_var.block_mask is not None, "Block mask must be initialized before training"
     with torch.no_grad():
         x = vqvae.quantize.idxBl_to_var_input(idx)
+        # add noise
+        if epsilon > 0:
+            # Add random noise to the input
+            noise = torch.randn_like(x) * epsilon
+            x = x + noise
+
     x = simple_var.preprocess(x)
     logits = simple_var(x, block_mask=simple_var.block_mask)
     return logits
@@ -360,7 +367,7 @@ def simple_var_inference(simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size:
         if scale < len(simple_var.patch_num) - 1:
             # Convert prediction to feature for next step
             h = rearrange(vqvae.quantize.embedding(next_tokens), 'B (h w) C -> B C h w', h=pn, w=pn) # B, C, pn, pn
-            h_up = F.interpolate(h, size=(H, W), mode='bicubic', align_corners=False)
+            h_up = F.interpolate(h, size=(H, W), mode='bicubic')
             
             # Update f_hat for next iteration
             t = scale / (len(simple_var.patch_num) - 1)
@@ -372,5 +379,8 @@ def simple_var_inference(simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size:
             current_token = rearrange(f_hat_down, 'B C h w -> B (h w) C')
             # linear projection
             current_token = simple_var.linear(current_token)
+            # current_token = simple_var.norm(current_token)
+        
+        start_pos = end_pos
         
     return id_seq

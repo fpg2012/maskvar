@@ -785,6 +785,8 @@ def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, device: s
             simple_var_state_dict = new_state_dict
         simple_var.load_state_dict(simple_var_state_dict)
 
+    simple_var.init_block_mask()
+
     return simple_var.to(device)
 
 
