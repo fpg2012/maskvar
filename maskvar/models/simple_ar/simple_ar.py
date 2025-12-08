@@ -339,11 +339,11 @@ def simple_var_inference(simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size:
 
     f_hat = torch.zeros(B, C, H, W, dtype=torch.float, device=simple_var.device)
 
-    print(f"simple_var.patch_num: {simple_var.patch_num}")
+    # print(f"simple_var.patch_num: {simple_var.patch_num}")
 
     for scale, pn in enumerate(simple_var.patch_num):
-        print(f"scale, pn: {scale}, {pn}")
-        print(f"current_token shape: {current_token.shape}")
+        # print(f"scale, pn: {scale}, {pn}")
+        # print(f"current_token shape: {current_token.shape}")
         # add pos and level embeddings
         end_pos = start_pos + pn * pn
 
@@ -355,11 +355,11 @@ def simple_var_inference(simple_var: SimpleVAR, vqvae: VQVAE_Single, batch_size:
         logits = simple_var.forward(current_token, block_mask=None) # (B, pn*pn, vocab_size)
         # Sample next token
         logits_flat = rearrange(logits, 'b l v -> (b l) v')
-        print(f"logits_flat shape: {logits_flat.shape}")
+        # print(f"logits_flat shape: {logits_flat.shape}")
         next_tokens = simple_var.sample_with_top_k_(logits_flat, top_k=1)
-        print(f"next_tokens shape: {next_tokens.shape}")
+        # print(f"next_tokens shape: {next_tokens.shape}")
         next_tokens = rearrange(next_tokens, '(b l) 1 -> b l', b=B, l=pn*pn)
-        print(f"next_tokens shape: {next_tokens.shape}")
+        # print(f"next_tokens shape: {next_tokens.shape}")
 
         # Append prediction to sequence
         id_seq.append(next_tokens)
