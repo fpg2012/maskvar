@@ -114,6 +114,9 @@ class SimpleVAR(nn.Module):
         convert single scale sam image feats to multiscale image_tokens
 
         image_feat: (B, C, H, W)
+
+        returns:
+            feats: (B, L, C)
         """
         B, C, H, W = image_feat.shape
         h_target = w_target = self.patch_num[-1]
@@ -124,11 +127,9 @@ class SimpleVAR(nn.Module):
         for i, pn in enumerate(self.patch_num):
             feat_down = F.interpolate(image_feat, size=(pn, pn), mode='bilinear')
             feat_down = rearrange(feat_down, 'B C h w -> B (h w) C')
-            print(f"feat_down.shape: {feat_down.shape}")
             feats.append(feat_down)
 
         feats = torch.cat(feats, dim=1)
-        print(f"feats.shape: {feats.shape}")
 
         # add pos embed and level embed to feat
         feats = feats + pos_embed_to_add + level_embed_to_add
