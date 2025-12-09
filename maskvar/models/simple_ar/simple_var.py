@@ -116,19 +116,19 @@ class SimpleVAR(nn.Module):
         image_feat: (B, C, H, W)
         """
         B, C, H, W = image_feat.shape
+        h_target = w_target = self.patch_num[-1]
 
         pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
 
         feats = []
         for i, pn in enumerate(self.patch_num):
-            if i == len(self.patch_num) - 1:
-                feat_down = image_feat 
-            else:
-                feat_down = F.interpolate(image_feat, size=(pn, pn), mode='bilinear')
+            feat_down = F.interpolate(image_feat, size=(pn, pn), mode='bilinear')
             feat_down = rearrange(feat_down, 'B C h w -> B (h w) C')
+            print(f"feat_down.shape: {feat_down.shape}")
             feats.append(feat_down)
 
         feats = torch.cat(feats, dim=1)
+        print(f"feats.shape: {feats.shape}")
 
         # add pos embed and level embed to feat
         feats = feats + pos_embed_to_add + level_embed_to_add

@@ -99,7 +99,7 @@ class TransformerCrossBlock(nn.Module):
         #     proj_drop=0.1,
         #     attn_l2_norm=False,
         # )
-        self.cross_attn = SimpleSelfAttention(embed_dim=dim, num_heads=num_heads)
+        self.cross_attn = SimpleCrossAttention(embed_dim=dim, num_heads=num_heads)
         self.layer_norm1 = nn.LayerNorm(dim)
         self.layer_norm2 = nn.LayerNorm(dim)
     
@@ -119,7 +119,7 @@ class HybridBlock(nn.Module):
         self.num_heads = num_heads
         # self.fuse_prompt = TransformerCrossBlock(dim, num_heads)
         self.fuse_image = TransformerCrossBlock(dim, num_heads)
-        self.self_block = SimpleSelfAttention(embed_dim=dim, num_heads=num_heads)
+        self.self_block = TransformerBlock(dim, num_heads)
     
     def forward(self, x: torch.Tensor, image_tokens=None, prompt_tokens=None, block_mask=None):
         """

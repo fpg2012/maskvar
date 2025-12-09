@@ -14,8 +14,8 @@ from maskvar.models.simple_ar import (
     simple_var_train_pass,
     simple_var_inference,
 )
-
 from maskvar.datasets import MaskLevelDataset, MaskLevelDatasetDummy
+
 
 class SimpleARTrainer:
 
@@ -71,6 +71,7 @@ class SimpleARTrainer:
 
         logits = simple_var_train_pass(
             idx=gt_idx,
+            image_feat=image_embed_sam,
             simple_var=self.simple_var, 
             vqvae=self.vqvae
         )
@@ -122,6 +123,7 @@ class SimpleARTrainer:
 
             logits = simple_var_train_pass(
                 idx=gt_idx,
+                image_feat=image_embed_sam,
                 simple_var=self.simple_var, 
                 vqvae=self.vqvae
             )
@@ -150,6 +152,7 @@ if __name__ == "__main__":
         build_hqseg44k_dataset,
         build_simple_var,
         build_vqvae_single_5_stages_v1,
+        build_mobile_sam_image_encoder,
     )
 
     parser = argparse.ArgumentParser()
@@ -166,24 +169,28 @@ if __name__ == "__main__":
 
     device = args.device
 
+    sam_image_encoder = build_mobile_sam_image_encoder('ckpt/mobile_sam.pt')
+    sam_image_encoder = sam_image_encoder.to(device)
+    sam_image_encoder = torch.compile(sam_image_encoder)
+
     train_set, _ = build_hqseg44k_dataset('data/sam-hq') # validate on train set
     train_set_masklevel = MaskLevelDatasetDummy(
         dataset=train_set,
-        sam_encoder=None,
-        with_image_embed=False,
+        sam_encoder=sam_image_encoder,
+        with_image_embed=True,
         device=args.device,
         mask_filter_thresh=0.1,
         seed=42,
-        # count=5,
+        count=5,
     )
     val_set_masklevel = MaskLevelDatasetDummy(
         dataset=train_set,
-        sam_encoder=None,
-        with_image_embed=False,
+        sam_encoder=sam_image_encoder,
+        with_image_embed=True,
         device=args.device,
         mask_filter_thresh=0.1,
         seed=42,
-        # count=5,
+        count=5,
     )
 
     simple_var = build_simple_var(device=device)
