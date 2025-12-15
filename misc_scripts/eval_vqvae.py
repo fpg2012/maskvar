@@ -1,36 +1,36 @@
-from models.vqvae_single import VQVAE_Single
+# Standard library
+import argparse
+import json
+import os
+from typing import List
+
+# Third-party
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from PIL import Image
-from torchvision import transforms
 import torchvision
+from PIL import Image
 from torch.utils.data.dataloader import DataLoader
-from datasets.instance_info import InstanceInfo
-from utils.metrics import calc_iou
-from utils import divide_image, merge_image
-from datasets.mask_level_dataset import MaskLevelDataset
+from torchvision import transforms
+from tqdm import tqdm
 
-import argparse
-
-from datasets.coco_lvis import LvisDataset
-from datasets.hqseg44k import HQSeg44KTestDataset, HQSeg44KTrainDataset
-
-from maskseg_build_everything import (
-    build_vqvae_single, 
-    build_vqvae_single_4_stages, 
-    build_vqvae_single_4_stages_v2, 
-    build_vqvae_single_fewer_stages,
+# Local application
+from maskvar.datasets.coco_lvis import LvisDataset
+from maskvar.datasets.hqseg44k import HQSeg44KTestDataset, HQSeg44KTrainDataset
+from maskvar.datasets.mask_level_dataset import MaskLevelDataset
+from maskvar.maskseg_build_everything import (
+    build_vqvae_single,
+    build_vqvae_single_4_stages,
     build_vqvae_single_4_stages_4_slices,
     build_vqvae_single_4_stages_4_slices_v2,
-    build_vqvae_single_5_stages_v1
+    build_vqvae_single_4_stages_v2,
+    build_vqvae_single_5_stages_v1,
+    build_vqvae_single_fewer_stages,
 )
-from typing import List, Optional, Dict, Tuple
-from utils.metrics import calc_iou
-from tqdm import tqdm
-import os
-from itertools import islice
+from maskvar.models.vqvae_single import VQVAE_Single
+from maskvar.utils import divide_image, merge_image
+from maskvar.utils.metrics import calc_iou
 
 class BadCase:
 
@@ -150,16 +150,23 @@ if __name__ == '__main__':
     vqvae = torch.compile(vqvae)
     evaluator = VQVAE_Evaluator(vqvae, args.batch_size, args.low_iou_thresh, args.device, args.division)
     if args.dataset == 'lvis_val':
-        dataset = LvisDataset(dataset_path='data/coco_lvis', split='val', img_split='val')
+        dataset = LvisDataset(dataset_path='../data/coco_lvis', split='val', img_split='val')
     elif args.dataset == 'hqseg44k_val':
-        dataset = HQSeg44KTestDataset(data_root='data/sam-hq')
+        dataset = HQSeg44KTestDataset(data_root='../data/sam-hq')
     elif args.dataset == 'hqseg44k_train':
-        dataset = HQSeg44KTrainDataset(data_root='data/sam-hq')
+        dataset = HQSeg44KTrainDataset(data_root='../data/sam-hq')
     else:
         raise ValueError(f'Unknown dataset: {args.dataset}')
 
     mean_iou, min_iou, max_iou, bad_cases, nan_count = evaluator.eval_dataset(dataset)
     print(f'mean iou: {mean_iou}, min iou: {min_iou}, max iou: {max_iou}')
     print(f'nan count: {nan_count}')
+    with open(f'result-{args.dataset}-{args.vqvae_config}.json', 'w') as f:
+        json.dump({
+            'mean_iou': mean_iou,
+            'min_iou': min_iou,
+            'max_iou': max_iou,
+            'nan_count': nan_count,
+        }, f, indent=4)
     if args.visualize_dir is not None:
         evaluator.analyze_bad_cases(bad_cases, args.visualize_dir)
