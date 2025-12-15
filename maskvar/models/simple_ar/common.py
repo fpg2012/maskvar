@@ -44,7 +44,7 @@ class SimpleCrossAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_kv = nn.Linear(embed_dim, embed_dim * 2)
     
-    def forward(self, x, k, block_mask):
+    def forward(self, x, k, block_mask=None):
         B, Lq, C = x.shape
         _, Lk, _ = k.shape
 
@@ -129,7 +129,7 @@ class HybridBlock(nn.Module):
         """
 
         # x = self.fuse_prompt(x, prompt_tokens, block_mask=block_mask)
-        x = self.fuse_image(x, image_tokens, block_mask=block_mask)
-        x = x + self.self_block(x, block_mask=None)
+        x = self.fuse_image(x, image_tokens, block_mask=None)
+        x = x + self.self_block(x, block_mask=block_mask)
 
         return x

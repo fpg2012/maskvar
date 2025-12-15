@@ -116,23 +116,29 @@ class SimpleVAR(nn.Module):
         image_feat: (B, C, H, W)
 
         returns:
-            feats: (B, L, C)
+            feats: (B, Lf, C)
         """
         B, C, H, W = image_feat.shape
         h_target = w_target = self.patch_num[-1]
 
         pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
 
-        feats = []
-        for i, pn in enumerate(self.patch_num):
-            feat_down = F.interpolate(image_feat, size=(pn, pn), mode='bilinear')
-            feat_down = rearrange(feat_down, 'B C h w -> B (h w) C')
-            feats.append(feat_down)
+        # feats = []
+        # for i, pn in enumerate(self.patch_num):
+        #     feat_down = F.interpolate(image_feat, size=(pn, pn), mode='bilinear')
+        #     feat_down = rearrange(feat_down, 'B C h w -> B (h w) C')
+        #     feats.append(feat_down)
 
-        feats = torch.cat(feats, dim=1)
+        # feats = torch.cat(feats, dim=1)
 
-        # add pos embed and level embed to feat
-        feats = feats + pos_embed_to_add + level_embed_to_add
+        # # add pos embed and level embed to feat
+        # feats = feats + pos_embed_to_add + level_embed_to_add
+
+        feat_down = F.interpolate(image_feat, size=(h_target, w_target), mode='bilinear')
+        feat_down = rearrange(feat_down, 'B C h w -> B (h w) C')
+
+        # add the last scale's pos emb and level emb
+        feats = feat_down + pos_embed_to_add[:, -h_target*w_target:] + level_embed_to_add[:, -h_target*w_target:]
 
         return feats
     
@@ -264,7 +270,7 @@ def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae:
         current_token = current_token + pos_embed + level_embed
 
         # Forward pass to get logits. No need for block masking during inference
-        logits = simple_var.forward(current_token, image_tokens=image_tokens[:, start_pos:end_pos], block_mask=None) # (B, pn*pn, vocab_size)
+        logits = simple_var.forward(current_token, image_tokens=image_tokens, block_mask=None) # (B, pn*pn, vocab_size)
         # Sample next token
         logits_flat = rearrange(logits, 'b l v -> (b l) v')
         next_tokens = simple_var.sample_with_top_k_(logits_flat, top_k=1)
