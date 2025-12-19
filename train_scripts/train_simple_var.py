@@ -3,10 +3,11 @@ from pathlib import Path
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import tqdm
-from einops import rearrange
+from einops import rearrange, repeat
 
 from maskvar.models.vqvae_single import VQVAE_Single
 from maskvar.models.simple_ar import (
@@ -31,6 +32,7 @@ class SimpleARTrainer:
         log_dir: Path,
         checkpoint_dir: Path,
         skip_eval: bool = True,
+        loss_weight_per_level=[1, 1, 1, 1, 1],
     ):
         # models
         self.simple_var: SimpleVAR = simple_var
@@ -49,6 +51,18 @@ class SimpleARTrainer:
         
         # loss
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
+
+        # loss weight
+        with torch.no_grad():
+            patch_num = simple_var.patch_num
+            loss_weight_per_token = []
+            for level, pn in enumerate(patch_num):
+                loss_weight_per_token.extend(
+                    [loss_weight_per_level[level] / pn**2] * pn**2
+                )
+            print(f'loss weight per token: {loss_weight_per_token}')
+            self.loss_weight_per_token = torch.tensor(loss_weight_per_token, dtype=torch.float32, device=self.device)
+            self.loss_weight_per_token = F.normalize(self.loss_weight_per_token, p=1, dim=-1)
 
         # logger
         self.logger = SummaryWriter(log_dir=str(log_dir))
@@ -76,15 +90,17 @@ class SimpleARTrainer:
             vqvae=self.vqvae
         )
 
-        acc = (logits.argmax(dim=-1) == gt_idx_flat).float().mean()
+        acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
 
         logits = rearrange(logits, 'B L C -> B C L')
 
-        loss = self.loss_function(logits, gt_idx_flat)
+        loss = self.loss_function(logits, gt_idx_flat) # (B, L)
+        loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # (B, L)
+
         loss = loss.mean()
         loss.backward()
         self.optimizer.step()
-        return loss.item(), acc.item()
+        return loss.item(), acc
 
     def train(self, num_iters: int):
         train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
@@ -97,11 +113,14 @@ class SimpleARTrainer:
         pbar = tqdm.tqdm(enumerate(train_dataloader), desc="Training", total=num_iters)
         for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
             loss, acc = self.train_step(image, image_embed_sam, single_mask_normalized, single_mask)
+            acc_mean = acc.mean().item()
+            acc_sos = acc[:, 0].mean().item()
             # update loss and acc in progressive bar
-            pbar.set_postfix({'loss': f'{loss:.4f}', 'acc': f'{acc:.4f}'})
+            pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
 
             self.logger.add_scalar('train/loss', loss, global_step=i)
-            self.logger.add_scalar('train/acc', acc, global_step=i)
+            self.logger.add_scalar('train/acc_mean', acc_mean, global_step=i)
+            self.logger.add_scalar('train/acc_sos', acc_sos, global_step=i)
         
         self.save_checkpoint(iters=num_iters)
     
@@ -132,6 +151,7 @@ class SimpleARTrainer:
             
             logits = rearrange(logits, 'b l c -> b c l')
             loss = self.loss_function(logits, gt_idx_flat)
+            loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # will be automatically broadcasted to [B, L]
             
             losses.append(loss.mean().item())
             accs.append(acc.item())
