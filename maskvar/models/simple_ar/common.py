@@ -44,12 +44,12 @@ class SimpleCrossAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_kv = nn.Linear(embed_dim, embed_dim * 2)
     
-    def forward(self, x, k, block_mask=None):
+    def forward(self, x, cond, block_mask=None):
         B, Lq, C = x.shape
-        _, Lk, _ = k.shape
+        _, Lk, _ = cond.shape
 
         q = self.proj(x) # (B, Lq, C)
-        kv = self.proj_kv(k) # (B, Lk, 2C)
+        kv = self.proj_kv(cond) # (B, Lk, 2C)
         
         q = rearrange(q, 'B Lq (H c) -> B H Lq c', H=self.num_heads)
         kv = rearrange(kv, 'B Lk (KV H c) -> KV B H Lk c', H=self.num_heads, KV=2)
