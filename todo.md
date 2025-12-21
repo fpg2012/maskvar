@@ -1,6 +1,19 @@
 TODO List
 ---
 
+12.20
+
+Now converged.
+
+train script:
+
+```
+python train_scripts/train_simple_var.py --device 'cuda' --outdir out/simple_var_4_debug --num_iters 100 --save_interval 50 --val_
+iters 16
+```
+
+---
+
 12.8
 
 Reimplemented var as `simple_var`. Finally get it converged...
