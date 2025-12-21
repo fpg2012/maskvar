@@ -15,7 +15,11 @@ from maskvar.models.simple_ar import (
     simple_var_train_pass,
     simple_var_inference,
 )
-from maskvar.datasets import MaskLevelDataset, MaskLevelDatasetDummy
+from maskvar.datasets import (
+    MaskLevelDataset,
+    MaskLevelDatasetDummy,
+    MaskLevelDatasetRandom,
+)
 
 
 class SimpleARTrainer:
@@ -60,7 +64,7 @@ class SimpleARTrainer:
                 loss_weight_per_token.extend(
                     [loss_weight_per_level[level] / pn**2] * pn**2
                 )
-            print(f'loss weight per token: {loss_weight_per_token}')
+            # print(f'loss weight per token: {loss_weight_per_token}')
             self.loss_weight_per_token = torch.tensor(loss_weight_per_token, dtype=torch.float32, device=self.device)
             self.loss_weight_per_token = F.normalize(self.loss_weight_per_token, p=1, dim=-1)
 
@@ -102,7 +106,7 @@ class SimpleARTrainer:
         self.optimizer.step()
         return loss.item(), acc
 
-    def train(self, num_iters: int):
+    def train(self, num_iters: int, outer_iter: int = 0):
         train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
 
         if num_iters > 0:
@@ -118,25 +122,28 @@ class SimpleARTrainer:
             # update loss and acc in progressive bar
             pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
 
-            self.logger.add_scalar('train/loss', loss, global_step=i)
-            self.logger.add_scalar('train/acc_mean', acc_mean, global_step=i)
-            self.logger.add_scalar('train/acc_sos', acc_sos, global_step=i)
+            self.logger.add_scalar('train/loss', loss, global_step=i+num_iters*outer_iter)
+            self.logger.add_scalar('train/acc_mean', acc_mean, global_step=i+num_iters*outer_iter)
+            self.logger.add_scalar('train/acc_sos', acc_sos, global_step=i+num_iters*outer_iter)
         
-        self.save_checkpoint(iters=num_iters)
+        global_iters = (outer_iter + 1)*num_iters
+        self.save_checkpoint(iters=global_iters)
     
     @torch.no_grad()
-    def eval(self, num_iters: int):
-        if num_iters > 0:
-            val_dataloader = DataLoader(islice(self.val_set, num_iters), batch_size=self.batch_size, shuffle=False, drop_last=True)
-        else:
-            val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
+    def eval(self, num_iters: int, global_step: int = 0):
+        val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
         
         self.simple_var.eval()
 
         losses = []
-        accs = []
+        acc_means = []
+        acc_soss = []
 
-        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in enumerate(val_dataloader):
+        pbar = tqdm.tqdm(enumerate(val_dataloader), desc="Val: ", total=num_iters)
+
+        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
+            if num_iters > 0 and i >= num_iters:
+                break
             gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
             gt_idx_flat = torch.cat(gt_idx, dim=1)
 
@@ -147,19 +154,31 @@ class SimpleARTrainer:
                 vqvae=self.vqvae
             )
             
-            acc = (logits.argmax(dim=1) == gt_idx_flat).float().mean()
+            acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
+            acc_mean = acc.mean().item()
+            acc_sos = acc[:, 0].mean().item()
             
             logits = rearrange(logits, 'b l c -> b c l')
             loss = self.loss_function(logits, gt_idx_flat)
             loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # will be automatically broadcasted to [B, L]
             
-            losses.append(loss.mean().item())
-            accs.append(acc.item())
+            loss_mean = loss.mean().item()
+
+            pbar.set_postfix({'loss': f'{loss_mean:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
+
+            losses.append(loss_mean)
+            acc_means.append(acc_mean)
+            acc_soss.append(acc_sos)
         
         mean_loss = float(sum(losses) / len(losses))
-        mean_acc = float(sum(accs) / len(accs))
+        mean_acc_mean = float(sum(acc_means) / len(acc_means))
+        mean_acc_sos = float(sum(acc_soss) / len(acc_soss))
 
-        return mean_loss, mean_acc
+        self.logger.add_scalar('val/loss', mean_loss, global_step=global_step)
+        self.logger.add_scalar('val/acc_mean', mean_acc_mean, global_step=global_step)
+        self.logger.add_scalar('val/acc_sos', mean_acc_sos, global_step=global_step)
+
+        return mean_loss, mean_acc_mean, mean_acc_sos
     
     def save_checkpoint(self, iters: int):
         torch.save(self.optimizer.state_dict(), self.output_dir / f'.optimizer.{iters}.pt')
@@ -178,7 +197,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--outdir', type=str)
-    parser.add_argument('--num_iters', type=int, default=1000)
+    parser.add_argument('--outer_iters', type=int, default=1000)
+    parser.add_argument('--val_iters', type=int, default=100)
+    parser.add_argument('--inner_iters', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=4)
     args = parser.parse_args()
 
@@ -193,24 +214,34 @@ if __name__ == "__main__":
     sam_image_encoder = sam_image_encoder.to(device)
     sam_image_encoder = torch.compile(sam_image_encoder)
 
-    train_set, _ = build_hqseg44k_dataset('data/sam-hq') # validate on train set
-    train_set_masklevel = MaskLevelDatasetDummy(
-        dataset=train_set,
-        sam_encoder=sam_image_encoder,
-        with_image_embed=True,
-        device=args.device,
-        mask_filter_thresh=0.1,
-        seed=42,
-        count=5,
-    )
+    train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
+    # train_set_masklevel = MaskLevelDatasetDummy(
+    #     dataset=train_set,
+    #     sam_encoder=sam_image_encoder,
+    #     with_image_embed=True,
+    #     device=args.device,
+    #     mask_filter_thresh=0.1,
+    #     seed=42,
+    #     count=5,
+    # )
     val_set_masklevel = MaskLevelDatasetDummy(
+        dataset=val_set,
+        sam_encoder=sam_image_encoder,
+        with_image_embed=True,
+        device=args.device,
+        mask_filter_thresh=0.1,
+        seed=42,
+        count=16,
+    )
+    train_set_masklevel = MaskLevelDatasetRandom(
         dataset=train_set,
         sam_encoder=sam_image_encoder,
         with_image_embed=True,
         device=args.device,
         mask_filter_thresh=0.1,
         seed=42,
-        count=5,
+        infinite=True,
+        shuffle=True,
     )
 
     simple_var = build_simple_var(device=device)
@@ -227,7 +258,13 @@ if __name__ == "__main__":
         log_dir=outdir / "logs",
         checkpoint_dir=outdir / "checkpoints",
     )
-    trainer.train(num_iters=args.num_iters)
+
+    outer_iters = args.outer_iters
+    inner_iters = args.inner_iters
+    for i in range(outer_iters):
+        print(f'=== outer iter {i} ===')
+        trainer.train(num_iters=inner_iters, outer_iter=i)
+        trainer.eval(args.val_iters, global_step=(i+1)*inner_iters)
     print(f"Training complete. Checkpoints saved to {outdir / 'checkpoints'}")
     print(f"Logs saved to {outdir / 'logs'}")
     
