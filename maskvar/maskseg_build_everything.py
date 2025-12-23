@@ -789,6 +789,31 @@ def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, device: s
 
     return simple_var.to(device)
 
+def build_simple_var_6d(simple_var_checkpoint_path: Optional[str] = None, device: str = 'cpu') -> SimpleVAR:
+    simple_var = SimpleVAR(
+        dim=256,
+        depth=6,
+        vocab_size=4096,
+        device=device,
+        patch_num=[1, 8, 16, 24, 32],
+        num_heads=4,
+        vqvae_dim=32,
+    )
+
+    if simple_var_checkpoint_path is not None:
+        simple_var_state_dict = torch.load(simple_var_checkpoint_path)
+        if any(key.startswith('_orig_mod.') for key in simple_var_state_dict.keys()):
+            # 创建一个新的字典，移除 '_orig_mod.' 前缀
+            new_state_dict = {}
+            for key, value in simple_var_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_var_state_dict = new_state_dict
+        simple_var.load_state_dict(simple_var_state_dict)
+
+    simple_var.init_block_mask()
+
+    return simple_var.to(device)
 
 # def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
 #     maskgit = MaskGIT(
