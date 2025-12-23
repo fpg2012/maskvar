@@ -37,6 +37,7 @@ class SimpleARTrainer:
         checkpoint_dir: Path,
         skip_eval: bool = True,
         loss_weight_per_level=[1, 1, 1, 1, 1],
+        opt_checkpoint: Path | None = None,
     ):
         # models
         self.simple_var: SimpleVAR = simple_var
@@ -55,6 +56,9 @@ class SimpleARTrainer:
         
         # loss
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
+        if opt_checkpoint is not None:
+            optimizer_state_dict = torch.load(opt_checkpoint)
+            self.optimizer.load_state_dict(optimizer_state_dict)
 
         # loss weight
         with torch.no_grad():
@@ -104,9 +108,10 @@ class SimpleARTrainer:
         loss = loss.mean()
         loss.backward()
         self.optimizer.step()
+
         return loss.item(), acc
 
-    def train(self, num_iters: int, outer_iter: int = 0):
+    def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0):
         train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
 
         if num_iters > 0:
@@ -119,14 +124,17 @@ class SimpleARTrainer:
             loss, acc = self.train_step(image, image_embed_sam, single_mask_normalized, single_mask)
             acc_mean = acc.mean().item()
             acc_sos = acc[:, 0].mean().item()
+
             # update loss and acc in progressive bar
             pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
 
-            self.logger.add_scalar('train/loss', loss, global_step=i+num_iters*outer_iter)
-            self.logger.add_scalar('train/acc_mean', acc_mean, global_step=i+num_iters*outer_iter)
-            self.logger.add_scalar('train/acc_sos', acc_sos, global_step=i+num_iters*outer_iter)
+            # log to tensorboard
+            global_iters = i + num_iters * outer_iter + resume_iters
+            self.logger.add_scalar('train/loss', loss, global_step=global_iters)
+            self.logger.add_scalar('train/acc_mean', acc_mean, global_step=global_iters)
+            self.logger.add_scalar('train/acc_sos', acc_sos, global_step=global_iters)
         
-        global_iters = (outer_iter + 1)*num_iters
+        global_iters = (outer_iter + 1)*num_iters + resume_iters
         self.save_checkpoint(iters=global_iters)
     
     @torch.no_grad()
@@ -201,7 +209,16 @@ if __name__ == "__main__":
     parser.add_argument('--val_iters', type=int, default=100)
     parser.add_argument('--inner_iters', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--resume_from', type=str, default=None)
+    parser.add_argument('--resume_iters', type=int, default=0)
     args = parser.parse_args()
+
+    if args.resume_from is not None:
+        checkpoint_path = Path(args.resume_from) / "checkpoints" / f".simple_var.{args.resume_iters}.pt"
+        opt_checkpoint = Path(args.resume_from) / "checkpoints" / f".optimizer.{args.resume_iters}.pt"
+    else:
+        checkpoint_path = None
+        opt_checkpoint = None
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -244,7 +261,7 @@ if __name__ == "__main__":
         shuffle=True,
     )
 
-    simple_var = build_simple_var(device=device)
+    simple_var = build_simple_var(simple_var_checkpoint_path=checkpoint_path, device=device)
     vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
 
     trainer = SimpleARTrainer(
@@ -257,14 +274,16 @@ if __name__ == "__main__":
         device=device,
         log_dir=outdir / "logs",
         checkpoint_dir=outdir / "checkpoints",
+        opt_checkpoint=opt_checkpoint,
     )
 
     outer_iters = args.outer_iters
     inner_iters = args.inner_iters
+    resume_iters = args.resume_iters
     for i in range(outer_iters):
         print(f'=== outer iter {i} ===')
-        trainer.train(num_iters=inner_iters, outer_iter=i)
-        trainer.eval(args.val_iters, global_step=(i+1)*inner_iters)
+        trainer.train(num_iters=inner_iters, outer_iter=i, resume_iters=resume_iters)
+        trainer.eval(args.val_iters, global_step=(i+1)*inner_iters+resume_iters)
     print(f"Training complete. Checkpoints saved to {outdir / 'checkpoints'}")
     print(f"Logs saved to {outdir / 'logs'}")
     
