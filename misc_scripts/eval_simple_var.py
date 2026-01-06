@@ -14,9 +14,7 @@ from einops import rearrange, repeat
 import matplotlib.pyplot as plt
 
 from maskvar.maskseg_build_everything import (
-    build_simple_var,
-    build_simple_var_16d,
-    build_simple_var_6d,
+    builder_map,
 )
 from maskvar.models.vqvae_single import VQVAE_Single
 from maskvar.models.simple_ar import (
@@ -230,20 +228,25 @@ class SimpleVAREvaluator:
 
 if __name__ == "__main__":
     import argparse
-    from maskvar.maskseg_build_everything import (
-        build_hqseg44k_dataset,
-        build_simple_var,
-        build_vqvae_single_5_stages_v1,
-        build_mobile_sam_image_encoder,
-    )
+    from maskvar.maskseg_build_everything import builder_map
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--outdir', type=str)
     parser.add_argument('--val_iters', type=int, default=0)
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--visualize', action='store_true')
+    # dataset
+    parser.add_argument('--dataset', type=str, default='hqseg44k')
+    # simple var
+    parser.add_argument('-c', '--simple_var', type=str, required=True)
+    parser.add_argument('--checkpoint', type=str, required=True)
+    # image encoder
+    parser.add_argument('--image_encoder', type=str, default='mobile_sam')
+    parser.add_argument('--image_encoder_checkpoint', type=str, default='ckpt/mobile_sam.pt')
+    # vqvae
+    parser.add_argument('--vqvae', type=str, default='vqvae_single_5_stages_v1')
+    parser.add_argument('--vqvae_checkpoint', type=str, default='out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth')
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -256,11 +259,11 @@ if __name__ == "__main__":
     print(f"Using checkpoint: {checkpoint_path}")
     assert Path(checkpoint_path).exists(), f"Checkpoint not found: {checkpoint_path}"
 
-    sam_image_encoder = build_mobile_sam_image_encoder('ckpt/mobile_sam.pt')
+    sam_image_encoder = builder_map['image_encoder'][args.image_encoder](args.image_encoder_checkpoint)
     sam_image_encoder = sam_image_encoder.to(device)
     sam_image_encoder = torch.compile(sam_image_encoder)
 
-    train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
+    train_set, val_set = builder_map['dataset'][args.dataset]('data/sam-hq') # validate on train set
     val_set_masklevel = MaskLevelDataset(
         dataset=val_set,
         sam_encoder=sam_image_encoder,
@@ -268,8 +271,8 @@ if __name__ == "__main__":
         device=args.device,
         mask_filter_thresh=0.1,
     )
-    simple_var = build_simple_var_6d(simple_var_checkpoint_path=checkpoint_path, device=device)
-    vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
+    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, device=device)
+    vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False)
 
     trainer = SimpleVAREvaluator(
         simple_var=simple_var,
