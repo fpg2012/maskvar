@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 
 def resize_longest_side(image, target_length, mode='bilinear'):
     scale = target_length * 1.0 / max(image.shape[-2], image.shape[-1])
@@ -41,5 +42,6 @@ def restore_normalized_image(image: torch.Tensor):
     device = image.device
     pixel_mean = torch.tensor([123.675, 116.28, 103.53], device=device) # copied from sam
     pixel_std = torch.tensor([58.395, 57.12, 57.375], device=device) # copied from sam
-    restored_image = image * pixel_std + pixel_mean
-    return restored_image
+    hwc = rearrange(image, 'c h w -> h w c')
+    restored_image = hwc * pixel_std + pixel_mean
+    return rearrange(restored_image, 'h w c -> c h w').clamp(0, 255).round().to(torch.uint8)
