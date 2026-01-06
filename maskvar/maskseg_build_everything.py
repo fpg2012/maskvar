@@ -930,8 +930,8 @@ builder_map = {
         "vqvae_single_4_stages_4_slices_v2": build_vqvae_single_4_stages_4_slices_v2,
     },
     "image_encoder": {
-        "sam_image_encoder": build_sam_image_encoder,
-        "var_image_encoder": build_var_image_encoder,
+        "sam_vitb": build_sam_image_encoder,
+        "mobile_sam": build_mobile_sam_image_encoder,
     },
     "prompt_encoder": build_prompt_encoder,
     "simple_ar": build_simple_ar,
