@@ -815,6 +815,32 @@ def build_simple_var_6d(simple_var_checkpoint_path: Optional[str] = None, device
 
     return simple_var.to(device)
 
+def build_simple_var_16d(simple_var_checkpoint_path: Optional[str] = None, device: str = 'cpu') -> SimpleVAR:
+    simple_var = SimpleVAR(
+        dim=256,
+        depth=16,
+        vocab_size=4096,
+        device=device,
+        patch_num=[1, 8, 16, 24, 32],
+        num_heads=4,
+        vqvae_dim=32,
+    )
+
+    if simple_var_checkpoint_path is not None:
+        simple_var_state_dict = torch.load(simple_var_checkpoint_path)
+        if any(key.startswith('_orig_mod.') for key in simple_var_state_dict.keys()):
+            # 创建一个新的字典，移除 '_orig_mod.' 前缀
+            new_state_dict = {}
+            for key, value in simple_var_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_var_state_dict = new_state_dict
+        simple_var.load_state_dict(simple_var_state_dict)
+
+    simple_var.init_block_mask()
+
+    return simple_var.to(device)
+
 # def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
 #     maskgit = MaskGIT(
 #         vqvae=vqvae,
@@ -884,3 +910,38 @@ def build_hqseg44k_dataset(dataset_path='data/sam-hq') -> Tuple[HQSeg44KTrainDat
     )
 
     return trainset, testset
+
+builder_map = {
+    "maskvar": {
+        "maskvar": build_maskvar,
+        "maskvar_flex": build_maskvar_flex,
+        "maskvar_flex_5_stages": build_maskvar_flex_5_stages,
+        "maskvar_flex_mobile_5_stages": build_maskvar_flex_mobile_5_stages,
+        "maskvar_flex_simple_mobile_5_stages": build_maskvar_flex_simple_mobile_5_stages,
+        "maskvar_flex_v2": build_maskvar_flex_v2,
+        "maskvar_v2": build_maskvar_v2,
+        "maskvar_v3": build_maskvar_v3,
+    },
+    "vqvae": {
+        "vqvae_single": build_vqvae_single,
+        "vqvae_single_4_stages_v2": build_vqvae_single_4_stages_v2,
+        "vqvae_single_5_stages_v1": build_vqvae_single_5_stages_v1,
+        "vqvae_single_4_stages_4_slices": build_vqvae_single_4_stages_4_slices,
+        "vqvae_single_4_stages_4_slices_v2": build_vqvae_single_4_stages_4_slices_v2,
+    },
+    "image_encoder": {
+        "sam_image_encoder": build_sam_image_encoder,
+        "var_image_encoder": build_var_image_encoder,
+    },
+    "prompt_encoder": build_prompt_encoder,
+    "simple_ar": build_simple_ar,
+    "simple_var": {
+        "simple_var": build_simple_var,
+        "simple_var_16d": build_simple_var_16d,
+        "simple_var_6d": build_simple_var_6d,
+    },
+    "dataset": {
+        "cocolvis": build_cocolvis_dataset,
+        "hqseg44k": build_hqseg44k_dataset,
+    }
+}
