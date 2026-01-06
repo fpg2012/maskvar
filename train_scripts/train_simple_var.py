@@ -1,5 +1,9 @@
 from itertools import islice
 from pathlib import Path
+import json
+import sys
+import time
+from datetime import datetime
 
 import torch
 from torch import nn
@@ -20,6 +24,37 @@ from maskvar.datasets import (
     MaskLevelDatasetDummy,
     MaskLevelDatasetRandom,
 )
+
+
+def save_train_configuration(args, outdir: Path):
+    cur_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+
+    # create outdir
+    outdir.mkdir(parents=True, exist_ok=True)
+    
+    # save train config
+    with open(outdir / 'train_config.json', 'w') as f:
+        json.dump(args.__dict__, f, ensure_ascii=False, indent=2)
+    
+    # save train command
+    with open(outdir / 'train_command.sh', 'w') as f:
+        f.write('#!/bin/bash\n')
+        f.write('# train start time: ' + cur_time + '\n')
+        f.write(' '.join(sys.argv))
+    
+    # print train config
+    print('train config: ')
+    for k, v in args.__dict__.items():
+        print(f'    {k}: {v}')
+    
+    # print train command
+    print('train command: ')
+    print(' '.join(sys.argv))
+    
+    # print start time
+    print('train start time: ' + cur_time)
+
+    time.sleep(2)
 
 
 class SimpleARTrainer:
@@ -196,22 +231,33 @@ class SimpleARTrainer:
 if __name__ == "__main__":
     import argparse
     from maskvar.maskseg_build_everything import (
-        build_hqseg44k_dataset,
-        build_simple_var,
-        build_vqvae_single_5_stages_v1,
-        build_mobile_sam_image_encoder,
+        builder_map
     )
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--outdir', type=str)
+    # hyperparameters
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--outer_iters', type=int, default=1000)
     parser.add_argument('--val_iters', type=int, default=100)
     parser.add_argument('--inner_iters', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=4)
+    # resume
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--resume_iters', type=int, default=0)
+    # dataset
+    parser.add_argument('--dataset', choices=['hqseg44k', 'cocolvis'], type=str, default='hqseg44k')
+    # configs
+    parser.add_argument('--simple_var', type=str, default='simple_var')
+    parser.add_argument('--image_encoder', choices=['sam-vitb', 'mobile_sam'], type=str, default='mobile_sam')
+    parser.add_argument('--image_encoder_checkpoint', type=str, default='ckpt/mobile_sam.pt')
+    parser.add_argument('--vqvae', choices=builder_map['vqvae'].keys(), type=str, default='vqvae_single_5_stages_v1')
+    parser.add_argument('--vqvae_checkpoint', type=str, default='out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth')
     args = parser.parse_args()
+
+    outdir = Path(args.outdir)
+    save_train_configuration(args, outdir)
 
     if args.resume_from is not None:
         checkpoint_path = Path(args.resume_from) / "checkpoints" / f".simple_var.{args.resume_iters}.pt"
@@ -220,18 +266,20 @@ if __name__ == "__main__":
         checkpoint_path = None
         opt_checkpoint = None
 
-    outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "checkpoints").mkdir(parents=True, exist_ok=True)
     (outdir / "logs").mkdir(parents=True, exist_ok=True)
 
     device = args.device
 
-    sam_image_encoder = build_mobile_sam_image_encoder('ckpt/mobile_sam.pt')
+    # sam_image_encoder = build_mobile_sam_image_encoder('ckpt/mobile_sam.pt')
+    sam_image_encoder = builder_map['image_encoder'][args.image_encoder](args.image_encoder_checkpoint)
     sam_image_encoder = sam_image_encoder.to(device)
     sam_image_encoder = torch.compile(sam_image_encoder)
 
-    train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
+    dataset_dir = 'data/sam-hq' if args.dataset == 'hqseg44k' else 'data/coco-lvis'
+    # train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
+    train_set, val_set = builder_map['dataset'][args.dataset](dataset_dir)
     # train_set_masklevel = MaskLevelDatasetDummy(
     #     dataset=train_set,
     #     sam_encoder=sam_image_encoder,
@@ -261,16 +309,21 @@ if __name__ == "__main__":
         shuffle=True,
     )
 
-    simple_var = build_simple_var(simple_var_checkpoint_path=checkpoint_path, device=device)
-    vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
+    # simple_var = build_simple_var(simple_var_checkpoint_path=checkpoint_path, device=device)
+    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, device=device)
+    # vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
+    vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False)
+
+    lr = args.lr
+    batch_size = args.batch_size
 
     trainer = SimpleARTrainer(
         simple_var=simple_var,
         vqvae=vqvae,
-        lr=1e-3,
+        lr=lr,
         train_set=train_set_masklevel,
         val_set=val_set_masklevel,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         device=device,
         log_dir=outdir / "logs",
         checkpoint_dir=outdir / "checkpoints",
@@ -284,6 +337,7 @@ if __name__ == "__main__":
         print(f'=== outer iter {i} ===')
         trainer.train(num_iters=inner_iters, outer_iter=i, resume_iters=resume_iters)
         trainer.eval(args.val_iters, global_step=(i+1)*inner_iters+resume_iters)
+    print(f"Training finish at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Training complete. Checkpoints saved to {outdir / 'checkpoints'}")
     print(f"Logs saved to {outdir / 'logs'}")
     
