@@ -36,10 +36,12 @@ class MaskLevelDataset(IterableDataset):
         mask_filter_thresh=0.1,
         image_size_encoder=1024,
         image_size_mask=256,
+        dtype=torch.float32
     ):
         self.dataset = dataset
         self.sam_encoder = sam_encoder
         self.device = device
+        self.dtype=dtype
         self.with_image_embed = with_image_embed
         self.mask_filter_thresh = mask_filter_thresh
 
@@ -79,15 +81,16 @@ class MaskLevelDataset(IterableDataset):
                     continue
                 yield image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach()
 
+    @torch.no_grad()
     def preprocess_image(self, image):
         """
         preprocess image for image encoder
 
         image: (H, W, 3)
         """
-        with torch.no_grad():  # 整个预处理过程都不需要梯度
+        with torch.autocast(self.device, dtype=self.dtype):
             # !MUST NOT DIVIDE 255 HERE
-            image = torch.from_numpy(image).to(self.device, dtype=torch.float32, non_blocking=True)
+            image = torch.from_numpy(image).to(self.device, dtype=self.dtype, non_blocking=True)
             image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
             image = resize_longest_side(image.unsqueeze(0), self.image_size_encoder).squeeze(0)
 
@@ -110,12 +113,13 @@ class MaskLevelDataset(IterableDataset):
                 image_embed_sam = 0
         return image, image_embed_sam
 
+    @torch.no_grad()
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):
-        with torch.no_grad():  # mask预处理不需要梯度
+        with torch.autocast(self.device, dtype=self.dtype):
             mask = gt_mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
 
             # to tensor
-            mask = torch.from_numpy(mask).to(self.device, dtype=torch.float32, non_blocking=True).unsqueeze(0)
+            mask = torch.from_numpy(mask).to(self.device, dtype=self.dtype, non_blocking=True).unsqueeze(0)
 
             mask = resize_longest_side(mask.unsqueeze(0), self.image_size_mask, 'nearest').squeeze(0)
             # mask = mask.long()
@@ -157,8 +161,9 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
         image_size_encoder=1024,
         image_size_mask=256,
         count=1,
+        dtype=torch.float32
     ):
-        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask)
+        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype)
         self.rng = np.random.default_rng(seed)
         self.seed = seed
         self.count = count
@@ -215,8 +220,9 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
         image_size_encoder=1024,
         image_size_mask=256,
         shuffle=True, # 是否每次顺序都相同
+        dtype=torch.float32
     ):
-        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask)
+        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype)
         self.rng = np.random.default_rng(seed)
         self.num_masks = num_masks
         self.infinite = infinite

@@ -1,0 +1,316 @@
+"""
+python train_scripts/simple_var/train_simple_var_v2_16d.py \
+    --device 'cuda' \
+    --outdir out/simple_var_v2_16d \
+    --outer_iters 20 \
+    --val_iters 64 \
+    --inner_iters 10000 \
+    --batch_size 4 \
+    --dtype bfloat16 \
+    # --resume_from out/simple_var_v2_16d \
+    # --resume_iters 200000
+"""
+from itertools import islice
+from pathlib import Path
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import tqdm
+from einops import rearrange, repeat
+
+from maskvar.models.vqvae_single import VQVAE_Single
+from maskvar.models.simple_ar import (
+    SimpleVAR,
+    simple_var_train_pass,
+    simple_var_inference,
+)
+from maskvar.datasets import (
+    MaskLevelDataset,
+    MaskLevelDatasetDummy,
+    MaskLevelDatasetRandom,
+)
+
+
+class SimpleARTrainer:
+
+    def __init__(
+        self, 
+        simple_var: SimpleVAR, 
+        vqvae: VQVAE_Single, 
+        lr: float,
+        train_set: MaskLevelDataset, 
+        val_set: MaskLevelDataset, 
+        batch_size: int, 
+        device: str,
+        log_dir: Path,
+        checkpoint_dir: Path,
+        skip_eval: bool = True,
+        loss_weight_per_level=[1, 1, 1, 1, 1],
+        opt_checkpoint: Path | None = None,
+    ):
+        # models
+        self.simple_var: SimpleVAR = simple_var
+        self.vqvae: VQVAE_Single = vqvae
+
+        # optimizer
+        self.optimizer = torch.optim.AdamW(simple_var.parameters(), lr=lr)
+
+        # device
+        self.device = device
+
+        # dataset
+        self.train_set = train_set
+        self.val_set = val_set
+        self.batch_size = batch_size
+        
+        # loss
+        self.loss_function = nn.CrossEntropyLoss(reduction='none')
+        if opt_checkpoint is not None:
+            optimizer_state_dict = torch.load(opt_checkpoint)
+            self.optimizer.load_state_dict(optimizer_state_dict)
+
+        # loss weight
+        with torch.no_grad():
+            patch_num = simple_var.patch_num
+            loss_weight_per_token = []
+            for level, pn in enumerate(patch_num):
+                loss_weight_per_token.extend(
+                    [loss_weight_per_level[level] / pn**2] * pn**2
+                )
+            # print(f'loss weight per token: {loss_weight_per_token}')
+            self.loss_weight_per_token = torch.tensor(loss_weight_per_token, dtype=torch.float32, device=self.device)
+            self.loss_weight_per_token = F.normalize(self.loss_weight_per_token, p=1, dim=-1)
+
+        # logger
+        self.logger = SummaryWriter(log_dir=str(log_dir))
+        self.output_dir = checkpoint_dir
+
+        self.skip_eval = skip_eval
+
+        self.compile_model()
+    
+    def compile_model(self):
+        self.simple_var.to(self.device)
+        self.vqvae.to(self.device)
+        self.simple_var = torch.compile(self.simple_var)
+        self.vqvae = torch.compile(self.vqvae)
+
+    def train_step(self, image, image_embed_sam, single_mask_normalized, single_mask):
+        self.optimizer.zero_grad()
+        gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
+        gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
+
+        logits = simple_var_train_pass(
+            idx=gt_idx,
+            image_feat=image_embed_sam,
+            simple_var=self.simple_var, 
+            vqvae=self.vqvae
+        )
+
+        acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
+
+        logits = rearrange(logits, 'B L C -> B C L')
+
+        loss = self.loss_function(logits, gt_idx_flat) # (B, L)
+        loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # (B, L)
+
+        loss = loss.mean()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item(), acc
+
+    def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0):
+        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
+
+        if num_iters > 0:
+            train_dataloader = islice(train_dataloader, num_iters)
+
+        self.simple_var.train()
+        
+        pbar = tqdm.tqdm(enumerate(train_dataloader), desc="Training", total=num_iters)
+        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
+            loss, acc = self.train_step(image, image_embed_sam, single_mask_normalized, single_mask)
+            acc_mean = acc.mean().item()
+            acc_sos = acc[:, 0].mean().item()
+
+            # update loss and acc in progressive bar
+            pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
+
+            # log to tensorboard
+            global_iters = i + num_iters * outer_iter + resume_iters
+            self.logger.add_scalar('train/loss', loss, global_step=global_iters)
+            self.logger.add_scalar('train/acc_mean', acc_mean, global_step=global_iters)
+            self.logger.add_scalar('train/acc_sos', acc_sos, global_step=global_iters)
+        
+        global_iters = (outer_iter + 1)*num_iters + resume_iters
+        self.save_checkpoint(iters=global_iters)
+    
+    @torch.no_grad()
+    def eval(self, num_iters: int, global_step: int = 0):
+        val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
+        
+        self.simple_var.eval()
+
+        losses = []
+        acc_means = []
+        acc_soss = []
+
+        pbar = tqdm.tqdm(enumerate(val_dataloader), desc="Val: ", total=num_iters)
+
+        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
+            if num_iters > 0 and i >= num_iters:
+                break
+            gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
+            gt_idx_flat = torch.cat(gt_idx, dim=1)
+
+            logits = simple_var_train_pass(
+                idx=gt_idx,
+                image_feat=image_embed_sam,
+                simple_var=self.simple_var, 
+                vqvae=self.vqvae
+            )
+            
+            acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
+            acc_mean = acc.mean().item()
+            acc_sos = acc[:, 0].mean().item()
+            
+            logits = rearrange(logits, 'b l c -> b c l')
+            loss = self.loss_function(logits, gt_idx_flat)
+            loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # will be automatically broadcasted to [B, L]
+            
+            loss_mean = loss.mean().item()
+
+            pbar.set_postfix({'loss': f'{loss_mean:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
+
+            losses.append(loss_mean)
+            acc_means.append(acc_mean)
+            acc_soss.append(acc_sos)
+        
+        mean_loss = float(sum(losses) / len(losses))
+        mean_acc_mean = float(sum(acc_means) / len(acc_means))
+        mean_acc_sos = float(sum(acc_soss) / len(acc_soss))
+
+        self.logger.add_scalar('val/loss', mean_loss, global_step=global_step)
+        self.logger.add_scalar('val/acc_mean', mean_acc_mean, global_step=global_step)
+        self.logger.add_scalar('val/acc_sos', mean_acc_sos, global_step=global_step)
+
+        return mean_loss, mean_acc_mean, mean_acc_sos
+    
+    def save_checkpoint(self, iters: int):
+        torch.save(self.optimizer.state_dict(), self.output_dir / f'.optimizer.{iters}.pt')
+        torch.save(self.simple_var.state_dict(), self.output_dir / f'.simple_var.{iters}.pt')
+
+
+if __name__ == "__main__":
+    import argparse
+    from maskvar.maskseg_build_everything import (
+        build_hqseg44k_dataset,
+        build_simple_var,
+        build_vqvae_single_5_stages_v1,
+        build_mobile_sam_image_encoder,
+        build_simple_var_16d,
+    )
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--outdir', type=str)
+    parser.add_argument('--outer_iters', type=int, default=1000)
+    parser.add_argument('--val_iters', type=int, default=100)
+    parser.add_argument('--inner_iters', type=int, default=1000)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--resume_from', type=str, default=None)
+    parser.add_argument('--resume_iters', type=int, default=0)
+    parser.add_argument('--dtype', type=str, default='float32')
+    args = parser.parse_args()
+
+    if args.dtype == 'float16':
+        dtype = torch.float16
+    elif args.dtype == 'bfloat16':
+        dtype = torch.bfloat16
+    elif args.dtype == 'float32':
+        dtype = torch.float32
+    else:
+        print(f"[WARN] Unsupported dtype '{args.dtype}', using float32 instead!")
+        dtype = torch.float32
+
+    if args.resume_from is not None:
+        checkpoint_path = Path(args.resume_from) / "checkpoints" / f".simple_var.{args.resume_iters}.pt"
+        opt_checkpoint = Path(args.resume_from) / "checkpoints" / f".optimizer.{args.resume_iters}.pt"
+    else:
+        checkpoint_path = None
+        opt_checkpoint = None
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (outdir / "logs").mkdir(parents=True, exist_ok=True)
+
+    device = args.device
+
+    sam_image_encoder = build_mobile_sam_image_encoder('ckpt/mobile_sam.pt')
+    sam_image_encoder = sam_image_encoder.to(device)
+    sam_image_encoder = torch.compile(sam_image_encoder)
+
+    train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
+    # train_set_masklevel = MaskLevelDatasetDummy(
+    #     dataset=train_set,
+    #     sam_encoder=sam_image_encoder,
+    #     with_image_embed=True,
+    #     device=args.device,
+    #     mask_filter_thresh=0.1,
+    #     seed=42,
+    #     count=5,
+    # )
+    val_set_masklevel = MaskLevelDatasetDummy(
+        dataset=val_set,
+        sam_encoder=sam_image_encoder,
+        with_image_embed=True,
+        device=args.device,
+        mask_filter_thresh=0.1,
+        seed=42,
+        count=16,
+        dtype=dtype,
+    )
+    train_set_masklevel = MaskLevelDatasetRandom(
+        dataset=train_set,
+        sam_encoder=sam_image_encoder,
+        with_image_embed=True,
+        device=args.device,
+        mask_filter_thresh=0.1,
+        seed=42,
+        infinite=True,
+        shuffle=True,
+        dtype=dtype,
+    )
+
+    simple_var = build_simple_var_16d(simple_var_checkpoint_path=checkpoint_path, device=device)
+    vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
+
+    trainer = SimpleARTrainer(
+        simple_var=simple_var,
+        vqvae=vqvae,
+        lr=1e-4,
+        train_set=train_set_masklevel,
+        val_set=val_set_masklevel,
+        batch_size=args.batch_size,
+        device=device,
+        log_dir=outdir / "logs",
+        checkpoint_dir=outdir / "checkpoints",
+        opt_checkpoint=opt_checkpoint,
+    )
+
+    outer_iters = args.outer_iters
+    inner_iters = args.inner_iters
+    resume_iters = args.resume_iters
+    with torch.autocast(device_type=args.device, enabled=True, dtype=dtype):
+        for i in range(outer_iters):
+            print(f'=== outer iter {i} ===')
+            trainer.train(num_iters=inner_iters, outer_iter=i, resume_iters=resume_iters)
+            trainer.eval(args.val_iters, global_step=(i+1)*inner_iters+resume_iters)
+    print(f"Training complete. Checkpoints saved to {outdir / 'checkpoints'}")
+    print(f"Logs saved to {outdir / 'logs'}")
+    
