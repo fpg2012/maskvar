@@ -66,7 +66,8 @@ class SimpleARTrainer:
         lr: float,
         train_set: MaskLevelDataset, 
         val_set: MaskLevelDataset, 
-        batch_size: int, 
+        batch_size: int,
+        accumulate_steps: int,
         device: str,
         log_dir: Path,
         checkpoint_dir: Path,
@@ -88,6 +89,7 @@ class SimpleARTrainer:
         self.train_set = train_set
         self.val_set = val_set
         self.batch_size = batch_size
+        self.accumulate_steps = accumulate_steps
         
         # loss
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
@@ -121,8 +123,7 @@ class SimpleARTrainer:
         self.simple_var = torch.compile(self.simple_var)
         self.vqvae = torch.compile(self.vqvae)
 
-    def train_step(self, image, image_embed_sam, single_mask_normalized, single_mask):
-        self.optimizer.zero_grad()
+    def train_step(self, inner_iter_count, image, image_embed_sam, single_mask_normalized, single_mask):
         gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
         gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
 
@@ -141,8 +142,12 @@ class SimpleARTrainer:
         loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # (B, L)
 
         loss = loss.mean()
+        loss = loss / self.accumulate_steps
         loss.backward()
-        self.optimizer.step()
+        
+        if (inner_iter_count + 1) % self.accumulate_steps == 0:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
         return loss.item(), acc
 
@@ -156,7 +161,15 @@ class SimpleARTrainer:
         
         pbar = tqdm.tqdm(enumerate(train_dataloader), desc="Training", total=num_iters)
         for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
-            loss, acc = self.train_step(image, image_embed_sam, single_mask_normalized, single_mask)
+            global_iters = i + num_iters * outer_iter + resume_iters
+
+            loss, acc = self.train_step(
+                i,
+                image,
+                image_embed_sam,
+                single_mask_normalized,
+                single_mask,
+            )
             acc_mean = acc.mean().item()
             acc_sos = acc[:, 0].mean().item()
 
@@ -164,7 +177,6 @@ class SimpleARTrainer:
             pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
 
             # log to tensorboard
-            global_iters = i + num_iters * outer_iter + resume_iters
             self.logger.add_scalar('train/loss', loss, global_step=global_iters)
             self.logger.add_scalar('train/acc_mean', acc_mean, global_step=global_iters)
             self.logger.add_scalar('train/acc_sos', acc_sos, global_step=global_iters)
@@ -243,6 +255,7 @@ if __name__ == "__main__":
     parser.add_argument('--val_iters', type=int, default=100)
     parser.add_argument('--inner_iters', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--accumulate_steps', type=int, default=1)
     # resume
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--resume_iters', type=int, default=0)
@@ -316,6 +329,7 @@ if __name__ == "__main__":
 
     lr = args.lr
     batch_size = args.batch_size
+    accumulate_steps = args.accumulate_steps
 
     trainer = SimpleARTrainer(
         simple_var=simple_var,
@@ -324,6 +338,7 @@ if __name__ == "__main__":
         train_set=train_set_masklevel,
         val_set=val_set_masklevel,
         batch_size=batch_size,
+        accumulate_steps=accumulate_steps,
         device=device,
         log_dir=outdir / "logs",
         checkpoint_dir=outdir / "checkpoints",
