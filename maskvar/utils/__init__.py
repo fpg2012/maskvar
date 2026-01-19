@@ -33,6 +33,25 @@ def merge_image(x_0, division):
     x = x.view(B, C, 2, 2, h, w).permute(0, 1, 2, 4, 3, 5).contiguous().view(B, C, H, W) # (B, C, H, W)
     return x
 
+def preprocess_image(image: torch.Tensor, image_size_encoder, device, dtype):
+    with torch.autocast(device, dtype=dtype):
+        # !MUST NOT DIVIDE 255 HERE
+        image = torch.from_numpy(image).to(device, dtype=dtype, non_blocking=True)
+        image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
+        image = resize_longest_side(image.unsqueeze(0), image_size_encoder).squeeze(0)
+
+        # normalize image
+        pixel_mean = torch.tensor([123.675, 116.28, 103.53], device=device)
+        pixel_std = torch.tensor([58.395, 57.12, 57.375], device=device)
+        image = (image - pixel_mean.view(-1, 1, 1)) / pixel_std.view(-1, 1, 1)
+
+        # pad image to image_size_encoder (default 1024)
+        h, w = image.shape[-2:]
+        padh = image_size_encoder - h
+        padw = image_size_encoder - w
+        image = F.pad(image, (0, padw, 0, padh), value=0)
+    return image
+
 def restore_normalized_image(image: torch.Tensor):
     """
     Restore normalized image to original image
