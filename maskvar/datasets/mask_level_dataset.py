@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 import torch.distributed as dist
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -115,9 +115,10 @@ class MaskLevelDataset(IterableDataset):
                 assert index is not None
                 image_embed_sam = self.image_feature_cache[index]
             else:
-                with torch.autocast(self.device, dtype=self.dtype):
-                    image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0).clone()
-                image_embed_sam = image_embed_sam.to('cpu')
+                raise NotImplementedError("sam embedding in dataset is now disabled! Please use image feature cache instead.")
+                # with torch.autocast(self.device, dtype=self.dtype):
+                #     image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0).clone()
+                # image_embed_sam = image_embed_sam.to('cpu')
         else:
             image_embed_sam = None
         return image, image_embed_sam
@@ -249,7 +250,14 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
             self.__reset_rng_and_counter()
 
         # sample a data point from dataset
-        index = self.rng.integers(0, len(self.dataset))
+        index_range = (0, len(self.dataset))
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            shard_size = len(self.dataset) // worker_info.num_workers
+            index_range = (worker_info.id * shard_size, (worker_info.id + 1) * shard_size)
+
+        index = self.rng.integers(index_range[0], index_range[1])
+        
         image, mask, instance_info = self.dataset[index]
         image, image_embed_sam = self.preprocess_image(image, index=index)
 

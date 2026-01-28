@@ -161,7 +161,8 @@ class SimpleARTrainer:
         return loss.item(), acc
 
     def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0):
-        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=8, prefetch_factor=16, pin_memory=True, persistent_workers=True)
+        # train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
+        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=16, prefetch_factor=2, pin_memory=True, persistent_workers=True)
 
         if num_iters > 0:
             train_dataloader = islice(train_dataloader, num_iters)
@@ -255,8 +256,8 @@ class SimpleARTrainer:
 
 
 if __name__ == "__main__":
-    import torch.multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
+    # import torch.multiprocessing as mp
+    # mp.set_start_method('spawn', force=True)
 
     import argparse
     from maskvar.maskseg_build_everything import (
