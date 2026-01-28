@@ -10,6 +10,7 @@ from typing import Optional, Iterator, Tuple
 
 from .coco_lvis import LvisDataset
 from .hqseg44k import HQSeg44KTrainDataset
+from .image_feature_cache import ImageFeatureCache
 from ..utils import resize_longest_side
 from ..models.sam import ImageEncoderViT as SamImageEncoder
 
@@ -36,7 +37,8 @@ class MaskLevelDataset(IterableDataset):
         mask_filter_thresh=0.1,
         image_size_encoder=1024,
         image_size_mask=256,
-        dtype=torch.float32
+        dtype=torch.float32,
+        image_feature_cache: Optional[ImageFeatureCache] = None
     ):
         self.dataset = dataset
         self.sam_encoder = sam_encoder
@@ -49,11 +51,13 @@ class MaskLevelDataset(IterableDataset):
         self.image_size_mask = image_size_mask
         
         if self.with_image_embed:
-            assert self.sam_encoder is not None
+            assert (self.sam_encoder is not None) or (image_feature_cache is not None)
 
         # 使用register_buffer避免每次都创建新tensor
         self.pixel_mean = torch.tensor([123.675, 116.28, 103.53], device=device) # copied from sam
         self.pixel_std = torch.tensor([58.395, 57.12, 57.375], device=device) # copied from sam
+
+        self.image_feature_cache = image_feature_cache
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
@@ -74,7 +78,7 @@ class MaskLevelDataset(IterableDataset):
                 continue
 
             image, mask, instance_info = self.dataset[i]
-            image, image_embed_sam = self.preprocess_image(image)
+            image, image_embed_sam = self.preprocess_image(image, index=i)
             for instance_idx in instance_info.keys():
                 single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
                 if not self.filter_mask(single_mask, self.mask_filter_thresh):
@@ -82,7 +86,7 @@ class MaskLevelDataset(IterableDataset):
                 yield image.detach(), image_embed_sam.detach() if isinstance(image_embed_sam, torch.Tensor) else image_embed_sam, single_mask_normalized.detach(), single_mask.detach()
 
     @torch.no_grad()
-    def preprocess_image(self, image):
+    def preprocess_image(self, image, index=None):
         """
         preprocess image for image encoder
 
@@ -108,9 +112,13 @@ class MaskLevelDataset(IterableDataset):
             # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
             if self.with_image_embed:
                 # 使用clone()创建新tensor，避免保留对encoder输出的引用
-                image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0).clone()
+                if self.image_feature_cache is not None:
+                    assert index is not None
+                    image_embed_sam = self.image_feature_cache[index]
+                else:
+                    image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0).clone()
             else:
-                image_embed_sam = 0
+                image_embed_sam = None
         return image, image_embed_sam
 
     @torch.no_grad()
@@ -161,9 +169,10 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
         image_size_encoder=1024,
         image_size_mask=256,
         count=1,
-        dtype=torch.float32
+        dtype=torch.float32,
+        image_feature_cache: Optional[ImageFeatureCache] = None
     ):
-        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype)
+        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype, image_feature_cache)
         self.rng = np.random.default_rng(seed)
         self.seed = seed
         self.count = count
@@ -176,7 +185,7 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
             # sample a data point from dataset
             index = self.rng.integers(0, len(self.dataset))
             image, mask, instance_info = self.dataset[index]
-            image, image_embed_sam = self.preprocess_image(image)
+            image, image_embed_sam = self.preprocess_image(image, index=index)
 
             for instance_idx in instance_info.keys():  # Take first count instances only
                 single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)
@@ -220,9 +229,10 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
         image_size_encoder=1024,
         image_size_mask=256,
         shuffle=True, # 是否每次顺序都相同
-        dtype=torch.float32
+        dtype=torch.float32,
+        image_feature_cache: Optional[ImageFeatureCache] = None
     ):
-        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype)
+        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype, image_feature_cache)
         self.rng = np.random.default_rng(seed)
         self.num_masks = num_masks
         self.infinite = infinite
@@ -241,7 +251,7 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
         # sample a data point from dataset
         index = self.rng.integers(0, len(self.dataset))
         image, mask, instance_info = self.dataset[index]
-        image, image_embed_sam = self.preprocess_image(image)
+        image, image_embed_sam = self.preprocess_image(image, index=index)
 
         for instance_idx in instance_info.keys():
             if self.num_masks > 0 and self.counter >= self.num_masks:

@@ -37,16 +37,15 @@ class ImageFeatureCache(Dataset):
             return self.metadata["count"]
         return self.metadata["count"] * self.internal_batch_size
 
-    def __get_item__(self, index) -> torch.Tensor:
+    def __getitem__(self, index) -> torch.Tensor:
         """
         return CHW image feature if original_batch_mode is disabled
         otherwhise, return BCHW image feature
         """
         if self.original_batch_mode:
-            image_feature = torch.load(self.cache_dir / self.model_name / f'{self.dataset}_{index}.pt', map_location=self.device)
+            image_feature = torch.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{index:06d}.pt', map_location=self.device)
             return image_feature
-        
         batch_index = index // self.internal_batch_size
         item_index_in_batch = index % self.internal_batch_size
-        image_feature = torch.load(self.cache_dir / self.model_name / f'{self.dataset}_{batch_index}.pt', map_location=self.device)
+        image_feature = torch.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{batch_index:06d}.pt', map_location=self.device)
         return image_feature[item_index_in_batch]
