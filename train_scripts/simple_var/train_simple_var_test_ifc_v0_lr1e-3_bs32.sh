@@ -9,8 +9,9 @@ python train_scripts/train_simple_var.py \
     --lr 1e-3 \
     --batch_size 16 \
     --accumulate_steps 2 \
-    --outer_iters 5 \
+    --outer_iters 20 \
     --val_iters 64 \
-    --inner_iters 64 \
+    --inner_iters 5000 \
     --image_feature_cache_dir data/cache \
-    --image_encoder sam_vitb
+    --image_encoder sam_vitb \
+    --dtype bfloat16

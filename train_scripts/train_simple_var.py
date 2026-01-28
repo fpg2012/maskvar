@@ -111,7 +111,7 @@ class SimpleARTrainer:
                     [loss_weight_per_level[level] / pn**2] * pn**2
                 )
             # print(f'loss weight per token: {loss_weight_per_token}')
-            self.loss_weight_per_token = torch.tensor(loss_weight_per_token, dtype=torch.float32, device=self.device)
+            self.loss_weight_per_token = torch.tensor(loss_weight_per_token, device=self.device)
             self.loss_weight_per_token = F.normalize(self.loss_weight_per_token, p=1, dim=-1)
 
         # logger
@@ -131,10 +131,11 @@ class SimpleARTrainer:
     def train_step(self, inner_iter_count, image, image_embed_sam, single_mask_normalized, single_mask):
         image_embed_sam = image_embed_sam.to(self.device)
         single_mask_normalized = single_mask_normalized.to(self.device)
+
+        gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
+        gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
         
         with torch.autocast(self.device, dtype=self.dtype):
-            gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
-            gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
 
             logits = simple_var_train_pass(
                 idx=gt_idx,
@@ -162,7 +163,7 @@ class SimpleARTrainer:
 
     def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0):
         # train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
-        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=16, prefetch_factor=2, pin_memory=True, persistent_workers=True)
+        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=64, prefetch_factor=2, pin_memory=True, persistent_workers=True)
 
         if num_iters > 0:
             train_dataloader = islice(train_dataloader, num_iters)
@@ -206,17 +207,16 @@ class SimpleARTrainer:
 
         pbar = tqdm.tqdm(enumerate(val_dataloader), desc="Val: ", total=num_iters)
 
-        
-
         for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
-            image_embed_sam = image_embed_sam.to(device)
-            single_mask_normalized = single_mask_normalized.to(device)
-            with torch.autocast(self.device, dtype=self.dtype):
-                if num_iters > 0 and i >= num_iters:
-                    break
-                gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
-                gt_idx_flat = torch.cat(gt_idx, dim=1)
+            image_embed_sam = image_embed_sam.to(self.device)
+            single_mask_normalized = single_mask_normalized.to(self.device)
+            
+            if num_iters > 0 and i >= num_iters:
+                break
+            gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
+            gt_idx_flat = torch.cat(gt_idx, dim=1)
 
+            with torch.autocast(self.device, dtype=self.dtype):
                 logits = simple_var_train_pass(
                     idx=gt_idx,
                     image_feat=image_embed_sam,
