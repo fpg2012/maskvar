@@ -17,6 +17,8 @@ class SimpleVAR(nn.Module):
                  patch_num=[1, 4, 8, 16, 32], 
                  num_heads=4,
                  vqvae_dim=256,
+                 use_sam_pe=False,
+                 sam_pe=None
                  ):
         super().__init__()
         self.patch_num = patch_num
@@ -41,7 +43,19 @@ class SimpleVAR(nn.Module):
         
         pn_last = self.patch_num[-1]
         
-        self.pos_embed = nn.Parameter(torch.randn(1, pn_last, pn_last, dim))
+        self.use_sam_pe = use_sam_pe
+        if use_sam_pe:
+            # check pe shape
+            assert sam_pe is not None, "sam_pe must be provided when use_sam_pe is True"
+            assert sam_pe.shape[0] == 1 and sam_pe.shape[1] == dim and sam_pe.shape[-1] == sam_pe.shape[-2], f"sam_pe shape: {sam_pe.shape}, expected: (1, {dim}, p, p)"
+            sam_pe = sam_pe.to(device)
+            if sam_pe.shape[-1] != pn_last:
+                sam_pe = F.interpolate(sam_pe, size=(pn_last, pn_last), mode='bilinear', align_corners=False)
+            sam_pe = rearrange(sam_pe, '1 c h w -> 1 h w c')
+            self.pos_embed = sam_pe.detach()
+        else:
+            # trainable pe
+            self.pos_embed = nn.Parameter(torch.randn(1, pn_last, pn_last, dim))
         self.level_embedding = nn.Embedding(len(patch_num), dim)
         
         self.sos = nn.Parameter(torch.randn(dim))

@@ -163,7 +163,7 @@ class SimpleARTrainer:
 
     def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0):
         # train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
-        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=64, prefetch_factor=2, pin_memory=True, persistent_workers=True)
+        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=32, prefetch_factor=2, pin_memory=True, persistent_workers=True)
 
         if num_iters > 0:
             train_dataloader = islice(train_dataloader, num_iters)
@@ -285,6 +285,8 @@ if __name__ == "__main__":
     parser.add_argument('--image_encoder_checkpoint', type=str, default='ckpt/mobile_sam.pt')
     parser.add_argument('--vqvae', choices=builder_map['vqvae'].keys(), type=str, default='vqvae_single_5_stages_v1')
     parser.add_argument('--vqvae_checkpoint', type=str, default='out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth')
+    parser.add_argument('--use_sam_pe', action='store_true')
+    parser.add_argument('--prompt_encoder_checkpoint', type=str, default=None)
     # image embedding caching
     parser.add_argument('--image_feature_cache_dir', type=str, default="")
     # dtype
@@ -356,8 +358,15 @@ if __name__ == "__main__":
         image_feature_cache=image_feature_cache_train,
     )
 
+    if (args.use_sam_pe):
+        prompt_encoder = builder_map['prompt_encoder'](args.prompt_encoder_checkpoint)
+        sam_pe = prompt_encoder.get_dense_pe() # BCHW
+        del prompt_encoder
+    else:
+        sam_pe = None
+
     # simple_var = build_simple_var(simple_var_checkpoint_path=checkpoint_path, device=device)
-    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, device=device)
+    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, sam_pe=sam_pe, device=device)
     # vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
     vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False)
 

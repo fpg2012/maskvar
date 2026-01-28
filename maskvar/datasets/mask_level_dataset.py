@@ -114,7 +114,7 @@ class MaskLevelDataset(IterableDataset):
             # 使用clone()创建新tensor，避免保留对encoder输出的引用
             if self.image_feature_cache is not None:
                 assert index is not None
-                image_embed_sam = self.image_feature_cache[index]
+                image_embed_sam = self.image_feature_cache[index].detach()
             else:
                 raise NotImplementedError("sam embedding in dataset is now disabled! Please use image feature cache instead.")
                 # with torch.autocast(self.device, dtype=self.dtype):
@@ -122,7 +122,7 @@ class MaskLevelDataset(IterableDataset):
                 # image_embed_sam = image_embed_sam.to('cpu')
         else:
             image_embed_sam = None
-        return image, image_embed_sam
+        return image.detach(), image_embed_sam
 
     @torch.no_grad()
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):
@@ -143,7 +143,7 @@ class MaskLevelDataset(IterableDataset):
         # normalize mask
         mask_normalized = mask * 2 - 1
 
-        return mask_normalized, mask
+        return mask_normalized.detach(), mask.detach()
     
     def filter_mask(self, mask, thresh=0.1):
         """
@@ -361,10 +361,10 @@ class MaskLevelFlatDataset(Dataset):
 
         # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
         if self.with_image_embed:
-            image_embed_sam = self.image_feature_cache[index]
+            image_embed_sam = self.image_feature_cache[index].detach()
         else:
             image_embed_sam = None
-        return image, image_embed_sam
+        return image.detach(), image_embed_sam
 
     @torch.no_grad()
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):
@@ -385,7 +385,7 @@ class MaskLevelFlatDataset(Dataset):
         # normalize mask
         mask_normalized = mask * 2 - 1
 
-        return mask_normalized, mask
+        return mask_normalized.detach(), mask.detach()
     
     def filter_mask(self, mask, thresh=0.1):
         """

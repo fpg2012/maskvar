@@ -763,7 +763,7 @@ def build_simple_ar(simple_ar_checkpoint_path: Optional[str] = None, device: str
 
     return simple_ar.to(device)
 
-def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, device: str = 'cpu') -> SimpleVAR:
+def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu') -> SimpleVAR:
     simple_var = SimpleVAR(
         dim=256,
         depth=2,
@@ -772,6 +772,8 @@ def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, device: s
         patch_num=[1, 8, 16, 24, 32],
         num_heads=4,
         vqvae_dim=32,
+        use_sam_pe=(sam_pe is not None),
+        sam_pe=sam_pe,
     )
 
     if simple_var_checkpoint_path is not None:
@@ -789,7 +791,7 @@ def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, device: s
 
     return simple_var.to(device)
 
-def build_simple_var_6d(simple_var_checkpoint_path: Optional[str] = None, device: str = 'cpu') -> SimpleVAR:
+def build_simple_var_6d(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu') -> SimpleVAR:
     simple_var = SimpleVAR(
         dim=256,
         depth=6,
@@ -798,6 +800,8 @@ def build_simple_var_6d(simple_var_checkpoint_path: Optional[str] = None, device
         patch_num=[1, 8, 16, 24, 32],
         num_heads=4,
         vqvae_dim=32,
+        use_sam_pe=(sam_pe is not None),
+        sam_pe=sam_pe,
     )
 
     if simple_var_checkpoint_path is not None:
@@ -815,7 +819,7 @@ def build_simple_var_6d(simple_var_checkpoint_path: Optional[str] = None, device
 
     return simple_var.to(device)
 
-def build_simple_var_16d(simple_var_checkpoint_path: Optional[str] = None, device: str = 'cpu') -> SimpleVAR:
+def build_simple_var_16d(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu') -> SimpleVAR:
     simple_var = SimpleVAR(
         dim=256,
         depth=16,
@@ -824,6 +828,8 @@ def build_simple_var_16d(simple_var_checkpoint_path: Optional[str] = None, devic
         patch_num=[1, 8, 16, 24, 32],
         num_heads=4,
         vqvae_dim=32,
+        use_sam_pe=(sam_pe is not None),
+        sam_pe=sam_pe,
     )
 
     if simple_var_checkpoint_path is not None:
