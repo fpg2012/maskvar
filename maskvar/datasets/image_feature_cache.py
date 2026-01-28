@@ -6,11 +6,11 @@ from torch.utils.data import Dataset
 
 class ImageFeatureCache(Dataset):
 
-    def __init__(self, cache_dir: Path, dataset: str, model_name: str, device='cuda', original_batch_mode=False):
+    def __init__(self, cache_dir: Path, dataset: str, model_name: str, device='cpu', original_batch_mode=False):
         self.cache_dir = cache_dir
         self.dataset = dataset
         self.model_name = model_name
-        self.device = device
+        # self.device = device
         self.metadata = {
             "count": 0,
             "resolution": 1024,
@@ -43,9 +43,9 @@ class ImageFeatureCache(Dataset):
         otherwhise, return BCHW image feature
         """
         if self.original_batch_mode:
-            image_feature = torch.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{index:06d}.pt', map_location=self.device)
+            image_feature = torch.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{index:06d}.pt', map_location='cpu')
             return image_feature
         batch_index = index // self.internal_batch_size
         item_index_in_batch = index % self.internal_batch_size
-        image_feature = torch.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{batch_index:06d}.pt', map_location=self.device)
+        image_feature = torch.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{batch_index:06d}.pt', map_location='cpu')
         return image_feature[item_index_in_batch]

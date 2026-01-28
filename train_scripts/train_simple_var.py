@@ -24,7 +24,10 @@ from maskvar.datasets import (
     MaskLevelDatasetDummy,
     MaskLevelDatasetRandom,
 )
+from maskvar.datasets.image_feature_cache import ImageFeatureCache
 
+
+torch.set_float32_matmul_precision('high')
 
 def save_train_configuration(args, outdir: Path):
     cur_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -73,6 +76,7 @@ class SimpleARTrainer:
         checkpoint_dir: Path,
         skip_eval: bool = True,
         loss_weight_per_level=[1, 1, 1, 1, 1],
+        dtype=torch.float32,
         opt_checkpoint: Path | None = None,
     ):
         # models
@@ -84,6 +88,7 @@ class SimpleARTrainer:
 
         # device
         self.device = device
+        self.dtype = dtype
 
         # dataset
         self.train_set = train_set
@@ -124,35 +129,39 @@ class SimpleARTrainer:
         self.vqvae = torch.compile(self.vqvae)
 
     def train_step(self, inner_iter_count, image, image_embed_sam, single_mask_normalized, single_mask):
-        gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
-        gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
-
-        logits = simple_var_train_pass(
-            idx=gt_idx,
-            image_feat=image_embed_sam,
-            simple_var=self.simple_var, 
-            vqvae=self.vqvae
-        )
-
-        acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
-
-        logits = rearrange(logits, 'B L C -> B C L')
-
-        loss = self.loss_function(logits, gt_idx_flat) # (B, L)
-        loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # (B, L)
-
-        loss = loss.mean()
-        loss = loss / self.accumulate_steps
-        loss.backward()
+        image_embed_sam = image_embed_sam.to(self.device)
+        single_mask_normalized = single_mask_normalized.to(self.device)
         
-        if (inner_iter_count + 1) % self.accumulate_steps == 0:
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+        with torch.autocast(self.device, dtype=self.dtype):
+            gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
+            gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
+
+            logits = simple_var_train_pass(
+                idx=gt_idx,
+                image_feat=image_embed_sam,
+                simple_var=self.simple_var, 
+                vqvae=self.vqvae
+            )
+
+            acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
+
+            logits = rearrange(logits, 'B L C -> B C L')
+
+            loss = self.loss_function(logits, gt_idx_flat) # (B, L)
+            loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # (B, L)
+
+            loss = loss.mean()
+            loss = loss / self.accumulate_steps
+            loss.backward()
+            
+            if (inner_iter_count + 1) % self.accumulate_steps == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
 
         return loss.item(), acc
 
     def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0):
-        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
+        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=8, prefetch_factor=16, pin_memory=True, persistent_workers=True)
 
         if num_iters > 0:
             train_dataloader = islice(train_dataloader, num_iters)
@@ -196,28 +205,33 @@ class SimpleARTrainer:
 
         pbar = tqdm.tqdm(enumerate(val_dataloader), desc="Val: ", total=num_iters)
 
-        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
-            if num_iters > 0 and i >= num_iters:
-                break
-            gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
-            gt_idx_flat = torch.cat(gt_idx, dim=1)
+        
 
-            logits = simple_var_train_pass(
-                idx=gt_idx,
-                image_feat=image_embed_sam,
-                simple_var=self.simple_var, 
-                vqvae=self.vqvae
-            )
-            
-            acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
-            acc_mean = acc.mean().item()
-            acc_sos = acc[:, 0].mean().item()
-            
-            logits = rearrange(logits, 'b l c -> b c l')
-            loss = self.loss_function(logits, gt_idx_flat)
-            loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # will be automatically broadcasted to [B, L]
-            
-            loss_mean = loss.mean().item()
+        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
+            image_embed_sam = image_embed_sam.to(device)
+            single_mask_normalized = single_mask_normalized.to(device)
+            with torch.autocast(self.device, dtype=self.dtype):
+                if num_iters > 0 and i >= num_iters:
+                    break
+                gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
+                gt_idx_flat = torch.cat(gt_idx, dim=1)
+
+                logits = simple_var_train_pass(
+                    idx=gt_idx,
+                    image_feat=image_embed_sam,
+                    simple_var=self.simple_var, 
+                    vqvae=self.vqvae
+                )
+                
+                acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
+                acc_mean = acc.mean().item()
+                acc_sos = acc[:, 0].mean().item()
+                
+                logits = rearrange(logits, 'b l c -> b c l')
+                loss = self.loss_function(logits, gt_idx_flat)
+                loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # will be automatically broadcasted to [B, L]
+                
+                loss_mean = loss.mean().item()
 
             pbar.set_postfix({'loss': f'{loss_mean:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
 
@@ -241,6 +255,9 @@ class SimpleARTrainer:
 
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
+
     import argparse
     from maskvar.maskseg_build_everything import (
         builder_map
@@ -263,10 +280,14 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', choices=['hqseg44k', 'cocolvis'], type=str, default='hqseg44k')
     # configs
     parser.add_argument('--simple_var', type=str, default='simple_var')
-    parser.add_argument('--image_encoder', choices=['sam-vitb', 'mobile_sam'], type=str, default='mobile_sam')
+    parser.add_argument('--image_encoder', choices=['sam_vitb', 'mobile_sam'], type=str, default='mobile_sam')
     parser.add_argument('--image_encoder_checkpoint', type=str, default='ckpt/mobile_sam.pt')
     parser.add_argument('--vqvae', choices=builder_map['vqvae'].keys(), type=str, default='vqvae_single_5_stages_v1')
     parser.add_argument('--vqvae_checkpoint', type=str, default='out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth')
+    # image embedding caching
+    parser.add_argument('--image_feature_cache_dir', type=str, default="")
+    # dtype
+    parser.add_argument('--dtype', choices=['float16', 'float32', 'bfloat16'], type=str, default='float32')
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -284,11 +305,21 @@ if __name__ == "__main__":
     (outdir / "logs").mkdir(parents=True, exist_ok=True)
 
     device = args.device
+    dtype = getattr(torch, args.dtype)
 
     # sam_image_encoder = build_mobile_sam_image_encoder('ckpt/mobile_sam.pt')
-    sam_image_encoder = builder_map['image_encoder'][args.image_encoder](args.image_encoder_checkpoint)
-    sam_image_encoder = sam_image_encoder.to(device)
-    sam_image_encoder = torch.compile(sam_image_encoder)
+    if args.image_feature_cache_dir:
+        print("Using image feature cache: ", args.image_feature_cache_dir)
+        image_feature_cache_train = ImageFeatureCache(Path(args.image_feature_cache_dir), f"{args.dataset}_train", args.image_encoder)
+        image_feature_cache_val = ImageFeatureCache(Path(args.image_feature_cache_dir), f"{args.dataset}_val", args.image_encoder)
+        sam_image_encoder = None
+    else:
+        print("Not using image feature cache")
+        image_feature_cache_train = None
+        image_feature_cache_val = None
+        sam_image_encoder = builder_map['image_encoder'][args.image_encoder](args.image_encoder_checkpoint)
+        sam_image_encoder = sam_image_encoder.to(device)
+        sam_image_encoder = torch.compile(sam_image_encoder)
 
     dataset_dir = 'data/sam-hq' if args.dataset == 'hqseg44k' else 'data/coco-lvis'
     # train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
@@ -310,6 +341,7 @@ if __name__ == "__main__":
         mask_filter_thresh=0.1,
         seed=42,
         count=16,
+        image_feature_cache=image_feature_cache_val,
     )
     train_set_masklevel = MaskLevelDatasetRandom(
         dataset=train_set,
@@ -320,6 +352,7 @@ if __name__ == "__main__":
         seed=42,
         infinite=True,
         shuffle=True,
+        image_feature_cache=image_feature_cache_train,
     )
 
     # simple_var = build_simple_var(simple_var_checkpoint_path=checkpoint_path, device=device)
@@ -343,6 +376,7 @@ if __name__ == "__main__":
         log_dir=outdir / "logs",
         checkpoint_dir=outdir / "checkpoints",
         opt_checkpoint=opt_checkpoint,
+        dtype=dtype,
     )
 
     outer_iters = args.outer_iters

@@ -54,8 +54,8 @@ class MaskLevelDataset(IterableDataset):
             assert (self.sam_encoder is not None) or (image_feature_cache is not None)
 
         # 使用register_buffer避免每次都创建新tensor
-        self.pixel_mean = torch.tensor([123.675, 116.28, 103.53], device=device) # copied from sam
-        self.pixel_std = torch.tensor([58.395, 57.12, 57.375], device=device) # copied from sam
+        self.pixel_mean = torch.tensor([123.675, 116.28, 103.53], ) # copied from sam
+        self.pixel_std = torch.tensor([58.395, 57.12, 57.375], ) # copied from sam
 
         self.image_feature_cache = image_feature_cache
 
@@ -92,54 +92,54 @@ class MaskLevelDataset(IterableDataset):
 
         image: (H, W, 3)
         """
-        with torch.autocast(self.device, dtype=self.dtype):
-            # !MUST NOT DIVIDE 255 HERE
-            image = torch.from_numpy(image).to(self.device, dtype=self.dtype, non_blocking=True)
-            image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
-            image = resize_longest_side(image.unsqueeze(0), self.image_size_encoder).squeeze(0)
+        # !MUST NOT DIVIDE 255 HERE
+        image = torch.from_numpy(image).to(dtype=self.dtype, non_blocking=True)
+        image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
+        image = resize_longest_side(image.unsqueeze(0), self.image_size_encoder).squeeze(0)
 
-            # normalize image
-            image = (image - self.pixel_mean.view(-1, 1, 1)) / self.pixel_std.view(-1, 1, 1)
+        # normalize image
+        image = (image - self.pixel_mean.view(-1, 1, 1)) / self.pixel_std.view(-1, 1, 1)
 
-            # pad image to image_size_encoder (default 1024)
-            h, w = image.shape[-2:]
-            padh = self.image_size_encoder - h
-            padw = self.image_size_encoder - w
-            image = F.pad(image, (0, padw, 0, padh), value=0)
+        # pad image to image_size_encoder (default 1024)
+        h, w = image.shape[-2:]
+        padh = self.image_size_encoder - h
+        padw = self.image_size_encoder - w
+        image = F.pad(image, (0, padw, 0, padh), value=0)
 
-            # print(f'image shape: {image.shape}')
+        # print(f'image shape: {image.shape}')
 
-            # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
-            if self.with_image_embed:
-                # 使用clone()创建新tensor，避免保留对encoder输出的引用
-                if self.image_feature_cache is not None:
-                    assert index is not None
-                    image_embed_sam = self.image_feature_cache[index]
-                else:
-                    image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0).clone()
+        # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
+        if self.with_image_embed:
+            # 使用clone()创建新tensor，避免保留对encoder输出的引用
+            if self.image_feature_cache is not None:
+                assert index is not None
+                image_embed_sam = self.image_feature_cache[index]
             else:
-                image_embed_sam = None
+                with torch.autocast(self.device, dtype=self.dtype):
+                    image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0).clone()
+                image_embed_sam = image_embed_sam.to('cpu')
+        else:
+            image_embed_sam = None
         return image, image_embed_sam
 
     @torch.no_grad()
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):
-        with torch.autocast(self.device, dtype=self.dtype):
-            mask = gt_mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
+        mask = gt_mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
 
-            # to tensor
-            mask = torch.from_numpy(mask).to(self.device, dtype=self.dtype, non_blocking=True).unsqueeze(0)
+        # to tensor
+        mask = torch.from_numpy(mask).to(dtype=self.dtype, non_blocking=True).unsqueeze(0)
 
-            mask = resize_longest_side(mask.unsqueeze(0), self.image_size_mask, 'nearest').squeeze(0)
-            # mask = mask.long()
+        mask = resize_longest_side(mask.unsqueeze(0), self.image_size_mask, 'nearest').squeeze(0)
+        # mask = mask.long()
 
-            # pad mask to image_size_mask (default 256)
-            h, w = mask.shape[-2:]
-            padh = self.image_size_mask - h
-            padw = self.image_size_mask - w
-            mask = F.pad(mask, (0, padw, 0, padh), value=0)
+        # pad mask to image_size_mask (default 256)
+        h, w = mask.shape[-2:]
+        padh = self.image_size_mask - h
+        padw = self.image_size_mask - w
+        mask = F.pad(mask, (0, padw, 0, padh), value=0)
 
-            # normalize mask
-            mask_normalized = mask * 2 - 1
+        # normalize mask
+        mask_normalized = mask * 2 - 1
 
         return mask_normalized, mask
     
