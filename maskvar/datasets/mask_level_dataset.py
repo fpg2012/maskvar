@@ -290,7 +290,6 @@ class MaskLevelFlatDataset(Dataset):
         self, 
         index_mapping_path: Path,
         dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
-        device: str, 
         with_image_embed=True,
         mask_filter_thresh=0.1,
         dtype=torch.float32,
@@ -300,7 +299,6 @@ class MaskLevelFlatDataset(Dataset):
     ):
         self.index_mapping_path = index_mapping_path
         self.dataset = dataset
-        self.device = device
         self.dtype=dtype
         self.with_image_embed = with_image_embed
         self.mask_filter_thresh = mask_filter_thresh

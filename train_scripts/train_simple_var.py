@@ -4,11 +4,14 @@ import json
 import sys
 import time
 from datetime import datetime
+import os
 
 import torch
+import torch.distributed as tdist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 import tqdm
 from einops import rearrange, repeat
@@ -24,6 +27,7 @@ from maskvar.datasets import (
     MaskLevelDatasetDummy,
     MaskLevelDatasetRandom,
 )
+from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset
 from maskvar.datasets.image_feature_cache import ImageFeatureCache
 
 
@@ -78,6 +82,8 @@ class SimpleARTrainer:
         loss_weight_per_level=[1, 1, 1, 1, 1],
         dtype=torch.float32,
         opt_checkpoint: Path | None = None,
+        dataloader_workers: int = 4,
+        prefetch_factor: int = 2,
     ):
         # models
         self.simple_var: SimpleVAR = simple_var
@@ -95,6 +101,8 @@ class SimpleARTrainer:
         self.val_set = val_set
         self.batch_size = batch_size
         self.accumulate_steps = accumulate_steps
+        self.sampler = None
+        self.val_sampler = None
         
         # loss
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
@@ -117,16 +125,60 @@ class SimpleARTrainer:
         # logger
         self.logger = SummaryWriter(log_dir=str(log_dir))
         self.output_dir = checkpoint_dir
+        self.log_duration = 32
 
         self.skip_eval = skip_eval
 
+        # torch distributed
+        if tdist.is_initialized():
+            self.rank = tdist.get_rank()
+            self.world_size = tdist.get_world_size()
+            self.local_rank = int(os.environ['LOCAL_RANK'])
+        else:
+            self.rank = 0
+            self.world_size = 1
+            self.local_rank = 0
+
         self.compile_model()
+        self.ddp_wrap()
+
+        # dataloader
+        self.dataloader_workers = dataloader_workers
+        self.prefetch_factor = prefetch_factor
+        self.train_dataloader = DataLoader(
+            self.train_set,
+            batch_size=self.batch_size,
+            shuffle=(self.sampler is None),
+            sampler=self.sampler,
+            drop_last=True,
+            num_workers=self.dataloader_workers,
+            prefetch_factor=self.prefetch_factor,
+            pin_memory=True,
+            persistent_workers=True
+        )
+        self.val_dataloader = DataLoader(
+            self.val_set,
+            batch_size=self.batch_size,
+            shuffle=(self.val_sampler is None),
+            drop_last=True,
+            sampler=self.val_sampler,
+            num_workers=self.dataloader_workers,
+            prefetch_factor=self.prefetch_factor,
+            pin_memory=True,
+            persistent_workers=True
+        )
     
     def compile_model(self):
         self.simple_var.to(self.device)
         self.vqvae.to(self.device)
         self.simple_var = torch.compile(self.simple_var)
         self.vqvae = torch.compile(self.vqvae)
+    
+    def ddp_wrap(self):
+        if self.world_size > 1:
+            self.simple_var = DDP(self.simple_var, device_ids=[self.rank])
+            self.sampler = DistributedSampler(self.train_set)
+            self.val_sampler = DistributedSampler(self.val_set)
 
     def train_step(self, inner_iter_count, image, image_embed_sam, single_mask_normalized, single_mask):
         image_embed_sam = image_embed_sam.to(self.device)
@@ -137,10 +189,9 @@ class SimpleARTrainer:
         
         with torch.autocast(self.device, dtype=self.dtype):
 
-            logits = simple_var_train_pass(
+            logits = self.simple_var(
                 idx=gt_idx,
                 image_feat=image_embed_sam,
-                simple_var=self.simple_var, 
                 vqvae=self.vqvae
             )
 
@@ -159,105 +210,156 @@ class SimpleARTrainer:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
-        return loss.item(), acc
+        return loss, acc
 
-    def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0):
-        # train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
-        train_dataloader = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=32, prefetch_factor=2, pin_memory=True, persistent_workers=True)
-
-        if num_iters > 0:
-            train_dataloader = islice(train_dataloader, num_iters)
+    def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0, val_iters=0):
+        if num_iters <= 0:
+            num_iters = len(self.train_dataloader)
 
         self.simple_var.train()
         
-        pbar = tqdm.tqdm(enumerate(train_dataloader), desc="Training", total=num_iters)
-        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
-            global_iters = i + num_iters * outer_iter + resume_iters
-
-            loss, acc = self.train_step(
-                i,
-                image,
-                image_embed_sam,
-                single_mask_normalized,
-                single_mask,
-            )
-            acc_mean = acc.mean().item()
-            acc_sos = acc[:, 0].mean().item()
-
-            # update loss and acc in progressive bar
-            pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
-
-            # log to tensorboard
-            self.logger.add_scalar('train/loss', loss, global_step=global_iters)
-            self.logger.add_scalar('train/acc_mean', acc_mean, global_step=global_iters)
-            self.logger.add_scalar('train/acc_sos', acc_sos, global_step=global_iters)
+        if self.rank == 0:
+            pbar = tqdm.tqdm(range(num_iters), desc="Training", total=num_iters)
         
-        global_iters = (outer_iter + 1)*num_iters + resume_iters
-        self.save_checkpoint(iters=global_iters)
+        iters_count = 0
+
+        while iters_count < num_iters:
+            if tdist.is_initialized():
+                self.sampler.set_epoch(outer_iter)
+            for i, (image, image_embed_sam, single_mask_normalized, single_mask) in enumerate(self.train_dataloader):
+                if iters_count >= num_iters:
+                    break
+                if self.rank == 0:
+                    pbar.update(1)
+
+                global_iters = iters_count + num_iters * outer_iter + resume_iters
+                iters_count += 1
+
+                loss, acc = self.train_step(
+                    i,
+                    image,
+                    image_embed_sam,
+                    single_mask_normalized,
+                    single_mask,
+                )
+
+                if global_iters % self.log_duration == 0:
+                    acc_mean = acc.mean()
+                    acc_sos = acc[:, 0].mean()
+                    if tdist.is_initialized():
+                        tdist.all_reduce(acc_mean, op=tdist.ReduceOp.AVG)
+                        tdist.all_reduce(acc_sos, op=tdist.ReduceOp.AVG)
+                        tdist.all_reduce(loss, op=tdist.ReduceOp.AVG)
+                    loss = loss.item()
+                    acc_mean = acc_mean.item()
+                    acc_sos = acc_sos.item()
+
+                    if self.rank == 0:
+                        # update loss and acc in progressive bar
+                        pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
+                        # log to tensorboard
+                        self.logger.add_scalar('train/loss', loss, global_step=global_iters)
+                        self.logger.add_scalar('train/acc_mean', acc_mean, global_step=global_iters)
+                        self.logger.add_scalar('train/acc_sos', acc_sos, global_step=global_iters)
+                
+        if self.rank == 0:
+            global_iters = (outer_iter + 1)*num_iters + resume_iters
+            self.save_checkpoint(iters=global_iters)
+        tdist.barrier()
+        self.eval(args.val_iters // world_size, global_step=global_iters)
     
     @torch.no_grad()
     def eval(self, num_iters: int, global_step: int = 0):
-        val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
-        
+        if num_iters <= 0 or num_iters > len(self.val_dataloader):
+            num_iters = len(self.val_dataloader)
         self.simple_var.eval()
 
-        losses = []
-        acc_means = []
-        acc_soss = []
+        total_loss = torch.tensor(0.0).to(self.device)
+        total_acc_mean = torch.tensor(0.0).to(self.device)
+        total_acc_sos = torch.tensor(0.0).to(self.device)
+        
+        if self.rank == 0:
+            pbar = tqdm.tqdm(range(num_iters), desc="Val: ", total=num_iters)
+        
+        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in enumerate(self.val_dataloader):
+            if self.rank == 0:
+                pbar.update(1)
 
-        pbar = tqdm.tqdm(enumerate(val_dataloader), desc="Val: ", total=num_iters)
-
-        for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
+            if i >= num_iters:
+                break
             image_embed_sam = image_embed_sam.to(self.device)
             single_mask_normalized = single_mask_normalized.to(self.device)
             
-            if num_iters > 0 and i >= num_iters:
-                break
             gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
             gt_idx_flat = torch.cat(gt_idx, dim=1)
 
             with torch.autocast(self.device, dtype=self.dtype):
-                logits = simple_var_train_pass(
+                logits = self.simple_var(
                     idx=gt_idx,
                     image_feat=image_embed_sam,
-                    simple_var=self.simple_var, 
                     vqvae=self.vqvae
                 )
                 
                 acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
-                acc_mean = acc.mean().item()
-                acc_sos = acc[:, 0].mean().item()
+
+                acc_mean = acc.mean()
+                acc_sos = acc[:, 0].mean()
                 
                 logits = rearrange(logits, 'b l c -> b c l')
                 loss = self.loss_function(logits, gt_idx_flat)
                 loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # will be automatically broadcasted to [B, L]
-                
-                loss_mean = loss.mean().item()
 
-            pbar.set_postfix({'loss': f'{loss_mean:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
+                loss_mean = loss.mean()
 
-            losses.append(loss_mean)
-            acc_means.append(acc_mean)
-            acc_soss.append(acc_sos)
+            if self.rank == 0:
+                pbar.set_postfix({'loss': f'{loss_mean:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
+
+            total_loss += loss_mean
+            total_acc_mean += acc_mean
+            total_acc_sos += acc_sos
         
-        mean_loss = float(sum(losses) / len(losses))
-        mean_acc_mean = float(sum(acc_means) / len(acc_means))
-        mean_acc_sos = float(sum(acc_soss) / len(acc_soss))
+        if tdist.is_initialized():
+            tdist.all_reduce(total_loss, op=tdist.ReduceOp.AVG)
+            tdist.all_reduce(total_acc_mean, op=tdist.ReduceOp.AVG)
+            tdist.all_reduce(total_acc_sos, op=tdist.ReduceOp.AVG)
 
-        self.logger.add_scalar('val/loss', mean_loss, global_step=global_step)
-        self.logger.add_scalar('val/acc_mean', mean_acc_mean, global_step=global_step)
-        self.logger.add_scalar('val/acc_sos', mean_acc_sos, global_step=global_step)
+        mean_loss = total_loss / num_iters
+        mean_acc_mean = total_acc_mean / num_iters
+        mean_acc_sos = total_acc_sos / num_iters
+
+        if self.rank == 0:
+            self.logger.add_scalar('val/loss', mean_loss.item(), global_step=global_step)
+            self.logger.add_scalar('val/acc_mean', mean_acc_mean.item(), global_step=global_step)
+            self.logger.add_scalar('val/acc_sos', mean_acc_sos.item(), global_step=global_step)
 
         return mean_loss, mean_acc_mean, mean_acc_sos
     
     def save_checkpoint(self, iters: int):
-        torch.save(self.optimizer.state_dict(), self.output_dir / f'.optimizer.{iters}.pt')
-        torch.save(self.simple_var.state_dict(), self.output_dir / f'.simple_var.{iters}.pt')
+        if tdist.is_initialized():
+            torch.save(self.optimizer.state_dict(), self.output_dir / f'.optimizer.{iters}.pt')
+            torch.save(self.simple_var.module.state_dict(), self.output_dir / f'.simple_var.{iters}.pt')
+        else:
+            torch.save(self.optimizer.state_dict(), self.output_dir / f'.optimizer.{iters}.pt')
+            torch.save(self.simple_var.state_dict(), self.output_dir / f'.simple_var.{iters}.pt')
 
+def setup_dist():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+
+        tdist.init_process_group("nccl", rank=rank, world_size=world_size, init_method="env://")
+        torch.cuda.set_device(local_rank)
+
+        return rank, local_rank, world_size
+    else:
+        return 0, 0, 1
+
+def cleanup():
+    tdist.destroy_process_group()
 
 if __name__ == "__main__":
-    # import torch.multiprocessing as mp
-    # mp.set_start_method('spawn', force=True)
+    rank, local_rank, world_size = setup_dist()
 
     import argparse
     from maskvar.maskseg_build_everything import (
@@ -269,9 +371,9 @@ if __name__ == "__main__":
     parser.add_argument('--outdir', type=str)
     # hyperparameters
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--outer_iters', type=int, default=1000)
-    parser.add_argument('--val_iters', type=int, default=100)
-    parser.add_argument('--inner_iters', type=int, default=1000)
+    parser.add_argument('--outer_iters', type=int, default=2)
+    parser.add_argument('--val_iters', type=int, default=0)
+    parser.add_argument('--inner_iters', type=int, default=0)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--accumulate_steps', type=int, default=1)
     # resume
@@ -279,6 +381,8 @@ if __name__ == "__main__":
     parser.add_argument('--resume_iters', type=int, default=0)
     # dataset
     parser.add_argument('--dataset', choices=['hqseg44k', 'cocolvis'], type=str, default='hqseg44k')
+    parser.add_argument('--dl_workers', type=int, default=4)
+    parser.add_argument('--prefetch_factor', type=int, default=2)
     # configs
     parser.add_argument('--simple_var', type=str, default='simple_var')
     parser.add_argument('--image_encoder', choices=['sam_vitb', 'mobile_sam'], type=str, default='mobile_sam')
@@ -293,8 +397,13 @@ if __name__ == "__main__":
     parser.add_argument('--dtype', choices=['float16', 'float32', 'bfloat16'], type=str, default='float32')
     args = parser.parse_args()
 
+    if tdist.is_initialized():
+        device = f"cuda:{local_rank}"
+    else:
+        device = args.device
+    dtype = getattr(torch, args.dtype)
+
     outdir = Path(args.outdir)
-    save_train_configuration(args, outdir)
 
     if args.resume_from is not None:
         checkpoint_path = Path(args.resume_from) / "checkpoints" / f".simple_var.{args.resume_iters}.pt"
@@ -303,12 +412,11 @@ if __name__ == "__main__":
         checkpoint_path = None
         opt_checkpoint = None
 
-    outdir.mkdir(parents=True, exist_ok=True)
-    (outdir / "checkpoints").mkdir(parents=True, exist_ok=True)
-    (outdir / "logs").mkdir(parents=True, exist_ok=True)
-
-    device = args.device
-    dtype = getattr(torch, args.dtype)
+    if rank == 0:
+        outdir.mkdir(parents=True, exist_ok=True)
+        save_train_configuration(args, outdir)
+        (outdir / "checkpoints").mkdir(parents=True, exist_ok=True)
+        (outdir / "logs").mkdir(parents=True, exist_ok=True)
 
     # sam_image_encoder = build_mobile_sam_image_encoder('ckpt/mobile_sam.pt')
     if args.image_feature_cache_dir:
@@ -318,47 +426,35 @@ if __name__ == "__main__":
         sam_image_encoder = None
     else:
         print("Not using image feature cache")
-        image_feature_cache_train = None
-        image_feature_cache_val = None
-        sam_image_encoder = builder_map['image_encoder'][args.image_encoder](args.image_encoder_checkpoint)
-        sam_image_encoder = sam_image_encoder.to(device)
-        sam_image_encoder = torch.compile(sam_image_encoder)
+        raise NotImplementedError
+        # image_feature_cache_train = None
+        # image_feature_cache_val = None
+        # sam_image_encoder = builder_map['image_encoder'][args.image_encoder](args.image_encoder_checkpoint)
+        # sam_image_encoder = sam_image_encoder.to(device)
+        # sam_image_encoder = torch.compile(sam_image_encoder)
 
     dataset_dir = 'data/sam-hq' if args.dataset == 'hqseg44k' else 'data/coco-lvis'
+    index_mapping_path = f'data/flat/{args.dataset}'
     # train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
     train_set, val_set = builder_map['dataset'][args.dataset](dataset_dir)
-    # train_set_masklevel = MaskLevelDatasetDummy(
-    #     dataset=train_set,
-    #     sam_encoder=sam_image_encoder,
-    #     with_image_embed=True,
-    #     device=args.device,
-    #     mask_filter_thresh=0.1,
-    #     seed=42,
-    #     count=5,
-    # )
-    val_set_masklevel = MaskLevelDatasetDummy(
+    val_set_masklevel = MaskLevelFlatDataset(
+        index_mapping_path=Path(index_mapping_path) / "val_index_mapping.npy",
         dataset=val_set,
-        sam_encoder=sam_image_encoder,
         with_image_embed=True,
-        device=args.device,
-        mask_filter_thresh=0.1,
-        seed=42,
-        count=16,
         image_feature_cache=image_feature_cache_val,
-    )
-    train_set_masklevel = MaskLevelDatasetRandom(
-        dataset=train_set,
-        sam_encoder=sam_image_encoder,
-        with_image_embed=True,
-        device=args.device,
         mask_filter_thresh=0.1,
-        seed=42,
-        infinite=True,
-        shuffle=True,
+        dtype=torch.float32,
+    )
+    train_set_masklevel = MaskLevelFlatDataset(
+        index_mapping_path=Path(index_mapping_path) / "train_index_mapping.npy",
+        dataset=train_set,
+        with_image_embed=True,
         image_feature_cache=image_feature_cache_train,
+        mask_filter_thresh=0.1,
+        dtype=torch.float32,
     )
 
-    if (args.use_sam_pe):
+    if args.use_sam_pe:
         prompt_encoder = builder_map['prompt_encoder'](args.prompt_encoder_checkpoint)
         sam_pe = prompt_encoder.get_dense_pe() # BCHW
         del prompt_encoder
@@ -368,11 +464,13 @@ if __name__ == "__main__":
     # simple_var = build_simple_var(simple_var_checkpoint_path=checkpoint_path, device=device)
     simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, sam_pe=sam_pe, device=device)
     # vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
-    vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False)
+    vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False).to(device)
 
     lr = args.lr
     batch_size = args.batch_size
     accumulate_steps = args.accumulate_steps
+
+    local_batch_size = batch_size // world_size
 
     trainer = SimpleARTrainer(
         simple_var=simple_var,
@@ -380,23 +478,31 @@ if __name__ == "__main__":
         lr=lr,
         train_set=train_set_masklevel,
         val_set=val_set_masklevel,
-        batch_size=batch_size,
+        batch_size=local_batch_size,
         accumulate_steps=accumulate_steps,
         device=device,
         log_dir=outdir / "logs",
         checkpoint_dir=outdir / "checkpoints",
         opt_checkpoint=opt_checkpoint,
         dtype=dtype,
+        dataloader_workers=args.dl_workers,
+        prefetch_factor=args.prefetch_factor
     )
 
     outer_iters = args.outer_iters
     inner_iters = args.inner_iters
     resume_iters = args.resume_iters
     for i in range(outer_iters):
-        print(f'=== outer iter {i} ===')
-        trainer.train(num_iters=inner_iters, outer_iter=i, resume_iters=resume_iters)
-        trainer.eval(args.val_iters, global_step=(i+1)*inner_iters+resume_iters)
-    print(f"Training finish at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Training complete. Checkpoints saved to {outdir / 'checkpoints'}")
-    print(f"Logs saved to {outdir / 'logs'}")
+        if rank == 0:
+            print(f'=== outer iter {i} ===')
+        trainer.train(num_iters=inner_iters // world_size, outer_iter=i, resume_iters=resume_iters, val_iters=args.val_iters // world_size)
     
+    if rank == 0:
+        print(f"Training finish at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Training complete. Checkpoints saved to {outdir / 'checkpoints'}")
+        print(f"Logs saved to {outdir / 'logs'}")
+    
+    del trainer
+    
+    if tdist.is_initialized():
+        cleanup()

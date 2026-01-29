@@ -52,7 +52,9 @@ class SimpleVAR(nn.Module):
             if sam_pe.shape[-1] != pn_last:
                 sam_pe = F.interpolate(sam_pe, size=(pn_last, pn_last), mode='bilinear', align_corners=False)
             sam_pe = rearrange(sam_pe, '1 c h w -> 1 h w c')
-            self.pos_embed = sam_pe.detach()
+            # self.pos_embed = sam_pe.detach()
+            print("use sam pe")
+            self.register_buffer('pos_embed', sam_pe.detach())
         else:
             # trainable pe
             self.pos_embed = nn.Parameter(torch.randn(1, pn_last, pn_last, dim))
@@ -156,7 +158,37 @@ class SimpleVAR(nn.Module):
 
         return feats
     
-    def forward(self, x: torch.Tensor, image_tokens: torch.Tensor, prompt_tokens=None, block_mask=None):
+    def forward(self, idx, image_feat: torch.Tensor, vqvae: VQVAE_Single, epsilon=0.001):
+        """
+        Training pass for SimpleVAR model.
+
+        1. Convert discrete codes to VQVAE input format
+        2. Preprocess input for SimpleVAR
+        3. Forward pass with block mask
+        
+        Args:
+            idx: List of (B, l) - Input discrete codes from VQVAE
+            image_feat: (B, C, H, W) - Image features from SAM
+            simple_var: SimpleVAR model instance
+            vqvae: VQVAE model instance
+
+        Returns: logits (B, l, vocab_size)
+        """
+        assert self.block_mask is not None, "Block mask must be initialized before training"
+        with torch.no_grad():
+            x = vqvae.quantize.idxBl_to_var_input(idx)
+            # add noise
+            if epsilon > 0:
+                # Add random noise to the input
+                noise = torch.randn_like(x) * epsilon
+                x = x + noise
+
+        x = self.preprocess(x)
+        image_tokens = self.preprocess_image_feat(image_feat)
+        logits = self.block_forward(x, image_tokens=image_tokens, block_mask=self.block_mask)
+        return logits
+
+    def block_forward(self, x: torch.Tensor, image_tokens: torch.Tensor, prompt_tokens=None, block_mask=None):
         """
         Applies the transformer blocks and outputs logits.
         When training, set block_mask to `self.block_mask`
@@ -245,7 +277,7 @@ def simple_var_train_pass(idx, image_feat: torch.Tensor, simple_var: SimpleVAR, 
 
     x = simple_var.preprocess(x)
     image_tokens = simple_var.preprocess_image_feat(image_feat)
-    logits = simple_var(x, image_tokens=image_tokens, block_mask=simple_var.block_mask)
+    logits = simple_var.block_forward(x, image_tokens=image_tokens, block_mask=simple_var.block_mask)
     return logits
 
 @torch.no_grad()
@@ -284,7 +316,7 @@ def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae:
         current_token = current_token + pos_embed + level_embed
 
         # Forward pass to get logits. No need for block masking during inference
-        logits = simple_var.forward(current_token, image_tokens=image_tokens, block_mask=None) # (B, pn*pn, vocab_size)
+        logits = simple_var.block_forward(current_token, image_tokens=image_tokens, block_mask=None) # (B, pn*pn, vocab_size)
         # Sample next token
         logits_flat = rearrange(logits, 'b l v -> (b l) v')
         next_tokens = simple_var.sample_with_top_k_(logits_flat, top_k=1)
