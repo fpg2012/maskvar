@@ -32,17 +32,16 @@ class MaskLevelDataset(IterableDataset):
     def __init__(
         self, 
         dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
-        sam_encoder: Optional[SamImageEncoder], 
         device: str, 
         with_image_embed=True,
         mask_filter_thresh=0.1,
         image_size_encoder=1024,
         image_size_mask=256,
         dtype=torch.float32,
+        sam_encoder=None,
         image_feature_cache: Optional[ImageFeatureCache] = None
     ):
         self.dataset = dataset
-        self.sam_encoder = sam_encoder
         self.device = device
         self.dtype=dtype
         self.with_image_embed = with_image_embed
@@ -52,7 +51,7 @@ class MaskLevelDataset(IterableDataset):
         self.image_size_mask = image_size_mask
         
         if self.with_image_embed:
-            assert (self.sam_encoder is not None) or (image_feature_cache is not None)
+            assert (image_feature_cache is not None)
 
         # 使用register_buffer避免每次都创建新tensor
         self.pixel_mean = torch.tensor([123.675, 116.28, 103.53], ) # copied from sam
@@ -163,7 +162,6 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
     def __init__(
         self, 
         dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
-        sam_encoder: Optional[SamImageEncoder], 
         device: str, 
         with_image_embed=True,
         mask_filter_thresh=0.1,
@@ -174,7 +172,7 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
         dtype=torch.float32,
         image_feature_cache: Optional[ImageFeatureCache] = None
     ):
-        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype, image_feature_cache)
+        super().__init__(dataset, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype, image_feature_cache)
         self.rng = np.random.default_rng(seed)
         self.seed = seed
         self.count = count
@@ -221,7 +219,6 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
     def __init__(
         self, 
         dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
-        sam_encoder: Optional[SamImageEncoder], 
         device: str, 
         with_image_embed=True,
         mask_filter_thresh=0.1,
@@ -234,7 +231,7 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
         dtype=torch.float32,
         image_feature_cache: Optional[ImageFeatureCache] = None
     ):
-        super().__init__(dataset, sam_encoder, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype, image_feature_cache)
+        super().__init__(dataset, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype, image_feature_cache)
         self.rng = np.random.default_rng(seed)
         self.num_masks = num_masks
         self.infinite = infinite

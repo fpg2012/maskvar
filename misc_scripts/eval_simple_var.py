@@ -27,11 +27,13 @@ from maskvar.datasets import (
     MaskLevelDatasetDummy,
     MaskLevelDatasetRandom,
 )
+from maskvar.datasets.image_feature_cache import ImageFeatureCache
 from maskvar.utils import restore_normalized_image
 from maskvar.utils.metrics import (
     calc_iou
 )
 
+torch.set_float32_matmul_precision('high')
 
 class SimpleVAREvaluator:
 
@@ -87,7 +89,7 @@ class SimpleVAREvaluator:
 
     @torch.no_grad()
     def eval_with_teacher_input(self, num_iters: int):
-        val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
+        val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=4, prefetch_factor=2, pin_memory=True, persistent_workers=True)
 
         losses = []
         acc_means = []
@@ -96,6 +98,10 @@ class SimpleVAREvaluator:
         pbar = tqdm.tqdm(enumerate(val_dataloader), desc="Val: ", total=num_iters)
 
         for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
+            image_embed_sam = image_embed_sam.to(self.device)
+            single_mask_normalized = single_mask_normalized.to(self.device)
+            single_mask = single_mask.to(self.device)
+
             if num_iters > 0 and i >= num_iters:
                 break
             gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
@@ -144,6 +150,11 @@ class SimpleVAREvaluator:
         for i, (image, image_embed_sam, single_mask_normalized, single_mask) in pbar:
             if num_iters > 0 and i >= num_iters:
                 break
+
+            image_embed_sam = image_embed_sam.to(self.device)
+            single_mask_normalized = single_mask_normalized.to(self.device)
+            single_mask = single_mask.to(device)
+
             gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
             gt_idx_flat = torch.cat(gt_idx, dim=1)
 
@@ -237,7 +248,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--visualize', action='store_true')
     # dataset
-    parser.add_argument('--dataset', type=str, default='hqseg44k')
+    parser.add_argument('--dataset', choices=['hqseg44k', 'cocolvis'], type=str, default='hqseg44k')
+    parser.add_argument('--dataset_split', type=str, default='val')
     # simple var
     parser.add_argument('-c', '--simple_var', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
@@ -247,6 +259,8 @@ if __name__ == "__main__":
     # vqvae
     parser.add_argument('--vqvae', type=str, default='vqvae_single_5_stages_v1')
     parser.add_argument('--vqvae_checkpoint', type=str, default='out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth')
+    # image cache dir
+    parser.add_argument('--image_feature_cache_dir', type=str, default=None)
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -259,17 +273,25 @@ if __name__ == "__main__":
     print(f"Using checkpoint: {checkpoint_path}")
     assert Path(checkpoint_path).exists(), f"Checkpoint not found: {checkpoint_path}"
 
-    sam_image_encoder = builder_map['image_encoder'][args.image_encoder](args.image_encoder_checkpoint)
-    sam_image_encoder = sam_image_encoder.to(device)
-    sam_image_encoder = torch.compile(sam_image_encoder)
+    # sam_image_encoder = builder_map['image_encoder'][args.image_encoder](args.image_encoder_checkpoint)
+    # sam_image_encoder = sam_image_encoder.to(device)
+    # sam_image_encoder = torch.compile(sam_image_encoder)
+    if args.image_feature_cache_dir is None:
+        raise ValueError("image_feature_cache_dir is required now!")
+    image_feature_cache = ImageFeatureCache(
+        cache_dir=Path(args.image_feature_cache_dir),
+        dataset=f"{args.dataset}_{args.dataset_split}",
+        model_name=args.image_encoder,
+        device=device,
+    )
 
     train_set, val_set = builder_map['dataset'][args.dataset]('data/sam-hq') # validate on train set
     val_set_masklevel = MaskLevelDataset(
-        dataset=val_set,
-        sam_encoder=sam_image_encoder,
+        dataset=val_set if args.dataset_split != 'train' else train_set,
         with_image_embed=True,
         device=args.device,
         mask_filter_thresh=0.1,
+        image_feature_cache=image_feature_cache,
     )
     simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, device=device)
     vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False)
