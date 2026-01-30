@@ -433,7 +433,7 @@ if __name__ == "__main__":
         # sam_image_encoder = sam_image_encoder.to(device)
         # sam_image_encoder = torch.compile(sam_image_encoder)
 
-    dataset_dir = 'data/sam-hq' if args.dataset == 'hqseg44k' else 'data/coco-lvis'
+    dataset_dir = 'data/sam-hq' if args.dataset == 'hqseg44k' else 'data/coco_lvis'
     index_mapping_path = f'data/flat/{args.dataset}'
     # train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
     train_set, val_set = builder_map['dataset'][args.dataset](dataset_dir)

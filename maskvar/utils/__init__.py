@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+import numpy as np
 
 def resize_longest_side(image, target_length, mode='bilinear'):
     scale = target_length * 1.0 / max(image.shape[-2], image.shape[-1])
@@ -51,6 +52,24 @@ def preprocess_image(image: torch.Tensor, image_size_encoder, device, dtype):
         padw = image_size_encoder - w
         image = F.pad(image, (0, padw, 0, padh), value=0)
     return image
+
+def preprocess_mask(mask: torch.Tensor, image_size_mask):
+    """
+    mask: (1, H, W) torch.Tensor
+    """
+    mask = resize_longest_side(mask.unsqueeze(0), image_size_mask, 'nearest').squeeze(0)
+    # mask = mask.long()
+
+    # pad mask to image_size_mask (default 256)
+    h, w = mask.shape[-2:]
+    padh = image_size_mask - h
+    padw = image_size_mask - w
+    mask = F.pad(mask, (0, padw, 0, padh), value=0)
+
+    # normalize mask
+    mask_normalized = mask * 2 - 1
+
+    return mask_normalized.detach(), mask.detach()
 
 def restore_normalized_image(image: torch.Tensor):
     """

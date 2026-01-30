@@ -295,13 +295,15 @@ class MaskLevelFlatDataset(Dataset):
         dtype=torch.float32,
         image_size_encoder=1024,
         image_size_mask=256,
-        image_feature_cache: Optional[ImageFeatureCache] = None
+        image_feature_cache: Optional[ImageFeatureCache] = None,
+        skip_preprocess=False,
     ):
         self.index_mapping_path = index_mapping_path
         self.dataset = dataset
         self.dtype=dtype
         self.with_image_embed = with_image_embed
         self.mask_filter_thresh = mask_filter_thresh
+        self.skip_preprocess=skip_preprocess
         
         if self.with_image_embed:
             assert (image_feature_cache is not None)
@@ -327,7 +329,16 @@ class MaskLevelFlatDataset(Dataset):
         mask_index = self.index_mapping[index][1]
 
         image, mask, instance_info = self.dataset[image_index]
-        image, image_embed_sam = self.preprocess_image(image, index=image_index)
+        if self.skip_preprocess:
+            image = torch.from_numpy(image.astype(np.float32))
+        else:
+            image = self.preprocess_image(image, index=image_index)
+        
+        if self.with_image_embed:
+            image_embed_sam = torch.from_numpy(self.image_feature_cache[image_index])
+        else:
+            image_embed_sam = None
+
         single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, mask_index)
         return image, image_embed_sam, single_mask_normalized, single_mask
 
@@ -339,7 +350,7 @@ class MaskLevelFlatDataset(Dataset):
         image: (H, W, 3)
         """
         # !MUST NOT DIVIDE 255 HERE
-        image = torch.from_numpy(image).to(dtype=self.dtype, non_blocking=True)
+        image = torch.from_numpy(image.astype(np.float32))
         image = image.permute(2, 0, 1) # (H, W, 3) -> (3, H, W)
         image = resize_longest_side(image.unsqueeze(0), self.image_size_encoder).squeeze(0)
 
@@ -355,18 +366,14 @@ class MaskLevelFlatDataset(Dataset):
         # print(f'image shape: {image.shape}')
 
         # image_embed = self.image_encoder(image.unsqueeze(0)).squeeze(0)
-        if self.with_image_embed:
-            image_embed_sam = self.image_feature_cache[index].detach()
-        else:
-            image_embed_sam = None
-        return image.detach(), image_embed_sam
+        return image.detach()
 
     @torch.no_grad()
     def preprocess_mask(self, gt_mask, instance_info, instance_idx):
         mask = gt_mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
 
         # to tensor
-        mask = torch.from_numpy(mask).to(dtype=self.dtype, non_blocking=True).unsqueeze(0)
+        mask = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)
 
         mask = resize_longest_side(mask.unsqueeze(0), self.image_size_mask, 'nearest').squeeze(0)
         # mask = mask.long()

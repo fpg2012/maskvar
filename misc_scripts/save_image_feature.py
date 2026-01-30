@@ -4,6 +4,7 @@ from itertools import islice
 from pathlib import Path
 import time
 import json
+import numpy as np
 
 import torch
 from torch import nn
@@ -43,7 +44,7 @@ def cache_image_features(save_dir, dataset, image_encoder, image_size_encoder, d
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=True, collate_fn=collate_fn)
     for index, batch in enumerate(tqdm(dataloader, desc="Caching image features")):
         feature = image_encoder(batch).to(dtype=dtype)
-        torch.save(feature, save_dir / f"batch_{index:06d}.pt")
+        np.save(save_dir / f"batch_{index:06d}.npy", feature.cpu().numpy())
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

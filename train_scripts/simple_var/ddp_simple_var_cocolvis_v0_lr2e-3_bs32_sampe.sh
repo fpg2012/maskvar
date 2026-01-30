@@ -1,7 +1,8 @@
 #!/bin/bash
 N_NODE=${1:-4}
-OUTDIR=${2:-out/ddp_train_test_bs32}
+OUTDIR=${2:-out/ddp_simple_var_cocolvis_v0_lr2e-3_bs32_sampe}
 export MASTER_PORT=${3:-29500}
+export OMP_NUM_THREADS=4
 
 torchrun --nproc_per_node=$N_NODE train_scripts/train_simple_var.py \
     --outdir $OUTDIR \
@@ -16,6 +17,6 @@ torchrun --nproc_per_node=$N_NODE train_scripts/train_simple_var.py \
     --image_feature_cache_dir data/cache \
     --image_encoder sam_vitb \
     --dtype bfloat16 \
-    --dataset hqseg44k \
-    --dl_workers 8 \
-    --prefetch_factor 4
+    --dataset cocolvis \
+    --dl_workers 2 \
+    --prefetch_factor 256
