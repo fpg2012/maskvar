@@ -18,5 +18,5 @@ torchrun --nproc_per_node=$N_NODE train_scripts/train_simple_var.py \
     --image_encoder sam_vitb \
     --dtype bfloat16 \
     --dataset cocolvis \
-    --dl_workers 2 \
-    --prefetch_factor 256
+    --dl_workers 16 \
+    --prefetch_factor 2

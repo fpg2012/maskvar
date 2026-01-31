@@ -253,6 +253,7 @@ if __name__ == "__main__":
     # simple var
     parser.add_argument('-c', '--simple_var', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--use_sam_pe', action='store_true')
     # image encoder
     parser.add_argument('--image_encoder', type=str, default='mobile_sam')
     parser.add_argument('--image_encoder_checkpoint', type=str, default='ckpt/mobile_sam.pt')
@@ -293,7 +294,15 @@ if __name__ == "__main__":
         mask_filter_thresh=0.1,
         image_feature_cache=image_feature_cache,
     )
-    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, device=device)
+
+    if args.use_sam_pe:
+        prompt_encoder = builder_map['prompt_encoder'](args.image_encoder_checkpoint).to(args.device)
+        sam_pe = prompt_encoder.get_dense_pe().cpu() # BCHW
+        del prompt_encoder
+    else:
+        sam_pe = None
+
+    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, sam_pe=sam_pe, device=device)
     vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False)
 
     trainer = SimpleVAREvaluator(

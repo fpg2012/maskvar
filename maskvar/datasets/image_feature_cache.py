@@ -1,13 +1,20 @@
 from pathlib import Path
 import json
+from collections import OrderedDict
 
 import torch
 import numpy as np
 from torch.utils.data import Dataset
 
+class ShardCacheLine:
+
+    def __init__(self, shard_index: int, shard: np.ndarray):
+        self.shard_index = shard_index
+        self.shard = shard
+
 class ImageFeatureCache(Dataset):
 
-    def __init__(self, cache_dir: Path, dataset: str, model_name: str, device='cpu', original_batch_mode=False):
+    def __init__(self, cache_dir: Path, dataset: str, model_name: str, device='cpu', original_batch_mode=False, max_cache_shard=1):
         self.cache_dir = cache_dir
         self.dataset = dataset
         self.model_name = model_name
@@ -27,16 +34,28 @@ class ImageFeatureCache(Dataset):
             self.metadata = json.load(f)
 
         self.internal_batch_size = self.metadata.get("batch_size", 1)
-        self.internal_dtype = getattr(torch, self.metadata.get("dtype", "float32"))
+        self.internal_dtype = getattr(torch, self.metadata.get("dtype", "float32").split('.')[1])
 
         self.original_batch_mode = original_batch_mode
 
         print("ImageFeatureCache loaded with metadata:\n", json.dumps(self.metadata, ensure_ascii=False, indent=2))
 
+        self.current_shard = OrderedDict()
+        self.max_cache_shard = max_cache_shard
+
     def __len__(self):
         if self.original_batch_mode:
             return self.metadata["count"]
         return self.metadata["count"] * self.internal_batch_size
+
+    def _get_shard(self, shard_index: int) -> np.ndarray:
+        if shard_index not in self.current_shard.keys():
+            if len(self.current_shard) >= self.max_cache_shard:
+                self.current_shard.popitem(last=False)
+            self.current_shard[shard_index] = np.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{shard_index:06d}.npy', mmap_mode='r')
+            # update access count
+        self.current_shard.move_to_end(shard_index)
+        return self.current_shard[shard_index]
 
     def __getitem__(self, index) -> np.ndarray:
         """
@@ -46,7 +65,8 @@ class ImageFeatureCache(Dataset):
         if self.original_batch_mode:
             image_feature = np.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{index:06d}.npy', mmap_mode='r')
             return image_feature
+
         batch_index = index // self.internal_batch_size
         item_index_in_batch = index % self.internal_batch_size
-        image_feature = np.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{batch_index:06d}.npy', mmap_mode='r')
+        image_feature = self._get_shard(batch_index)
         return image_feature[item_index_in_batch]

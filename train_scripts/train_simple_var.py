@@ -29,6 +29,7 @@ from maskvar.datasets import (
 )
 from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset
 from maskvar.datasets.image_feature_cache import ImageFeatureCache
+from maskvar.datasets.sharded_distributed_sampler import ShardedDistributedSampler
 
 
 torch.set_float32_matmul_precision('high')
@@ -177,7 +178,9 @@ class SimpleARTrainer:
     def ddp_wrap(self):
         if self.world_size > 1:
             self.simple_var = DDP(self.simple_var, device_ids=[self.rank])
-            self.sampler = DistributedSampler(self.train_set)
+            # self.sampler = DistributedSampler(self.train_set)
+            # self.val_sampler = DistributedSampler(self.val_set)
+            self.sampler = ShardedDistributedSampler(self.train_set, rank=self.rank, world_size=self.world_size, shard_size=1024)
             self.val_sampler = DistributedSampler(self.val_set)
 
     def train_step(self, inner_iter_count, image, image_embed_sam, single_mask_normalized, single_mask):
