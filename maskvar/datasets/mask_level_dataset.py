@@ -113,7 +113,7 @@ class MaskLevelDataset(IterableDataset):
             # 使用clone()创建新tensor，避免保留对encoder输出的引用
             if self.image_feature_cache is not None:
                 assert index is not None
-                image_embed_sam = self.image_feature_cache[index].detach()
+                image_embed_sam = torch.from_numpy(self.image_feature_cache[index])
             else:
                 raise NotImplementedError("sam embedding in dataset is now disabled! Please use image feature cache instead.")
                 # with torch.autocast(self.device, dtype=self.dtype):
