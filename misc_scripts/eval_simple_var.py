@@ -2,6 +2,7 @@ from itertools import islice
 from pathlib import Path
 from datetime import datetime
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import torchvision
@@ -13,6 +14,7 @@ import tqdm
 from einops import rearrange, repeat
 import matplotlib.pyplot as plt
 
+from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset
 from maskvar.maskseg_build_everything import (
     builder_map,
 )
@@ -46,6 +48,7 @@ class SimpleVAREvaluator:
         out_dir: Path,
         device: str,
         loss_weight_per_level=[1, 1, 1, 1, 1],
+        dataset_name: str = "dataset",
     ):
         # models
         self.simple_var: SimpleVAR = simple_var
@@ -75,6 +78,7 @@ class SimpleVAREvaluator:
 
         # out_dir
         self.out_dir = out_dir
+        self.dataset_name = dataset_name
 
         self.compile_model()
     
@@ -89,7 +93,16 @@ class SimpleVAREvaluator:
 
     @torch.no_grad()
     def eval_with_teacher_input(self, num_iters: int):
-        val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True, num_workers=4, prefetch_factor=2, pin_memory=True, persistent_workers=True)
+        val_dataloader = DataLoader(
+            self.val_set,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=4,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True
+        )
 
         losses = []
         acc_means = []
@@ -138,7 +151,14 @@ class SimpleVAREvaluator:
 
     @torch.no_grad()
     def eval_ar(self, num_iters: int, visualize: bool = False):
-        val_dataloader = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, drop_last=True)
+        # executor = ThreadPoolExecutor(max_workers=self.batch_size * 2)
+
+        val_dataloader = DataLoader(
+            self.val_set,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=True,
+        )
         
         acc_means = []
         acc_soss = []
@@ -194,29 +214,13 @@ class SimpleVAREvaluator:
             ious.append(iou_batch.mean().item())
             
             if visualize:
-                for j in range(self.batch_size):
-                    cur_iou = iou_batch[j].item()
-
-                    fig, ax = plt.subplots(1, 4, figsize=(15,4))
-                    ax[0].imshow(restore_normalized_image(image[j]).permute(1, 2, 0).cpu().numpy())
-                    ax[0].axis('off')
-                    ax[0].set_title(f'Image {i*self.batch_size + j}, IOU: {cur_iou:.3f}')
-
-                    result_gt = [m[j].unsqueeze(0) for m in decoded_masks_gt]
-                    result_mask_pred = [m[j].unsqueeze(0) for m in decoded_masks]
-                    result_mask_teacher = [m[j].unsqueeze(0) for m in decoded_masks_pred_with_teacher]
-
-                    self.visualize(result_gt, ax[1], 'gt')
-                    self.visualize(result_mask_pred, ax[2], 'pred')
-                    self.visualize(result_mask_teacher, ax[3], 'pred w/ teacher input')
-
-                    plt.savefig(self.out_dir / "eval" / "vis" / f'val_step_{i*self.batch_size + j}_iou{cur_iou:.3f}.png')
-                    plt.close()
+                # executor.submit(self.visualize_batch, i, image, iou_batch, decoded_masks, decoded_masks_gt, decoded_masks_pred_with_teacher)
+                self.visualize_batch(i, image, iou_batch, decoded_masks, decoded_masks_gt, decoded_masks_pred_with_teacher)
         
         print(f"Average IOU: {sum(ious)/len(ious):.4f}")
         print(f"Average accuracy (no teacher): {sum(acc_means)/len(acc_means):.4f}")
         print(f"Average accuracy (with teacher): {sum(acc_means_teacher)/len(acc_means_teacher):.4f}")
-        with open(self.out_dir / "eval" / f"eval_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
+        with open(self.out_dir / "eval" / self.dataset_name / f"eval_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
             result_data = {
                 "average_iou": sum(ious)/len(ious),
                 "average_accuracy_no_teacher": sum(acc_means)/len(acc_means),
@@ -224,10 +228,31 @@ class SimpleVAREvaluator:
                 "total_samples": len(ious)
             }
             json.dump(result_data, f, indent=2, ensure_ascii=False)
+        # executor.shutdown(wait=True)
 
     def vqvae_decode(self, indices):
         result = self.vqvae.idxBl_to_img(indices, same_shape=True)
         return result
+
+    def visualize_batch(self, step, image, iou_batch, decoded_masks, decoded_masks_gt, decoded_masks_pred_with_teacher):
+        for j in range(self.batch_size):
+            cur_iou = iou_batch[j].item()
+
+            fig, ax = plt.subplots(1, 4, figsize=(15,4))
+            ax[0].imshow(restore_normalized_image(image[j]).permute(1, 2, 0).cpu().numpy())
+            ax[0].axis('off')
+            ax[0].set_title(f'Image {i*self.batch_size + j}, IOU: {cur_iou:.3f}')
+
+            result_gt = [m[j].unsqueeze(0) for m in decoded_masks_gt]
+            result_mask_pred = [m[j].unsqueeze(0) for m in decoded_masks]
+            result_mask_teacher = [m[j].unsqueeze(0) for m in decoded_masks_pred_with_teacher]
+
+            self.visualize(result_gt, ax[1], 'gt')
+            self.visualize(result_mask_pred, ax[2], 'pred')
+            self.visualize(result_mask_teacher, ax[3], 'pred w/ teacher input')
+
+            plt.savefig(self.out_dir / "eval" / self.dataset_name / "vis" / f'val_step_{step*self.batch_size + j}_iou{cur_iou:.3f}.png')
+            plt.close()
 
     def visualize(self, result, ax, name='mask'):
         result = [mask for mask in result]
@@ -266,7 +291,7 @@ if __name__ == "__main__":
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    (outdir / "eval" / "vis").mkdir(parents=True, exist_ok=True)
+    (outdir / "eval" / f"{args.dataset}_{args.dataset_split}" / "vis").mkdir(parents=True, exist_ok=True)
 
     device = args.device
 
@@ -287,13 +312,23 @@ if __name__ == "__main__":
     )
 
     train_set, val_set = builder_map['dataset'][args.dataset]('data/sam-hq') # validate on train set
-    val_set_masklevel = MaskLevelDataset(
+
+    val_set_masklevel = MaskLevelFlatDataset(
+        index_mapping_path=f'data/flat/{args.dataset}/{args.dataset_split}_index_mapping.npy',
         dataset=val_set if args.dataset_split != 'train' else train_set,
         with_image_embed=True,
-        device=args.device,
-        mask_filter_thresh=0.1,
         image_feature_cache=image_feature_cache,
+        mask_filter_thresh=0.1,
+        dtype=torch.float32,
     )
+
+    # val_set_masklevel = MaskLevelDataset(
+    #     dataset=val_set if args.dataset_split != 'train' else train_set,
+    #     with_image_embed=True,
+    #     device=args.device,
+    #     mask_filter_thresh=0.1,
+    #     image_feature_cache=image_feature_cache,
+    # )
 
     if args.use_sam_pe:
         prompt_encoder = builder_map['prompt_encoder'](args.image_encoder_checkpoint).to(args.device)
@@ -312,10 +347,11 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         device=device,
         out_dir=outdir,
+        dataset_name=f'{args.dataset}_{args.dataset_split}'
     )
 
     trainer.eval_ar(args.val_iters, visualize=args.visualize)
     print(f"Evaluation complete")
     if args.visualize:
-        print(f"Visualization saved to {outdir / 'eval' / 'vis'}")
+        print(f"Visualization saved to {outdir / 'eval' / f'{args.dataset}_{args.dataset_split}' / 'vis'}")
     
