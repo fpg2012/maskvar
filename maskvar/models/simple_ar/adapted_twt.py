@@ -84,7 +84,7 @@ class AdaptedTwoWayTransformer(nn.Module):
         point_embedding: Tensor,
         mask_tokens: Tensor,
         mask_tokens_pe: Tensor,
-        block_mask=None
+        self_attn_block_mask=None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass of the AdaptedTwoWayTransformer.
@@ -93,9 +93,9 @@ class AdaptedTwoWayTransformer(nn.Module):
           image_embedding: (B, C, H, W) Image features to attend to
           image_pe: (B, C, H, W) Positional encoding for image features
           point_embedding: (B, Lqs, C) Query tokens (IOU, mask, SOS, prompt tokens)
-          mask_tokens: (B, Lqm, C) Mask tokens for autoregressive prediction
+          mask_tokens: (B, Lqm, C) Mask tokens for autoregressive prediction (including mask token)
           mask_tokens_pe: (B, Lqm, C) Positional encoding for mask tokens
-          block_mask: Optional attention mask for controlling token visibility
+          self_attn_block_mask: Optional attention mask for controlling token visibility
                      (e.g., for enforcing Markovian property during training)
 
         Returns:
@@ -120,19 +120,18 @@ class AdaptedTwoWayTransformer(nn.Module):
         # Apply transformer blocks and final layernorm
         for layer in self.layers:
             queries, keys, mask_tokens = layer(
-                queries=queries,
-                keys=keys,
-                query_mask_pe=query_mask_pe,
-                key_pe=image_pe,
-                ar_queries=mask_tokens,
-                block_mask=block_mask,
+                queries=queries, ar_queries=mask_tokens, keys=keys,
+                query_pe = point_embedding, mask_pe=mask_tokens_pe, key_pe=image_pe,
+                self_attn_block_mask=self_attn_block_mask,
             )
 
         # Apply the final attention layer from the points to the image
         full_queries = torch.cat([queries, mask_tokens], dim=1)
         full_queries_w_pe = full_queries + query_mask_pe
         k = keys + image_pe
-        attn_out = self.final_attn_token_to_image(q=full_queries_w_pe, k=k, v=keys)
+        attn_out = self.final_attn_token_to_image(
+            q=full_queries_w_pe, k=k, v=keys
+        )
         full_queries = full_queries + attn_out
         full_queries = self.norm_final_attn(full_queries)
 
@@ -197,13 +196,9 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
     def forward(
         self,
-        queries: Tensor,
-        keys: Tensor,
-        query_mask_pe: Tensor,
-        key_pe: Tensor,
-        ar_queries: Tensor,
-        block_mask=None,
-        block_mask2=None,
+        queries: Tensor, ar_queries: Tensor, keys: Tensor,
+        query_pe: Tensor, mask_pe: Tensor, key_pe: Tensor,
+        self_attn_block_mask=None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass of the AdaptedTwoWayAttentionBlock.
@@ -214,8 +209,8 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
             query_mask_pe: (B, Lqs+Lqm, C) Positional encoding for queries + mask tokens
             key_pe: (B, Lk, C) Positional encoding for image tokens
             ar_queries: (B, Lqm, C) Mask tokens for autoregressive prediction
-            block_mask: Optional mask for self-attention (queries ↔ queries)
-            block_mask2: Optional mask for cross-attention (queries → keys)
+            self_attn_block_mask: Optional mask for self-attention (queries ↔ queries)
+            mask_to_image_cross_attn_block_mask: Optional mask for cross-attention (queries → keys)
 
         Returns:
             qs: (B, Lqs, C) Updated query tokens
@@ -227,21 +222,42 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
         _, Lk, _ = keys.shape
 
         # Self attention block
-        # NOTE: MARKOVIAN mask or CAUSAL mask should be applied here
-        full_queries = torch.cat([queries, ar_queries], dim=1)
+        ## self-attn among queries (iou token, output tokens, prompt tokens)
         if self.skip_first_layer_pe:
-            full_queries = self.self_attn(q=full_queries, k=full_queries, v=full_queries, block_mask=block_mask)
+            queries = self.self_attn(
+                q=queries, k=queries, v=queries,
+                block_mask=None
+            )
         else:
-            q = full_queries + query_mask_pe
-            attn_out = self.self_attn(q=q, k=q, v=full_queries, block_mask=block_mask)
-            full_queries = full_queries + attn_out
-        full_queries = self.norm1(full_queries)
+            q = queries + query_pe
+            attn_out = self.self_attn(
+                q=q, k=q, v=queries,
+                block_mask=None
+            )
+            queries = queries + attn_out
+        queries = self.norm1(queries)
+
+        ## self-attn among mask tokens
+        ## require markovian or causal mask
+        qm_0 = ar_queries + mask_pe
+        attn_out_qm0 = self.self_attn(
+            q=qm_0, k=qm_0, v=ar_queries,
+            block_mask=self_attn_block_mask
+        )
+        ar_queries = ar_queries + attn_out_qm0
+        ar_queries = self.norm1(ar_queries)
+
+        full_queries = torch.cat([queries, ar_queries], dim=1)
+        query_mask_pe = torch.cat([query_pe, mask_pe], dim=1)
 
         # Cross attention block, tokens attending to image embedding
         # no need for block mask in principle
         q = full_queries + query_mask_pe
         k = keys + key_pe
-        attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys, block_mask=block_mask2)
+        attn_out = self.cross_attn_token_to_image(
+            q=q, k=k, v=keys,
+            block_mask=None
+        )
         full_queries = full_queries + attn_out
         full_queries = self.norm2(full_queries)
 
@@ -251,11 +267,13 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
         full_queries = self.norm3(full_queries)
 
         # Cross attention block, image embedding attending to tokens
-        # only qs is involved
+        # only qs is involved, which means that image tokens cannot see mask tokens
         qs, qm = full_queries[:, :Lqs], full_queries[:, Lqs:]
-        qs_w_pe = qs + query_mask_pe[:, :Lqs]
+        qs_w_pe = qs + query_pe
         k = keys + key_pe
-        attn_out = self.cross_attn_image_to_token(q=k, k=qs_w_pe, v=qs)
+        attn_out = self.cross_attn_image_to_token(
+            q=k, k=qs_w_pe, v=qs
+        )
         keys = keys + attn_out
         keys = self.norm4(keys)
 
