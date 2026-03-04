@@ -7,6 +7,8 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from einops import rearrange, repeat
+from torch.nn.attention.flex_attention import create_block_mask
 
 from typing import List, Tuple, Type
 
@@ -15,16 +17,47 @@ from .adapted_mask_decoder import AdaptedMaskDecoder
 
 
 class SimpleVARSamDecoder(nn.Module):
+    """
+    SimpleVAR decoder that reuses SAM's MaskDecoder architecture for autoregressive
+    mask token prediction.
+
+    This module adapts SAM's TwoWayTransformer to predict VQ-VAE mask tokens
+    in an autoregressive manner. It supports multi-scale patch prediction and
+    integrates with SAM's image encoder features.
+
+    Key components:
+    1. AdaptedMaskDecoder: Modified SAM MaskDecoder that handles mask tokens
+    2. Position and level embeddings: For multi-scale patch encoding
+    3. Linear projection: Maps VQ-VAE token dimensions to model dimensions
+    4. Classification head: Predicts next token from vocabulary
+
+    The model supports both training (with teacher forcing) and inference
+    (autoregressive sampling) modes.
+    """
     def __init__(self,
                  adapted_mask_decoder: AdaptedMaskDecoder,
                  dim=256,
                  depth=2,
-                 vocab_size=4096, 
-                 device='cpu', 
-                 patch_num=[1, 4, 8, 16, 32], 
+                 vocab_size=4096,
+                 device='cpu',
+                 patch_num=[1, 4, 8, 16, 32],
                  num_heads=4,
                  vqvae_dim=256,
                  ):
+        """
+        Initialize the SimpleVARSamDecoder.
+
+        Args:
+            adapted_mask_decoder: Pre-configured AdaptedMaskDecoder instance
+            dim: Model dimension (default: 256)
+            depth: Number of transformer layers (unused, kept for compatibility)
+            vocab_size: Size of VQ-VAE vocabulary (default: 4096)
+            device: Device to run on (default: 'cpu')
+            patch_num: List of patch sizes for multi-scale prediction
+                       Each element represents the grid size at that scale
+            num_heads: Number of attention heads (unused, kept for compatibility)
+            vqvae_dim: Dimension of VQ-VAE tokens (default: 256)
+        """
         super().__init__()
         self.patch_num = patch_num
         self.adapted_mask_decoder = adapted_mask_decoder
@@ -55,44 +88,90 @@ class SimpleVARSamDecoder(nn.Module):
         # self.norm = nn.LayerNorm(self.dim)
 
     def calc_embed_to_add(self):
-        # pos emb
+        """
+        Calculate positional and level embeddings for all patch scales.
+
+        This method computes:
+        1. Positional embeddings: Interpolated from the base positional embedding
+           to match each patch scale
+        2. Level embeddings: Learned embeddings for each patch scale (coarse to fine)
+
+        Returns:
+            pos_embed_to_add: (1, total_patches, dim) positional embeddings
+            level_embed_to_add: (1, total_patches, dim) level embeddings
+        """
+        # Positional embeddings: interpolate base positional embedding to each scale
         pos_embed_to_add = []
 
+        # Reshape positional embedding from (1, H, W, C) to (1, C, H, W) for interpolation
         pos_embed_1chw = rearrange(self.pos_embed, '1 h w c -> 1 c h w')
         for i, pn in enumerate(self.patch_num):
             if pn == self.patch_num[-1]:
+                # For the finest scale, use the original embedding
                 pos_embed_interpolated = pos_embed_1chw
             else:
-                pos_embed_interpolated = F.interpolate(pos_embed_1chw, size=(pn, pn), mode='bilinear', align_corners=False)
+                # For coarser scales, interpolate to the target size
+                pos_embed_interpolated = F.interpolate(
+                    pos_embed_1chw, size=(pn, pn), mode='bilinear', align_corners=False
+                )
+            # Reshape to (1, patches, dim)
             pos_embed_interpolated = rearrange(pos_embed_interpolated, '1 c h w -> 1 (h w) c')
-            # print(f"pn={pn}, interpolated shape: {pos_embed_interpolated.shape}")
             pos_embed_to_add.append(pos_embed_interpolated)
         pos_embed_to_add = torch.cat(pos_embed_to_add, dim=1)
 
-        # level embed
+        # Level embeddings: learned embeddings for each scale
         level_embed_to_add = []
         for i in range(len(self.patch_num)):
+            # Repeat level embedding for each patch at this scale
             level_embed = repeat(self.level_embedding.weight[i], 'c -> l c', l=self.patch_num[i]**2)
             level_embed_to_add.append(level_embed)
-        level_embed_to_add = torch.cat(level_embed_to_add, dim=0) # L c
-        level_embed_to_add = repeat(level_embed_to_add, 'l c -> b l c', b=1) # 1 L c
+        level_embed_to_add = torch.cat(level_embed_to_add, dim=0)  # (total_patches, dim)
+        level_embed_to_add = repeat(level_embed_to_add, 'l c -> b l c', b=1)  # (1, total_patches, dim)
 
         return pos_embed_to_add, level_embed_to_add
 
     def init_block_mask(self):
-        # block mask
+        """
+        Initialize the block mask for controlling attention between tokens.
+
+        The mask ensures that tokens can only attend to other tokens at the same
+        scale (level). This creates a block-diagonal attention pattern where
+        each scale's tokens are independent during self-attention.
+
+        This is used during training to enforce the Markovian property:
+        tokens at finer scales can only attend to tokens at the same or coarser scales.
+        """
         def mask_mod(b, h, q_idx, k_idx):
+            """Mask function: returns True if query and key tokens are at the same scale."""
             return self.level_map_tensor[q_idx] == self.level_map_tensor[k_idx]
-        
-        self.block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=self.max_len, KV_LEN=self.max_len, device=self.device)
+
+        # Create block mask using PyTorch's flex_attention utility
+        self.block_mask = create_block_mask(
+            mask_mod,
+            B=None,  # Batch dimension (None means support any batch size)
+            H=None,  # Head dimension (None means support any number of heads)
+            Q_LEN=self.max_len,
+            KV_LEN=self.max_len,
+            device=self.device
+        )
     
     def preprocess(self, x: torch.Tensor):
         """
-        1. project x to model dimension
-        2. prepend SOS token
-        3. add positional and level embeddings
+        Preprocess input tokens for the autoregressive model.
 
-        x: (B, L-1, C) output from quant.idxBl_to_var_input()
+        Steps:
+        1. Project VQ-VAE tokens to model dimension using linear layer
+        2. Prepend SOS (Start of Sequence) token
+        3. Add positional and level embeddings
+
+        Args:
+            x: (B, L-1, C) VQ-VAE tokens from quant.idxBl_to_var_input()
+               Note: L-1 because during training we predict the next token
+               given previous tokens (teacher forcing)
+
+        Returns:
+            x: (B, L, C) preprocessed tokens ready for transformer input
+               where L = (L-1) + 1 (SOS token)
         """
         B, L_minus_1, C = x.shape
         L = L_minus_1 + 1
@@ -111,12 +190,22 @@ class SimpleVARSamDecoder(nn.Module):
     
     def preprocess_image_feat(self, image_feat: torch.Tensor):
         """
-        convert single scale sam image feats to multiscale image_tokens
+        Convert single-scale SAM image features to multi-scale image tokens.
 
-        image_feat: (B, C, H, W)
+        The SAM encoder produces features at a single scale (e.g., 64x64 for 1024x1024 input).
+        This method interpolates these features to the target scale (finest patch resolution)
+        and adds positional embeddings for that scale only.
 
-        returns:
-            feats: (B, Lf, C)
+        Note: The original multi-scale version (commented out) would create features
+        for each patch scale, but the current implementation uses only the finest scale
+        for efficiency.
+
+        Args:
+            image_feat: (B, C, H, W) Image features from SAM encoder
+
+        Returns:
+            feats: (B, Lf, C) Image tokens at the finest scale with positional embeddings
+                   where Lf = h_target * w_target
         """
         B, C, H, W = image_feat.shape
         h_target = w_target = self.patch_num[-1]
@@ -148,76 +237,92 @@ class SimpleVARSamDecoder(nn.Module):
         When training, set block_mask to `self.block_mask`
         When inferencing, set block_mask to `None`
 
-        x: (B, L, C)
-        image_tokens: (B, Li, C)
-        # prompt_tokens: (B, Lp, C)
+        Args:
+            x: (B, L, C) - input tokens (SOS + mask tokens) after preprocessing
+            image_tokens: (B, Li, C) - image features from SAM encoder
+            prompt_tokens: (B, Lp, C) - optional prompt tokens (points, boxes)
+            block_mask: attention mask for controlling token visibility
+
+        Returns:
+            logits: (B, L, vocab_size) - predicted token logits
         """
         # NOTE
         # 这里存在attention mask无法应用的问题
         # 导致高效并行训练不可行
         # 原因：由于SAM采用TwoWay Attention，如果并行训练，很难确保训推一致性
-        # 
+        #
         # 解法一：不并行（训练速度会成倍减慢，实际上不可接受）
         # 解法二：让image tokens只看到sos，加入额外的一层self attention block让sos和其他mask token共享信息
         # 解法三：不并行，把任务转成残差预测任务，在点击位置使用更多token？
         # 解法四：降采样image token，让image token也自回归
 
-        # for block in self.blocks:
-        #     x = block(x, image_tokens=image_tokens, block_mask=block_mask)
-        x = self.adapted_mask_decoder.forward(
+        # 计算位置编码和层级编码
+        pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
+
+        # mask_tokens_pe 是位置编码和层级编码的和
+        mask_tokens_pe = pos_embed_to_add + level_embed_to_add
+
+        # 调用AdaptedMaskDecoder
+        # x作为mask_tokens传入，image_pe只需要位置编码部分
+        qs, qm = self.adapted_mask_decoder.forward(
             image_embeddings=image_tokens,
-            image_pe=self.calc_embed_to_add(),
+            image_pe=pos_embed_to_add,
             sparse_prompt_embeddings=prompt_tokens,
             dense_prompt_embeddings=None,
             multimask_output=False,
-            output_tokens=x,
-            mask_mod=None,
+            mask_tokens=x,
+            mask_tokens_pe=mask_tokens_pe,
+            block_mask=block_mask,
         )
-        logits = self.cls(x)
+
+        # 我们只需要mask tokens的输出（qm），而不是query tokens（qs）
+        # qm包含了处理后的mask tokens
+        logits = self.cls(qm)
         return logits
     
     def sample_with_top_k_(self, logits, top_k=50):
         """
-        Sample from logits using top-k sampling
-        
+        Sample from logits using top-k sampling for autoregressive generation.
+
+        Top-k sampling restricts sampling to the k tokens with the highest probabilities,
+        which helps maintain diversity while avoiding low-probability tokens.
+
         Args:
-            logits: (B, C) - batch of token logits for the next token
-            top_k: keep only top k tokens for sampling
-        
+            logits: (B, vocab_size) Batch of token logits for the next token prediction
+            top_k: Number of top tokens to consider for sampling (default: 50)
+
         Returns:
-            (B, 1) - sampled token indices
+            next_token: (B, 1) Sampled token indices for each batch element
         """
-        # 确保top_k不超过词汇表大小
+        # Ensure top_k doesn't exceed vocabulary size
         vocab_size = logits.shape[-1]
         top_k = min(top_k, vocab_size)
-        
+
         if top_k <= 0:
-            # 如果top_k无效，直接采样
+            # If top_k is invalid, sample from the full distribution
             probs = torch.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             return next_token
-        
-        # 获取top-k的值和索引
+
+        # Get top-k values and indices
         topk_values, topk_indices = torch.topk(logits, k=top_k, dim=-1)
-        
-        # 创建掩码：只保留top-k位置的logits
-        # 方法1: 使用scatter直接构建新logits
+
+        # Create mask: keep only logits at top-k positions
         batch_size = logits.shape[0]
-        
-        # 创建全为-inf的logits
+
+        # Initialize filtered logits with -inf
         filtered_logits = torch.full_like(logits, float('-inf'))
-        
-        # 使用einops重新排列索引以便scatter操作
-        # 将topk_indices从(B, k)转换为适合scatter的形状
+
+        # Prepare batch indices for scatter operation
         batch_indices = torch.arange(batch_size, device=logits.device)
         batch_indices = rearrange(batch_indices, 'b -> b 1')
         batch_indices = batch_indices.expand(-1, top_k)
-        
-        # 使用scatter_填充top-k值
+
+        # Fill top-k values into filtered logits using scatter
         filtered_logits[batch_indices, topk_indices] = topk_values
-        
-        # 从过滤后的分布中采样
+
+        # Sample from the filtered distribution
         probs = torch.softmax(filtered_logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
-        
+
         return next_token

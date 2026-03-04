@@ -17,6 +17,17 @@ from ..sam.common import LayerNorm2d
 
 
 class AdaptedMaskDecoder(nn.Module):
+    """
+    Adapted version of SAM's MaskDecoder for autoregressive mask token prediction.
+
+    This decoder extends the original SAM MaskDecoder to:
+    1. Support autoregressive mask token prediction instead of direct mask output
+    2. Handle additional mask tokens with separate positional encoding
+    3. Return processed tokens for classification rather than mask logits
+
+    The decoder maintains the original SAM architecture components but
+    repurposes them for token prediction tasks.
+    """
     def __init__(
         self,
         *,
@@ -28,20 +39,15 @@ class AdaptedMaskDecoder(nn.Module):
         iou_head_hidden_dim: int = 256,
     ) -> None:
         """
-        Predicts masks given an image and prompt embeddings, using a
-        transformer architecture.
+        Initialize the AdaptedMaskDecoder.
 
-        Arguments:
-          transformer_dim (int): the channel dimension of the transformer
-          transformer (nn.Module): the transformer used to predict masks
-          num_multimask_outputs (int): the number of masks to predict
-            when disambiguating masks
-          activation (nn.Module): the type of activation to use when
-            upscaling masks
-          iou_head_depth (int): the depth of the MLP used to predict
-            mask quality
-          iou_head_hidden_dim (int): the hidden dimension of the MLP
-            used to predict mask quality
+        Args:
+          transformer_dim (int): Channel dimension of the transformer
+          transformer (AdaptedTwoWayTransformer): Transformer for mask token prediction
+          num_multimask_outputs (int): Number of mask outputs (kept for compatibility)
+          activation (nn.Module): Activation function for upscaling layers
+          iou_head_depth (int): Depth of the IoU prediction MLP
+          iou_head_hidden_dim (int): Hidden dimension of the IoU prediction MLP
         """
         super().__init__()
         self.transformer_dim = transformer_dim
@@ -81,6 +87,7 @@ class AdaptedMaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         multimask_output: bool,
         mask_tokens: torch.Tensor=None,
+        mask_tokens_pe: torch.Tensor=None,
         block_mask=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -91,14 +98,14 @@ class AdaptedMaskDecoder(nn.Module):
           image_pe (torch.Tensor): positional encoding with the shape of image_embeddings
           sparse_prompt_embeddings (torch.Tensor): the embeddings of the points and boxes
           dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
-          multimask_output (bool): Whether to return multiple masks or a single
-            mask.
-          mask_tokens: (B, L, C)
-          block_mask: attention mask
+          multimask_output (bool): Whether to return multiple masks or a single mask.
+          mask_tokens: (B, L, C) - mask tokens for autoregressive prediction
+          mask_tokens_pe: (B, L, C) - positional encoding for mask tokens
+          block_mask: attention mask for controlling token visibility
 
         Returns:
-          torch.Tensor: batched predicted masks
-          torch.Tensor: batched predictions of mask quality
+          torch.Tensor: query tokens (qs) - processed query tokens (iou, mask, sos, prompt)
+          torch.Tensor: mask tokens (qm) - processed mask tokens for autoregressive prediction
         """
         return self.predict_masks(
             image_embeddings=image_embeddings,
@@ -106,6 +113,7 @@ class AdaptedMaskDecoder(nn.Module):
             sparse_prompt_embeddings=sparse_prompt_embeddings,
             dense_prompt_embeddings=dense_prompt_embeddings,
             mask_tokens=mask_tokens,
+            mask_tokens_pe=mask_tokens_pe,
             block_mask=block_mask,
         )
 
@@ -114,15 +122,26 @@ class AdaptedMaskDecoder(nn.Module):
         image_embeddings: torch.Tensor,
         image_pe: torch.Tensor,
         sparse_prompt_embeddings: torch.Tensor | None,
-        # dense_prompt_embeddings: torch.Tensor,
+        dense_prompt_embeddings: torch.Tensor,
         mask_tokens: torch.Tensor,
         mask_tokens_pe: torch.Tensor,
         block_mask=None,
     ):
         """
         Predicts masks. See 'forward' for more details.
-        
-        output_tokens: (B, L, C)
+
+        Args:
+            image_embeddings: (B, C, H, W) image embeddings from SAM encoder
+            image_pe: (B, C, H, W) positional encoding for image embeddings
+            sparse_prompt_embeddings: (B, Lp, C) sparse prompt embeddings (points, boxes)
+            dense_prompt_embeddings: (B, C, H, W) dense prompt embeddings (mask inputs)
+            mask_tokens: (B, L, C) mask tokens for autoregressive prediction
+            mask_tokens_pe: (B, L, C) positional encoding for mask tokens
+            block_mask: attention mask for controlling token visibility
+
+        Returns:
+            qs: (B, Lqs, C) processed query tokens (iou, mask, sos, prompt tokens)
+            qm: (B, Lqm, C) processed mask tokens for autoregressive prediction
         """
         B = image_embeddings.shape[0]
         # Concatenate output tokens

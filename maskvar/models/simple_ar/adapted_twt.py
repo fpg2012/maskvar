@@ -8,6 +8,8 @@
 
 import torch
 from torch import Tensor, nn
+from torch.nn.attention.flex_attention import flex_attention
+from einops import rearrange
 
 import math
 from typing import Tuple, Type
@@ -18,6 +20,19 @@ from .common import SimpleSelfAttention, SimpleCrossAttention
 
 
 class AdaptedTwoWayTransformer(nn.Module):
+    """
+    Adapted version of SAM's TwoWayTransformer for autoregressive mask prediction.
+
+    This transformer extends the original SAM TwoWayTransformer to support:
+    1. Additional mask tokens for autoregressive prediction
+    2. Separate positional encoding for mask tokens
+    3. Block attention masks for controlling token visibility during training
+
+    The transformer performs bidirectional attention between:
+    - Query tokens: IOU token, mask tokens, SOS token, and prompt tokens
+    - Image tokens: Features from SAM image encoder
+    - Mask tokens: Autoregressive tokens being predicted
+    """
     def __init__(
         self,
         depth: int,
@@ -28,16 +43,15 @@ class AdaptedTwoWayTransformer(nn.Module):
         attention_downsample_rate: int = 2,
     ) -> None:
         """
-        A transformer decoder that attends to an input image using
-        queries whose positional embedding is supplied.
+        Initialize the AdaptedTwoWayTransformer.
 
         Args:
-          depth (int): number of layers in the transformer
-          embedding_dim (int): the channel dimension for the input embeddings
-          num_heads (int): the number of heads for multihead attention. Must
-            divide embedding_dim
-          mlp_dim (int): the channel dimension internal to the MLP block
-          activation (nn.Module): the activation to use in the MLP block
+          depth (int): Number of transformer layers
+          embedding_dim (int): Channel dimension for input embeddings
+          num_heads (int): Number of attention heads (must divide embedding_dim)
+          mlp_dim (int): Hidden dimension for MLP blocks
+          activation (nn.Module): Activation function for MLP blocks (default: ReLU)
+          attention_downsample_rate (int): Downsample rate for attention (default: 2)
         """
         super().__init__()
         self.depth = depth
@@ -73,17 +87,21 @@ class AdaptedTwoWayTransformer(nn.Module):
         block_mask=None
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
+        Forward pass of the AdaptedTwoWayTransformer.
+
         Args:
-          image_embedding (torch.Tensor): image to attend to. Should be shape
-            B x embedding_dim x h x w for any h and w.
-          image_pe (torch.Tensor): the positional encoding to add to the image. Must
-            have the same shape as image_embedding.
-          point_embedding (torch.Tensor): the embedding to add to the query points.
-            Must have shape B x N_points x embedding_dim for any N_points.
+          image_embedding: (B, C, H, W) Image features to attend to
+          image_pe: (B, C, H, W) Positional encoding for image features
+          point_embedding: (B, Lqs, C) Query tokens (IOU, mask, SOS, prompt tokens)
+          mask_tokens: (B, Lqm, C) Mask tokens for autoregressive prediction
+          mask_tokens_pe: (B, Lqm, C) Positional encoding for mask tokens
+          block_mask: Optional attention mask for controlling token visibility
+                     (e.g., for enforcing Markovian property during training)
 
         Returns:
-          torch.Tensor: the processed point_embedding
-          torch.Tensor: the processed image_embedding
+          qs: (B, Lqs, C) Processed query tokens
+          keys: (B, H*W, C) Processed image tokens
+          qm: (B, Lqm, C) Processed mask tokens (for autoregressive prediction)
         """
         # BxCxHxW -> BxHWxC == B x N_image_tokens x C
         bs, c, h, w = image_embedding.shape
@@ -106,7 +124,7 @@ class AdaptedTwoWayTransformer(nn.Module):
                 keys=keys,
                 query_mask_pe=query_mask_pe,
                 key_pe=image_pe,
-                ar_queires=mask_tokens,
+                ar_queries=mask_tokens,
                 block_mask=block_mask,
             )
 
@@ -124,6 +142,20 @@ class AdaptedTwoWayTransformer(nn.Module):
 
 
 class AdaptedTwoWayAttentionBlock(nn.Module):
+    """
+    Adapted version of SAM's TwoWayAttentionBlock for autoregressive prediction.
+
+    This block extends the original TwoWayAttentionBlock to handle:
+    1. Combined query and mask tokens for self-attention
+    2. Separate positional encodings for queries and mask tokens
+    3. Block attention masks for training-time token visibility control
+
+    The block performs four operations in sequence:
+    1. Self-attention on combined queries and mask tokens
+    2. Cross-attention from tokens to image features
+    3. MLP on token representations
+    4. Cross-attention from image features to query tokens only
+    """
     def __init__(
         self,
         embedding_dim: int,
@@ -134,17 +166,15 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
         skip_first_layer_pe: bool = False,
     ) -> None:
         """
-        A transformer block with four layers: (1) self-attention of sparse
-        inputs, (2) cross attention of sparse inputs to dense inputs, (3) mlp
-        block on sparse inputs, and (4) cross attention of dense inputs to sparse
-        inputs.
+        Initialize the AdaptedTwoWayAttentionBlock.
 
-        Arguments:
-          embedding_dim (int): the channel dimension of the embeddings
-          num_heads (int): the number of heads in the attention layers
-          mlp_dim (int): the hidden dimension of the mlp block
-          activation (nn.Module): the activation of the mlp block
-          skip_first_layer_pe (bool): skip the PE on the first layer
+        Args:
+          embedding_dim (int): Channel dimension of embeddings
+          num_heads (int): Number of attention heads
+          mlp_dim (int): Hidden dimension for MLP blocks (default: 2048)
+          activation (nn.Module): Activation function for MLP blocks (default: ReLU)
+          attention_downsample_rate (int): Downsample rate for attention (default: 2)
+          skip_first_layer_pe (bool): Whether to skip positional encoding in first layer
         """
         super().__init__()
         self.self_attn = AdaptedAttention(embedding_dim, num_heads)
@@ -172,13 +202,25 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
         query_mask_pe: Tensor,
         key_pe: Tensor,
         ar_queries: Tensor,
-        block_mask=None, # block mask for self attn: q <-> q
-        block_mask2=None, # block mask for q -> k
-    ) -> Tuple[Tensor, Tensor]:
+        block_mask=None,
+        block_mask2=None,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
-        queries: B Lqs C
-        keys: B Lk C
-        ar_queires: B Lqm C
+        Forward pass of the AdaptedTwoWayAttentionBlock.
+
+        Args:
+            queries: (B, Lqs, C) Query tokens (IOU, mask, SOS, prompt tokens)
+            keys: (B, Lk, C) Image tokens (flattened image features)
+            query_mask_pe: (B, Lqs+Lqm, C) Positional encoding for queries + mask tokens
+            key_pe: (B, Lk, C) Positional encoding for image tokens
+            ar_queries: (B, Lqm, C) Mask tokens for autoregressive prediction
+            block_mask: Optional mask for self-attention (queries ↔ queries)
+            block_mask2: Optional mask for cross-attention (queries → keys)
+
+        Returns:
+            qs: (B, Lqs, C) Updated query tokens
+            keys: (B, Lk, C) Updated image tokens
+            qm: (B, Lqm, C) Updated mask tokens
         """
         B, Lqs, C = queries.shape
         _, Lqm, _ = ar_queries.shape
@@ -221,8 +263,26 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
 
 class AdaptedAttention(nn.Module):
+    """
+    Adapted attention module that supports block attention masks.
+
+    This attention module uses PyTorch's flex_attention to efficiently handle
+    block-diagonal attention masks, which are useful for enforcing constraints
+    like Markovian property (tokens at different scales cannot attend to each other).
+
+    The module supports optional downsampling of the internal dimension to
+    reduce computational cost.
+    """
 
     def __init__(self, embed_dim: int = 256, num_heads: int = 4, downsample_rate: int = 1):
+        """
+        Initialize the AdaptedAttention module.
+
+        Args:
+            embed_dim: Input embedding dimension (default: 256)
+            num_heads: Number of attention heads (default: 4)
+            downsample_rate: Factor to downsample internal dimension (default: 1)
+        """
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -238,20 +298,36 @@ class AdaptedAttention(nn.Module):
         self.out_proj = nn.Linear(self.internal_dim, embed_dim)
     
     def forward(self, q, k, v, block_mask=None):
+        """
+        Forward pass of the AdaptedAttention module.
+
+        Args:
+            q: (B, Lq, C) Query tensor
+            k: (B, Lk, C) Key tensor
+            v: (B, Lv, C) Value tensor
+            block_mask: Optional block attention mask for flex_attention
+
+        Returns:
+            out: (B, Lq, C) Attention output
+        """
         B, Lq, C = q.shape
         _, Lk, _ = k.shape
         _, Lv, _ = v.shape
 
-        q = self.q_proj(q) # (B, Lq, C)
-        k = self.k_proj(k) # (B, Lk, C)
-        v = self.v_proj(v) # (B, Lk, C)
-        
+        # Project inputs to internal dimension
+        q = self.q_proj(q)  # (B, Lq, internal_dim)
+        k = self.k_proj(k)  # (B, Lk, internal_dim)
+        v = self.v_proj(v)  # (B, Lk, internal_dim)
+
+        # Reshape for multi-head attention
         q = rearrange(q, 'B Lq (H c) -> B H Lq c', H=self.num_heads)
         k = rearrange(k, 'B Lk (H c) -> B H Lk c', H=self.num_heads)
         v = rearrange(v, 'B Lv (H c) -> B H Lv c', H=self.num_heads)
-        
-        out = flex_attention(q, k, v, block_mask=block_mask)
-        out = rearrange(out, 'B H L c -> B L (H c)')
 
+        # Apply attention with optional block mask
+        out = flex_attention(q, k, v, block_mask=block_mask)
+        out = rearrange(out, 'B H L c -> B L (H c)')  # (B, Lq, internal_dim)
+
+        # Project back to original dimension
         out = self.out_proj(out)
         return out
