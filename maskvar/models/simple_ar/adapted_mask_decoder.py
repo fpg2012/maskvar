@@ -59,7 +59,7 @@ class AdaptedMaskDecoder(nn.Module):
         self.num_mask_tokens = num_multimask_outputs + 1
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
 
-        self.sos_token = nn.Embedding(1, transformer_dim)
+        # self.sos_token = nn.Embedding(1, transformer_dim)
 
         self.output_upscaling = nn.Sequential(
             nn.ConvTranspose2d(transformer_dim, transformer_dim // 4, kernel_size=2, stride=2),
@@ -88,7 +88,7 @@ class AdaptedMaskDecoder(nn.Module):
         multimask_output: bool,
         mask_tokens: torch.Tensor=None,
         mask_tokens_pe: torch.Tensor=None,
-        block_mask=None,
+        self_attn_mask=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -104,8 +104,8 @@ class AdaptedMaskDecoder(nn.Module):
           block_mask: attention mask for controlling token visibility
 
         Returns:
-          torch.Tensor: query tokens (qs) - processed query tokens (iou, mask, sos, prompt)
-          torch.Tensor: mask tokens (qm) - processed mask tokens for autoregressive prediction
+          torch.Tensor: query tokens (qs) - processed query tokens (iou, mask, prompt)
+          torch.Tensor: mask tokens (qm) - processed mask tokens for autoregressive prediction (including iou token)
         """
         return self.predict_masks(
             image_embeddings=image_embeddings,
@@ -114,7 +114,7 @@ class AdaptedMaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             mask_tokens=mask_tokens,
             mask_tokens_pe=mask_tokens_pe,
-            block_mask=block_mask,
+            self_attn_mask=self_attn_mask,
         )
 
     def predict_masks(
@@ -125,7 +125,7 @@ class AdaptedMaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         mask_tokens: torch.Tensor,
         mask_tokens_pe: torch.Tensor,
-        block_mask=None,
+        self_attn_mask=None,
     ):
         """
         Predicts masks. See 'forward' for more details.
@@ -146,7 +146,7 @@ class AdaptedMaskDecoder(nn.Module):
         B = image_embeddings.shape[0]
         # Concatenate output tokens
         
-        qs_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight, self.sos_token.weight], dim=0)
+        qs_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
         qs_tokens = rearrange(qs_tokens, 'n c -> b n c', b=B)
 
         if sparse_prompt_embeddings is not None:
@@ -168,7 +168,7 @@ class AdaptedMaskDecoder(nn.Module):
             point_embedding=qs_tokens,
             mask_tokens=mask_tokens,
             mask_tokens_pe=mask_tokens_pe,
-            block_mask=block_mask
+            self_attn_mask=self_attn_mask,
         )
 
         # Upscale mask embeddings and predict masks using the mask tokens

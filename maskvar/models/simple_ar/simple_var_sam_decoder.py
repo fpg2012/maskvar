@@ -12,6 +12,8 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 from typing import List, Tuple, Type
 
+from maskvar.models.vqvae_single import VQVAE_Single
+
 # from ..sam.mask_decoder import MaskDecoder
 from .adapted_mask_decoder import AdaptedMaskDecoder
 
@@ -231,7 +233,37 @@ class SimpleVARSamDecoder(nn.Module):
 
         return feats
     
-    def forward(self, x: torch.Tensor, image_tokens: torch.Tensor, prompt_tokens=None, block_mask=None):
+    def forward(self, idx, image_feat: torch.Tensor, vqvae: VQVAE_Single, epsilon=0.001):
+        """
+        Training pass for SimpleVAR model.
+
+        1. Convert discrete codes to VQVAE input format
+        2. Preprocess input for SimpleVAR
+        3. Forward pass with block mask
+        
+        Args:
+            idx: List of (B, l) - Input discrete codes from VQVAE
+            image_feat: (B, C, H, W) - Image features from SAM
+            simple_var: SimpleVAR model instance
+            vqvae: VQVAE model instance
+
+        Returns: logits (B, l, vocab_size)
+        """
+        assert self.block_mask is not None, "Block mask must be initialized before training"
+        with torch.no_grad():
+            x = vqvae.quantize.idxBl_to_var_input(idx)
+            # add noise
+            if epsilon > 0:
+                # Add random noise to the input
+                noise = torch.randn_like(x) * epsilon
+                x = x + noise
+
+        x = self.preprocess(x)
+        image_tokens = self.preprocess_image_feat(image_feat)
+        logits = self.block_forward(x, image_tokens=image_tokens, block_mask=self.block_mask)
+        return logits
+
+    def block_forward(self, x: torch.Tensor, image_tokens: torch.Tensor, prompt_tokens=None, block_mask=None):
         """
         Applies the transformer blocks and outputs logits.
         When training, set block_mask to `self.block_mask`
@@ -269,10 +301,9 @@ class SimpleVARSamDecoder(nn.Module):
             image_pe=pos_embed_to_add,
             sparse_prompt_embeddings=prompt_tokens,
             dense_prompt_embeddings=None,
-            multimask_output=False,
             mask_tokens=x,
             mask_tokens_pe=mask_tokens_pe,
-            block_mask=block_mask,
+            self_attn_mask=block_mask,
         )
 
         # 我们只需要mask tokens的输出（qm），而不是query tokens（qs）
@@ -326,3 +357,12 @@ class SimpleVARSamDecoder(nn.Module):
         next_token = torch.multinomial(probs, num_samples=1)
 
         return next_token
+
+# NOTE: just reuse train pass & inference in simple_var.py
+
+# def simple_var_train_pass(idx, image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single, epsilon=0.001):
+#     pass
+
+# @torch.no_grad()
+# def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single):
+#     pass

@@ -12,7 +12,9 @@ from .models.sam import PromptEncoder
 from .models.image_encoder import ImageEncoder, VarImageEncoder, NeckFPN
 from .models.maskvar import MaskVAR
 from .models.tinyvit import TinyViT
-from .models.simple_ar import SimpleAR, SimpleVAR
+from .models.simple_ar import SimpleAR, SimpleVAR, SimpleVARSamDecoder
+from .models.simple_ar.adapted_mask_decoder import AdaptedMaskDecoder
+from .models.simple_ar.adapted_twt import AdaptedTwoWayTransformer
 
 from .datasets.mask_level_dataset import MaskLevelDataset
 from .datasets.coco_lvis import LvisDataset
@@ -774,6 +776,45 @@ def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, sam_pe: O
         vqvae_dim=32,
         use_sam_pe=(sam_pe is not None),
         sam_pe=sam_pe,
+    )
+
+    if simple_var_checkpoint_path is not None:
+        simple_var_state_dict = torch.load(simple_var_checkpoint_path)
+        if any(key.startswith('_orig_mod.') for key in simple_var_state_dict.keys()):
+            # 创建一个新的字典，移除 '_orig_mod.' 前缀
+            new_state_dict = {}
+            for key, value in simple_var_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_var_state_dict = new_state_dict
+        simple_var.load_state_dict(simple_var_state_dict)
+
+    simple_var.init_block_mask()
+
+    return simple_var.to(device)
+
+def build_simple_var_sam_decoder(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu') -> SimpleVARSamDecoder:
+    adapted_2way_transformer = AdaptedTwoWayTransformer(
+        depth=2,
+        embedding_dim=256,
+        num_heads=4,
+        mlp_dim=2048,
+    )
+    
+    adapted_mask_decoder = AdaptedMaskDecoder(
+        transformer_dim=256,
+        transformer=adapted_2way_transformer,
+    )
+    
+    simple_var = SimpleVARSamDecoder(
+        adapted_mask_decoder=adapted_mask_decoder,
+        dim=256,
+        depth=2,
+        vocab_size=4096,
+        device=device,
+        patch_num=[1, 8, 16, 24, 32],
+        num_heads=4,
+        vqvae_dim=32,
     )
 
     if simple_var_checkpoint_path is not None:
