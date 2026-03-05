@@ -72,7 +72,7 @@ class AdaptedTwoWayTransformer(nn.Module):
                 )
             )
 
-        self.final_attn_token_to_image = Attention(
+        self.final_attn_token_to_image = AdaptedAttention(
             embedding_dim, num_heads, downsample_rate=attention_downsample_rate
         )
         self.norm_final_attn = nn.LayerNorm(embedding_dim)
@@ -84,7 +84,7 @@ class AdaptedTwoWayTransformer(nn.Module):
         point_embedding: Tensor,
         mask_tokens: Tensor,
         mask_tokens_pe: Tensor,
-        self_attn_block_mask=None,
+        self_attn_mask=None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass of the AdaptedTwoWayTransformer.
@@ -105,30 +105,37 @@ class AdaptedTwoWayTransformer(nn.Module):
         """
         # BxCxHxW -> BxHWxC == B x N_image_tokens x C
         bs, c, h, w = image_embedding.shape
-        image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
-        image_pe = image_pe.flatten(2).permute(0, 2, 1)
+
+        print('AdaptedTwoWayTransformer, image_embedding.shape', image_embedding.shape)
+        print('AdaptedTwoWayTransformer, image_pe.shape', image_pe.shape)
+
+        # image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
+        # image_pe = image_pe.flatten(2).permute(0, 2, 1)
 
         B, Lqs, C = point_embedding.shape
         _, Lqm, _ = mask_tokens.shape
 
         # Prepare queries
         queries = point_embedding
-        keys = image_embedding
+        keys = rearrange(image_embedding, 'b c h w -> b (h w) c')
+        key_pe = image_pe
 
+        # print("point_embedding.shape", point_embedding.shape)
+        # print("mask_tokens_pe.shape", mask_tokens_pe.shape)
         query_mask_pe = torch.cat([point_embedding, mask_tokens_pe], dim=1)
 
         # Apply transformer blocks and final layernorm
         for layer in self.layers:
             queries, keys, mask_tokens = layer(
                 queries=queries, ar_queries=mask_tokens, keys=keys,
-                query_pe = point_embedding, mask_pe=mask_tokens_pe, key_pe=image_pe,
-                self_attn_block_mask=self_attn_block_mask,
+                query_pe = point_embedding, mask_pe=mask_tokens_pe, key_pe=key_pe,
+                self_attn_mask=self_attn_mask,
             )
 
         # Apply the final attention layer from the points to the image
         full_queries = torch.cat([queries, mask_tokens], dim=1)
         full_queries_w_pe = full_queries + query_mask_pe
-        k = keys + image_pe
+        k = keys + key_pe
         attn_out = self.final_attn_token_to_image(
             q=full_queries_w_pe, k=k, v=keys
         )
@@ -179,7 +186,7 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
         self.self_attn = AdaptedAttention(embedding_dim, num_heads)
         self.norm1 = nn.LayerNorm(embedding_dim)
 
-        self.cross_attn_token_to_image = Attention(
+        self.cross_attn_token_to_image = AdaptedAttention(
             embedding_dim, num_heads, downsample_rate=attention_downsample_rate
         )
         self.norm2 = nn.LayerNorm(embedding_dim)
@@ -198,7 +205,7 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
         self,
         queries: Tensor, ar_queries: Tensor, keys: Tensor,
         query_pe: Tensor, mask_pe: Tensor, key_pe: Tensor,
-        self_attn_block_mask=None,
+        self_attn_mask=None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass of the AdaptedTwoWayAttentionBlock.
@@ -238,11 +245,14 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
         queries = self.norm1(queries)
 
         ## self-attn among mask tokens
-        ## require markovian or causal mask
+        ## require markovian attn mask or causal attn mask when training
+        print('ar_queries.shape', ar_queries.shape)
+        print('block mask is None: ', self_attn_mask is None)
+        print('mask_pe.shape', mask_pe.shape)
         qm_0 = ar_queries + mask_pe
         attn_out_qm0 = self.self_attn(
             q=qm_0, k=qm_0, v=ar_queries,
-            block_mask=self_attn_block_mask
+            block_mask=self_attn_mask
         )
         ar_queries = ar_queries + attn_out_qm0
         ar_queries = self.norm1(ar_queries)
@@ -252,6 +262,10 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
         # Cross attention block, tokens attending to image embedding
         # no need for block mask in principle
+        print('full_queries.shape', full_queries.shape)
+        print('query_mask_pe.shape', query_mask_pe.shape)
+        print('keys.shape', keys.shape)
+        print('key_pe.shape', key_pe.shape)
         q = full_queries + query_mask_pe
         k = keys + key_pe
         attn_out = self.cross_attn_token_to_image(

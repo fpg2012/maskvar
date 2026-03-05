@@ -45,6 +45,8 @@ class SimpleVARSamDecoder(nn.Module):
                  patch_num=[1, 4, 8, 16, 32],
                  num_heads=4,
                  vqvae_dim=256,
+                 use_sam_pe=False,
+                 sam_pe=None
                  ):
         """
         Initialize the SimpleVARSamDecoder.
@@ -76,7 +78,21 @@ class SimpleVARSamDecoder(nn.Module):
         
         pn_last = self.patch_num[-1]
         
-        self.pos_embed = nn.Parameter(torch.randn(1, pn_last, pn_last, dim))
+        self.use_sam_pe = use_sam_pe
+        if use_sam_pe:
+            # check pe shape
+            assert sam_pe is not None, "sam_pe must be provided when use_sam_pe is True"
+            assert sam_pe.shape[0] == 1 and sam_pe.shape[1] == dim and sam_pe.shape[-1] == sam_pe.shape[-2], f"sam_pe shape: {sam_pe.shape}, expected: (1, {dim}, p, p)"
+            sam_pe = sam_pe.to(self.device)
+            if sam_pe.shape[-1] != pn_last:
+                sam_pe = F.interpolate(sam_pe, size=(pn_last, pn_last), mode='bilinear', align_corners=False)
+            sam_pe = rearrange(sam_pe, '1 c h w -> 1 h w c')
+            # self.pos_embed = sam_pe.detach()
+            print("use sam pe")
+            self.register_buffer('pos_embed', sam_pe.detach())
+        else:
+            # trainable pe
+            self.pos_embed = nn.Parameter(torch.randn(1, pn_last, pn_last, dim))
         self.level_embedding = nn.Embedding(len(patch_num), dim)
         
         self.sos = nn.Parameter(torch.randn(dim))
@@ -260,10 +276,20 @@ class SimpleVARSamDecoder(nn.Module):
 
         x = self.preprocess(x)
         image_tokens = self.preprocess_image_feat(image_feat)
-        logits = self.block_forward(x, image_tokens=image_tokens, block_mask=self.block_mask)
+
+        logits = self.block_forward(
+            x=x,
+            image_tokens=image_tokens,
+            block_mask=self.block_mask
+        )
         return logits
 
-    def block_forward(self, x: torch.Tensor, image_tokens: torch.Tensor, prompt_tokens=None, block_mask=None):
+    def block_forward(self,
+        x: torch.Tensor,
+        image_tokens: torch.Tensor,
+        prompt_tokens=None,
+        block_mask=None
+    ):
         """
         Applies the transformer blocks and outputs logits.
         When training, set block_mask to `self.block_mask`
@@ -288,17 +314,24 @@ class SimpleVARSamDecoder(nn.Module):
         # 解法三：不并行，把任务转成残差预测任务，在点击位置使用更多token？
         # 解法四：降采样image token，让image token也自回归
 
-        # 计算位置编码和层级编码
-        pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
+        # # 计算位置编码和层级编码
+        # pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
 
-        # mask_tokens_pe 是位置编码和层级编码的和
+        # # mask_tokens_pe 是位置编码和层级编码的和
+        # mask_tokens_pe = pos_embed_to_add + level_embed_to_add
+
+        pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
         mask_tokens_pe = pos_embed_to_add + level_embed_to_add
+        _, Lqm, _ = x.shape
+        _, Li, _ = image_tokens.shape
+        mask_tokens_pe = mask_tokens_pe[:, :Lqm, :]
+        image_pe = pos_embed_to_add[:, -Li:, :]
 
         # 调用AdaptedMaskDecoder
         # x作为mask_tokens传入，image_pe只需要位置编码部分
         qs, qm = self.adapted_mask_decoder.forward(
             image_embeddings=image_tokens,
-            image_pe=pos_embed_to_add,
+            image_pe=image_pe,
             sparse_prompt_embeddings=prompt_tokens,
             dense_prompt_embeddings=None,
             mask_tokens=x,

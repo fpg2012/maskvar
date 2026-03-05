@@ -7,7 +7,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 
 from typing import List, Tuple, Type
 
@@ -85,7 +85,6 @@ class AdaptedMaskDecoder(nn.Module):
         image_pe: torch.Tensor,
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
-        multimask_output: bool,
         mask_tokens: torch.Tensor=None,
         mask_tokens_pe: torch.Tensor=None,
         self_attn_mask=None,
@@ -98,7 +97,6 @@ class AdaptedMaskDecoder(nn.Module):
           image_pe (torch.Tensor): positional encoding with the shape of image_embeddings
           sparse_prompt_embeddings (torch.Tensor): the embeddings of the points and boxes
           dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
-          multimask_output (bool): Whether to return multiple masks or a single mask.
           mask_tokens: (B, L, C) - mask tokens for autoregressive prediction
           mask_tokens_pe: (B, L, C) - positional encoding for mask tokens
           block_mask: attention mask for controlling token visibility
@@ -136,7 +134,7 @@ class AdaptedMaskDecoder(nn.Module):
             sparse_prompt_embeddings: (B, Lp, C) sparse prompt embeddings (points, boxes)
             dense_prompt_embeddings: (B, C, H, W) dense prompt embeddings (mask inputs)
             mask_tokens: (B, L, C) mask tokens for autoregressive prediction
-            mask_tokens_pe: (B, L, C) positional encoding for mask tokens
+            mask_tokens_pe: (1, L, C) positional encoding for mask tokens
             block_mask: attention mask for controlling token visibility
 
         Returns:
@@ -147,7 +145,9 @@ class AdaptedMaskDecoder(nn.Module):
         # Concatenate output tokens
         
         qs_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
-        qs_tokens = rearrange(qs_tokens, 'n c -> b n c', b=B)
+        qs_tokens = repeat(qs_tokens, 'n c -> b n c', b=B)
+
+        mask_tokens_pe = repeat(mask_tokens_pe, '1 n c -> b n c', b=B)
 
         if sparse_prompt_embeddings is not None:
             qs_tokens = torch.cat((qs_tokens, sparse_prompt_embeddings), dim=1)
@@ -159,7 +159,9 @@ class AdaptedMaskDecoder(nn.Module):
         # src = torch.repeat_interleave(image_embeddings, qs_tokens.shape[0], dim=0)
         # # src = src + dense_prompt_embeddings
         # pos_src = torch.repeat_interleave(image_pe, qs_tokens.shape[0], dim=0)
-        b, c, h, w = image_embeddings.shape
+        # print('image_embeddings.shape', image_embeddings.shape)
+        b, hw, c = image_embeddings.shape
+        image_embeddings = rearrange(image_embeddings, 'b (h w) c -> b c h w', h=int(hw**0.5), w=int(hw**0.5))
 
         # Run the transformer
         qs, src, qm = self.transformer(
