@@ -38,7 +38,6 @@ class MaskLevelDataset(IterableDataset):
         image_size_encoder=1024,
         image_size_mask=256,
         dtype=torch.float32,
-        sam_encoder=None,
         image_feature_cache: Optional[ImageFeatureCache] = None
     ):
         self.dataset = dataset
@@ -172,7 +171,16 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
         dtype=torch.float32,
         image_feature_cache: Optional[ImageFeatureCache] = None
     ):
-        super().__init__(dataset, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype, image_feature_cache)
+        super().__init__(
+            dataset=dataset,
+            device=device,
+            with_image_embed=with_image_embed,
+            mask_filter_thresh=mask_filter_thresh,
+            image_size_encoder=image_size_encoder,
+            image_size_mask=image_size_mask,
+            dtype=dtype,
+            image_feature_cache=image_feature_cache
+        )
         self.rng = np.random.default_rng(seed)
         self.seed = seed
         self.count = count
@@ -231,7 +239,16 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
         dtype=torch.float32,
         image_feature_cache: Optional[ImageFeatureCache] = None
     ):
-        super().__init__(dataset, device, with_image_embed, mask_filter_thresh, image_size_encoder, image_size_mask, dtype, image_feature_cache)
+        super().__init__(
+            dataset=dataset,
+            device=device,
+            with_image_embed=with_image_embed,
+            mask_filter_thresh=mask_filter_thresh,
+            image_size_encoder=image_size_encoder,
+            image_size_mask=image_size_mask,
+            dtype=dtype,
+            image_feature_cache=image_feature_cache
+        )
         self.rng = np.random.default_rng(seed)
         self.num_masks = num_masks
         self.infinite = infinite

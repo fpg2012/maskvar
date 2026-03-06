@@ -815,6 +815,8 @@ def build_simple_var_sam_decoder(simple_var_checkpoint_path: Optional[str] = Non
         patch_num=[1, 8, 16, 24, 32],
         num_heads=4,
         vqvae_dim=32,
+        use_sam_pe=(sam_pe is not None),
+        sam_pe=sam_pe,
     )
 
     if simple_var_checkpoint_path is not None:
@@ -986,6 +988,7 @@ builder_map = {
         "simple_var": build_simple_var,
         "simple_var_16d": build_simple_var_16d,
         "simple_var_6d": build_simple_var_6d,
+        "simple_var_sd": build_simple_var_sam_decoder
     },
     "dataset": {
         "cocolvis": build_cocolvis_dataset,

@@ -106,8 +106,8 @@ class AdaptedTwoWayTransformer(nn.Module):
         # BxCxHxW -> BxHWxC == B x N_image_tokens x C
         bs, c, h, w = image_embedding.shape
 
-        print('AdaptedTwoWayTransformer, image_embedding.shape', image_embedding.shape)
-        print('AdaptedTwoWayTransformer, image_pe.shape', image_pe.shape)
+        # print('AdaptedTwoWayTransformer, image_embedding.shape', image_embedding.shape)
+        # print('AdaptedTwoWayTransformer, image_pe.shape', image_pe.shape)
 
         # image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
         # image_pe = image_pe.flatten(2).permute(0, 2, 1)
@@ -246,9 +246,9 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
         ## self-attn among mask tokens
         ## require markovian attn mask or causal attn mask when training
-        print('ar_queries.shape', ar_queries.shape)
-        print('block mask is None: ', self_attn_mask is None)
-        print('mask_pe.shape', mask_pe.shape)
+        # print('ar_queries.shape', ar_queries.shape)
+        # print('block mask is None: ', self_attn_mask is None)
+        # print('mask_pe.shape', mask_pe.shape)
         qm_0 = ar_queries + mask_pe
         attn_out_qm0 = self.self_attn(
             q=qm_0, k=qm_0, v=ar_queries,
@@ -262,10 +262,10 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
         # Cross attention block, tokens attending to image embedding
         # no need for block mask in principle
-        print('full_queries.shape', full_queries.shape)
-        print('query_mask_pe.shape', query_mask_pe.shape)
-        print('keys.shape', keys.shape)
-        print('key_pe.shape', key_pe.shape)
+        # print('full_queries.shape', full_queries.shape)
+        # print('query_mask_pe.shape', query_mask_pe.shape)
+        # print('keys.shape', keys.shape)
+        # print('key_pe.shape', key_pe.shape)
         q = full_queries + query_mask_pe
         k = keys + key_pe
         attn_out = self.cross_attn_token_to_image(

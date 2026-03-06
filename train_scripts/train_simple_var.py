@@ -73,7 +73,7 @@ class SimpleARTrainer:
         vqvae: VQVAE_Single, 
         lr: float,
         train_set: MaskLevelDataset, 
-        val_set: MaskLevelDataset, 
+        val_set: MaskLevelDataset,
         batch_size: int,
         accumulate_steps: int,
         device: str,
@@ -85,6 +85,7 @@ class SimpleARTrainer:
         opt_checkpoint: Path | None = None,
         dataloader_workers: int = 4,
         prefetch_factor: int = 2,
+        shuffle_dataloader: bool = True
     ):
         # models
         self.simple_var: SimpleVAR = simple_var
@@ -149,7 +150,7 @@ class SimpleARTrainer:
         self.train_dataloader = DataLoader(
             self.train_set,
             batch_size=self.batch_size,
-            shuffle=(self.sampler is None),
+            shuffle=(self.sampler is None) and shuffle_dataloader,
             sampler=self.sampler,
             drop_last=True,
             num_workers=self.dataloader_workers,
@@ -160,7 +161,7 @@ class SimpleARTrainer:
         self.val_dataloader = DataLoader(
             self.val_set,
             batch_size=self.batch_size,
-            shuffle=(self.val_sampler is None),
+            shuffle=(self.val_sampler is None) and shuffle_dataloader,
             drop_last=True,
             sampler=self.val_sampler,
             num_workers=self.dataloader_workers,
@@ -268,7 +269,8 @@ class SimpleARTrainer:
         if self.rank == 0:
             global_iters = (outer_iter + 1)*num_iters + resume_iters
             self.save_checkpoint(iters=global_iters)
-        tdist.barrier()
+        if tdist.is_initialized():
+            tdist.barrier()
         self.eval(args.val_iters // world_size, global_step=global_iters)
     
     @torch.no_grad()
@@ -384,10 +386,12 @@ if __name__ == "__main__":
     parser.add_argument('--resume_iters', type=int, default=0)
     # dataset
     parser.add_argument('--dataset', choices=['hqseg44k', 'cocolvis'], type=str, default='hqseg44k')
+    parser.add_argument('--use_dummy_dataset_for_debug', action='store_true')
     parser.add_argument('--dl_workers', type=int, default=4)
     parser.add_argument('--prefetch_factor', type=int, default=2)
     # configs
     parser.add_argument('--simple_var', type=str, default='simple_var')
+    parser.add_argument('--simple_var_init_checkpoint', type=str, default=None)
     parser.add_argument('--image_encoder', choices=['sam_vitb', 'mobile_sam'], type=str, default='mobile_sam')
     parser.add_argument('--image_encoder_checkpoint', type=str, default='ckpt/mobile_sam.pt')
     parser.add_argument('--vqvae', choices=builder_map['vqvae'].keys(), type=str, default='vqvae_single_5_stages_v1')
@@ -412,7 +416,7 @@ if __name__ == "__main__":
         checkpoint_path = Path(args.resume_from) / "checkpoints" / f".simple_var.{args.resume_iters}.pt"
         opt_checkpoint = Path(args.resume_from) / "checkpoints" / f".optimizer.{args.resume_iters}.pt"
     else:
-        checkpoint_path = None
+        checkpoint_path = Path(args.simple_var_init_checkpoint) if args.simple_var_init_checkpoint else None
         opt_checkpoint = None
 
     if rank == 0:
@@ -440,22 +444,42 @@ if __name__ == "__main__":
     index_mapping_path = f'data/flat/{args.dataset}'
     # train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
     train_set, val_set = builder_map['dataset'][args.dataset](dataset_dir)
-    val_set_masklevel = MaskLevelFlatDataset(
-        index_mapping_path=Path(index_mapping_path) / "val_index_mapping.npy",
-        dataset=val_set,
-        with_image_embed=True,
-        image_feature_cache=image_feature_cache_val,
-        mask_filter_thresh=0.1,
-        dtype=torch.float32,
-    )
-    train_set_masklevel = MaskLevelFlatDataset(
-        index_mapping_path=Path(index_mapping_path) / "train_index_mapping.npy",
-        dataset=train_set,
-        with_image_embed=True,
-        image_feature_cache=image_feature_cache_train,
-        mask_filter_thresh=0.1,
-        dtype=torch.float32,
-    )
+    if args.use_dummy_dataset_for_debug:
+        train_set_masklevel = MaskLevelDatasetDummy(
+            dataset=train_set,
+            with_image_embed=True,
+            device=device,
+            mask_filter_thresh=0.1,
+            seed=42,
+            count=5,
+            image_feature_cache=image_feature_cache_train
+        )
+        val_set_masklevel = MaskLevelDatasetDummy(
+            dataset=train_set,
+            with_image_embed=True,
+            device=device,
+            mask_filter_thresh=0.1,
+            seed=42,
+            count=5,
+            image_feature_cache=image_feature_cache_train
+        )
+    else:
+        val_set_masklevel = MaskLevelFlatDataset(
+            index_mapping_path=Path(index_mapping_path) / "val_index_mapping.npy",
+            dataset=val_set,
+            with_image_embed=True,
+            image_feature_cache=image_feature_cache_val,
+            mask_filter_thresh=0.1,
+            dtype=torch.float32,
+        )
+        train_set_masklevel = MaskLevelFlatDataset(
+            index_mapping_path=Path(index_mapping_path) / "train_index_mapping.npy",
+            dataset=train_set,
+            with_image_embed=True,
+            image_feature_cache=image_feature_cache_train,
+            mask_filter_thresh=0.1,
+            dtype=torch.float32,
+        )
 
     if args.use_sam_pe:
         prompt_encoder = builder_map['prompt_encoder'](args.prompt_encoder_checkpoint)
@@ -489,7 +513,8 @@ if __name__ == "__main__":
         opt_checkpoint=opt_checkpoint,
         dtype=dtype,
         dataloader_workers=args.dl_workers,
-        prefetch_factor=args.prefetch_factor
+        prefetch_factor=args.prefetch_factor,
+        shuffle_dataloader=(not args.use_dummy_dataset_for_debug)
     )
 
     outer_iters = args.outer_iters
