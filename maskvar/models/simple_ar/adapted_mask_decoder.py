@@ -129,8 +129,8 @@ class AdaptedMaskDecoder(nn.Module):
         Predicts masks. See 'forward' for more details.
 
         Args:
-            image_embeddings: (B, C, H, W) image embeddings from SAM encoder
-            image_pe: (B, C, H, W) positional encoding for image embeddings
+            image_embeddings: (B, HW, C) image embeddings from SAM encoder
+            image_pe: (B, HW, C) positional encoding for image embeddings
             sparse_prompt_embeddings: (B, Lp, C) sparse prompt embeddings (points, boxes)
             dense_prompt_embeddings: (B, C, H, W) dense prompt embeddings (mask inputs)
             mask_tokens: (B, L, C) mask tokens for autoregressive prediction

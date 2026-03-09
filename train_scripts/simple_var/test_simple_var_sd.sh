@@ -13,7 +13,7 @@ python train_scripts/train_simple_var.py \
     --simple_var_init_checkpoint ckpt/simple_var_sd_init.pth \
     --use_dummy_dataset_for_debug \
     --outer_iters 2 \
-    --val_iters 0 \
+    --val_iters -1 \
     --inner_iters 1000 \
     --image_feature_cache_dir data/cache \
     --image_encoder sam_vitb \

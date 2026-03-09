@@ -85,7 +85,8 @@ class SimpleARTrainer:
         opt_checkpoint: Path | None = None,
         dataloader_workers: int = 4,
         prefetch_factor: int = 2,
-        shuffle_dataloader: bool = True
+        shuffle_dataloader: bool = True,
+        find_unused_parameters: bool = True,
     ):
         # models
         self.simple_var: SimpleVAR = simple_var
@@ -140,6 +141,8 @@ class SimpleARTrainer:
             self.rank = 0
             self.world_size = 1
             self.local_rank = 0
+        
+        self.find_unused_parameters = find_unused_parameters
 
         self.compile_model()
         self.ddp_wrap()
@@ -178,7 +181,7 @@ class SimpleARTrainer:
     
     def ddp_wrap(self):
         if self.world_size > 1:
-            self.simple_var = DDP(self.simple_var, device_ids=[self.rank])
+            self.simple_var = DDP(self.simple_var, device_ids=[self.rank], find_unused_parameters=self.find_unused_parameters)
             # self.sampler = DistributedSampler(self.train_set)
             # self.val_sampler = DistributedSampler(self.val_set)
             self.sampler = ShardedDistributedSampler(self.train_set, rank=self.rank, world_size=self.world_size, shard_size=1024)
@@ -275,7 +278,10 @@ class SimpleARTrainer:
     
     @torch.no_grad()
     def eval(self, num_iters: int, global_step: int = 0):
-        if num_iters <= 0 or num_iters > len(self.val_dataloader):
+        if num_iters < 0:
+            print(f'num_iters={num_iters}, skip val')
+            return
+        if num_iters == 0 or num_iters > len(self.val_dataloader):
             num_iters = len(self.val_dataloader)
         self.simple_var.eval()
 
@@ -398,6 +404,7 @@ if __name__ == "__main__":
     parser.add_argument('--vqvae_checkpoint', type=str, default='out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth')
     parser.add_argument('--use_sam_pe', action='store_true')
     parser.add_argument('--prompt_encoder_checkpoint', type=str, default=None)
+    parser.add_argument('--disable_find_unused_parameters', action='store_true')
     # image embedding caching
     parser.add_argument('--image_feature_cache_dir', type=str, default="")
     # dtype
@@ -514,7 +521,8 @@ if __name__ == "__main__":
         dtype=dtype,
         dataloader_workers=args.dl_workers,
         prefetch_factor=args.prefetch_factor,
-        shuffle_dataloader=(not args.use_dummy_dataset_for_debug)
+        shuffle_dataloader=(not args.use_dummy_dataset_for_debug),
+        find_unused_parameters=(not args.disable_find_unused_parameters),
     )
 
     outer_iters = args.outer_iters

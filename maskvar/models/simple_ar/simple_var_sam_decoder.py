@@ -104,6 +104,7 @@ class SimpleVARSamDecoder(nn.Module):
         
         self.linear = nn.Linear(self.vqvae_dim, self.dim)
         # self.norm = nn.LayerNorm(self.dim)
+        self.final_proj = nn.Linear(self.dim, self.dim)
 
     def calc_embed_to_add(self):
         """
@@ -338,6 +339,8 @@ class SimpleVARSamDecoder(nn.Module):
             mask_tokens_pe=mask_tokens_pe,
             self_attn_mask=block_mask,
         )
+
+        qm = self.final_proj(qm)
 
         # 我们只需要mask tokens的输出（qm），而不是query tokens（qs）
         # qm包含了处理后的mask tokens
