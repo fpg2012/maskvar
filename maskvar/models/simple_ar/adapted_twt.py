@@ -90,8 +90,8 @@ class AdaptedTwoWayTransformer(nn.Module):
         Forward pass of the AdaptedTwoWayTransformer.
 
         Args:
-          image_embedding: (B, C, H, W) Image features to attend to
-          image_pe: (B, C, H, W) Positional encoding for image features
+          image_embedding: (B, HW, C) Image features to attend to
+          image_pe: (B, HW, C) Positional encoding for image features (! same shape to image embedding)
           point_embedding: (B, Lqs, C) Query tokens (IOU, mask, SOS, prompt tokens)
           mask_tokens: (B, Lqm, C) Mask tokens for autoregressive prediction (including mask token)
           mask_tokens_pe: (B, Lqm, C) Positional encoding for mask tokens
@@ -103,8 +103,9 @@ class AdaptedTwoWayTransformer(nn.Module):
           keys: (B, H*W, C) Processed image tokens
           qm: (B, Lqm, C) Processed mask tokens (for autoregressive prediction)
         """
-        # BxCxHxW -> BxHWxC == B x N_image_tokens x C
-        bs, c, h, w = image_embedding.shape
+        # # BxCxHxW -> BxHWxC == B x N_image_tokens x C
+        # bs, c, h, w = image_embedding.shape
+        # bs, hw, c = image_embedding.shape
 
         # print('AdaptedTwoWayTransformer, image_embedding.shape', image_embedding.shape)
         # print('AdaptedTwoWayTransformer, image_pe.shape', image_pe.shape)
@@ -117,8 +118,8 @@ class AdaptedTwoWayTransformer(nn.Module):
 
         # Prepare queries
         queries = point_embedding
-        keys = rearrange(image_embedding, 'b c h w -> b (h w) c')
-        key_pe = image_pe
+        keys = image_embedding
+        key_pe = image_pe  # Already in (B, HW, C) format
 
         # print("point_embedding.shape", point_embedding.shape)
         # print("mask_tokens_pe.shape", mask_tokens_pe.shape)
@@ -212,12 +213,12 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
         Args:
             queries: (B, Lqs, C) Query tokens (IOU, mask, SOS, prompt tokens)
-            keys: (B, Lk, C) Image tokens (flattened image features)
-            query_mask_pe: (B, Lqs+Lqm, C) Positional encoding for queries + mask tokens
-            key_pe: (B, Lk, C) Positional encoding for image tokens
             ar_queries: (B, Lqm, C) Mask tokens for autoregressive prediction
-            self_attn_block_mask: Optional mask for self-attention (queries ↔ queries)
-            mask_to_image_cross_attn_block_mask: Optional mask for cross-attention (queries → keys)
+            keys: (B, Lk, C) Image tokens (flattened image features)
+            query_pe: (B, Lqs, C) same shape to queries
+            mask_pe: (B, Lqm, C) same shape to mask tokens
+            key_pe: (B, Lk, C) Positional encoding for image tokens, same shape to keys
+            self_attn_mask: Optional mask for self-attention (queries ↔ queries)
 
         Returns:
             qs: (B, Lqs, C) Updated query tokens
@@ -230,6 +231,7 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
         # Self attention block
         ## self-attn among queries (iou token, output tokens, prompt tokens)
+        ## no attn-mask required in here
         if self.skip_first_layer_pe:
             queries = self.self_attn(
                 q=queries, k=queries, v=queries,
@@ -246,10 +248,10 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
         ## self-attn among mask tokens
         ## require markovian attn mask or causal attn mask when training
-        # print('ar_queries.shape', ar_queries.shape)
-        # print('block mask is None: ', self_attn_mask is None)
-        # print('mask_pe.shape', mask_pe.shape)
-        qm_0 = ar_queries + mask_pe
+        if self.skip_first_layer_pe:
+            qm_0 = ar_queries
+        else:
+            qm_0 = ar_queries + mask_pe
         attn_out_qm0 = self.self_attn(
             q=qm_0, k=qm_0, v=ar_queries,
             block_mask=self_attn_mask
@@ -262,10 +264,6 @@ class AdaptedTwoWayAttentionBlock(nn.Module):
 
         # Cross attention block, tokens attending to image embedding
         # no need for block mask in principle
-        # print('full_queries.shape', full_queries.shape)
-        # print('query_mask_pe.shape', query_mask_pe.shape)
-        # print('keys.shape', keys.shape)
-        # print('key_pe.shape', key_pe.shape)
         q = full_queries + query_mask_pe
         k = keys + key_pe
         attn_out = self.cross_attn_token_to_image(

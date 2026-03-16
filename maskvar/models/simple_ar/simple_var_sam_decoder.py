@@ -246,9 +246,10 @@ class SimpleVARSamDecoder(nn.Module):
         feat_down = rearrange(feat_down, 'B C h w -> B (h w) C')
 
         # add the last scale's pos emb and level emb
-        feats = feat_down + pos_embed_to_add[:, -h_target*w_target:] + level_embed_to_add[:, -h_target*w_target:]
+        image_pe = pos_embed_to_add[:, -h_target*w_target:] + level_embed_to_add[:, -h_target*w_target:]
+        feats = feat_down
 
-        return feats
+        return feats, image_pe
     
     def forward(self, idx, image_feat: torch.Tensor, vqvae: VQVAE_Single, epsilon=0.001):
         """
@@ -276,11 +277,12 @@ class SimpleVARSamDecoder(nn.Module):
                 x = x + noise
 
         x = self.preprocess(x)
-        image_tokens = self.preprocess_image_feat(image_feat)
+        image_tokens, image_pe = self.preprocess_image_feat(image_feat)
 
         logits = self.block_forward(
             x=x,
             image_tokens=image_tokens,
+            image_pe=image_pe,
             block_mask=self.block_mask
         )
         return logits
@@ -288,6 +290,7 @@ class SimpleVARSamDecoder(nn.Module):
     def block_forward(self,
         x: torch.Tensor,
         image_tokens: torch.Tensor,
+        image_pe: torch.Tensor,
         prompt_tokens=None,
         block_mask=None
     ):
@@ -299,6 +302,7 @@ class SimpleVARSamDecoder(nn.Module):
         Args:
             x: (B, L, C) - input tokens (SOS + mask tokens) after preprocessing
             image_tokens: (B, Li, C) - image features from SAM encoder
+            image_pe: (B, Li, C) - image positional embeddings
             prompt_tokens: (B, Lp, C) - optional prompt tokens (points, boxes)
             block_mask: attention mask for controlling token visibility
 
@@ -321,12 +325,12 @@ class SimpleVARSamDecoder(nn.Module):
         # # mask_tokens_pe 是位置编码和层级编码的和
         # mask_tokens_pe = pos_embed_to_add + level_embed_to_add
 
-        pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
-        mask_tokens_pe = pos_embed_to_add + level_embed_to_add
         _, Lqm, _ = x.shape
         _, Li, _ = image_tokens.shape
+        
+        pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
+        mask_tokens_pe = pos_embed_to_add + level_embed_to_add
         mask_tokens_pe = mask_tokens_pe[:, :Lqm, :]
-        image_pe = pos_embed_to_add[:, -Li:, :]
 
         # 调用AdaptedMaskDecoder
         # x作为mask_tokens传入，image_pe只需要位置编码部分

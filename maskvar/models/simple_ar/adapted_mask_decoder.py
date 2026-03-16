@@ -99,7 +99,7 @@ class AdaptedMaskDecoder(nn.Module):
           dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
           mask_tokens: (B, L, C) - mask tokens for autoregressive prediction
           mask_tokens_pe: (B, L, C) - positional encoding for mask tokens
-          block_mask: attention mask for controlling token visibility
+          self_attn_mask: attention mask for controlling token visibility
 
         Returns:
           torch.Tensor: query tokens (qs) - processed query tokens (iou, mask, prompt)
@@ -135,7 +135,7 @@ class AdaptedMaskDecoder(nn.Module):
             dense_prompt_embeddings: (B, C, H, W) dense prompt embeddings (mask inputs)
             mask_tokens: (B, L, C) mask tokens for autoregressive prediction
             mask_tokens_pe: (1, L, C) positional encoding for mask tokens
-            block_mask: attention mask for controlling token visibility
+            self_attn_mask: attention mask for controlling token visibility
 
         Returns:
             qs: (B, Lqs, C) processed query tokens (iou, mask, sos, prompt tokens)
@@ -161,7 +161,6 @@ class AdaptedMaskDecoder(nn.Module):
         # pos_src = torch.repeat_interleave(image_pe, qs_tokens.shape[0], dim=0)
         # print('image_embeddings.shape', image_embeddings.shape)
         b, hw, c = image_embeddings.shape
-        image_embeddings = rearrange(image_embeddings, 'b (h w) c -> b c h w', h=int(hw**0.5), w=int(hw**0.5))
 
         # Run the transformer
         qs, src, qm = self.transformer(
