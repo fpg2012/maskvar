@@ -46,7 +46,9 @@ class SimpleVARSamDecoder(nn.Module):
                  num_heads=4,
                  vqvae_dim=256,
                  use_sam_pe=False,
-                 sam_pe=None
+                 sam_pe=None,
+                 linear_input_mapping=True,
+                 linear_output_mapping=True,
                  ):
         """
         Initialize the SimpleVARSamDecoder.
@@ -103,8 +105,25 @@ class SimpleVARSamDecoder(nn.Module):
         self.level_map_tensor = torch.tensor(self.level_map, device=self.device, dtype=torch.long)
         
         self.linear = nn.Linear(self.vqvae_dim, self.dim)
+        if linear_input_mapping:
+            self.input_map = self.linear
+        else:
+            self.input_map = nn.Sequential(
+                nn.Linear(self.vqvae_dim, self.vqvae_dim * 4),
+                nn.GELU(),
+                nn.Linear(self.vqvae_dim * 4, self.dim)
+            )
         # self.norm = nn.LayerNorm(self.dim)
         self.final_proj = nn.Linear(self.dim, self.dim)
+    
+        if linear_output_mapping:
+            self.output_map = self.final_proj
+        else:
+            self.output_map = nn.Sequential(
+                nn.Linear(self.dim, self.dim * 4),
+                nn.GELU(),
+                nn.Linear(self.dim * 4, self.dim)
+            )
 
     def calc_embed_to_add(self):
         """
@@ -197,7 +216,8 @@ class SimpleVARSamDecoder(nn.Module):
         pos_embed_to_add, level_embed_to_add = self.calc_embed_to_add()
         
         # map x using linear
-        x = self.linear(x)
+        # x = self.linear(x)
+        x = self.input_map(x)
         # x = self.norm(x)
 
         sos = repeat(self.sos, 'c -> b 1 c', b=B)
@@ -344,7 +364,8 @@ class SimpleVARSamDecoder(nn.Module):
             self_attn_mask=block_mask,
         )
 
-        qm = self.final_proj(qm)
+        # qm = self.final_proj(qm)
+        qm = self.output_map(qm)
 
         # 我们只需要mask tokens的输出（qm），而不是query tokens（qs）
         # qm包含了处理后的mask tokens
@@ -406,3 +427,110 @@ class SimpleVARSamDecoder(nn.Module):
 # @torch.no_grad()
 # def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single):
 #     pass
+
+@torch.no_grad()
+def simple_var_sd_inference(image_feat: torch.Tensor, simple_var: SimpleVARSamDecoder, vqvae: VQVAE_Single):
+    """
+    Autoregressive inference using top-k/top-p sampling
+
+    image_feat: (B, C, H, W) image features from SAM
+    
+    Returns: sampled token sequences of shape (B, l)
+    """
+    B = image_feat.shape[0]
+    H = W = simple_var.patch_num[-1]
+    C = simple_var.vqvae_dim
+
+    image_tokens, image_pe = simple_var.preprocess_image_feat(image_feat)
+
+    pos_embed_to_add, level_embed_to_add = simple_var.calc_embed_to_add() # (1, L, C), (1, L, C)
+
+    id_seq = []
+    current_token = repeat(
+        rearrange(simple_var.sos, 'c -> 1 1 c'), 
+        '1 1 c -> b 1 c',
+        b=B
+    ) # (B, 1, C)
+    start_pos = 0
+
+    f_hat = torch.zeros(B, C, H, W, dtype=torch.float, device=simple_var.device)
+
+    for scale, pn in enumerate(simple_var.patch_num):
+        # add pos and level embeddings
+        end_pos = start_pos + pn * pn
+
+        pos_embed = pos_embed_to_add[:, start_pos:end_pos]
+        level_embed = level_embed_to_add[:, start_pos:end_pos]
+        current_token = current_token + pos_embed + level_embed
+
+        # Forward pass to get logits. No need for block masking during inference
+        logits = simple_var.block_forward(
+            x=current_token,
+            image_tokens=image_tokens,
+            image_pe=image_pe,
+            block_mask=None
+        ) # (B, pn*pn, vocab_size)
+        # Sample next token
+        logits_flat = rearrange(logits, 'b l v -> (b l) v')
+        next_tokens = simple_var.sample_with_top_k_(logits_flat, top_k=1)
+        next_tokens = rearrange(next_tokens, '(b l) 1 -> b l', b=B, l=pn*pn)
+
+        # Append prediction to sequence
+        id_seq.append(next_tokens)
+
+        if scale < len(simple_var.patch_num) - 1:
+            # Convert prediction to feature for next step
+            h = rearrange(vqvae.quantize.embedding(next_tokens), 'B (h w) C -> B C h w', h=pn, w=pn) # B, C, pn, pn
+            h_up = F.interpolate(h, size=(H, W), mode='bicubic')
+            
+            # Update f_hat for next iteration
+            t = scale / (len(simple_var.patch_num) - 1)
+            f_hat.add_(vqvae.quantize.quant_resi[t](h_up))
+
+            pn_next = simple_var.patch_num[scale + 1]
+
+            f_hat_down = F.interpolate(f_hat, size=(pn_next, pn_next), mode='area')
+            current_token = rearrange(f_hat_down, 'B C h w -> B (h w) C')
+            # linear projection
+            current_token = simple_var.linear(current_token)
+            # current_token = simple_var.norm(current_token)
+        
+        start_pos = end_pos
+        
+    return id_seq
+
+# def simple_var_sd_train_pass(simple_var, idx, image_feat: torch.Tensor, vqvae: VQVAE_Single, epsilon=0.001):
+#     """
+#     Training pass for SimpleVAR model.
+
+#     1. Convert discrete codes to VQVAE input format
+#     2. Preprocess input for SimpleVAR
+#     3. Forward pass with block mask
+    
+#     Args:
+#         idx: List of (B, l) - Input discrete codes from VQVAE
+#         image_feat: (B, C, H, W) - Image features from SAM
+#         simple_var: SimpleVAR model instance
+#         vqvae: VQVAE model instance
+
+#     Returns: logits (B, l, vocab_size)
+#     """
+#     assert self.block_mask is not None, "Block mask must be initialized before training"
+#     with torch.no_grad():
+#         x = vqvae.quantize.idxBl_to_var_input(idx)
+#         # add noise
+#         if epsilon > 0:
+#             # Add random noise to the input
+#             noise = torch.randn_like(x) * epsilon
+#             x = x + noise
+
+#     x = self.preprocess(x)
+#     image_tokens, image_pe = self.preprocess_image_feat(image_feat)
+
+#     logits = self.block_forward(
+#         x=x,
+#         image_tokens=image_tokens,
+#         image_pe=image_pe,
+#         block_mask=self.block_mask
+#     )
+#     return logits
