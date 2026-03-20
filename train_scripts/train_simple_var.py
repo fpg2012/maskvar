@@ -188,8 +188,8 @@ class SimpleARTrainer:
             self.val_sampler = DistributedSampler(self.val_set)
 
     def train_step(self, inner_iter_count, image, image_embed_sam, single_mask_normalized, single_mask):
-        image_embed_sam = image_embed_sam.to(self.device)
-        single_mask_normalized = single_mask_normalized.to(self.device)
+        image_embed_sam = image_embed_sam.to(self.device, non_blocking=True)
+        single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
 
         gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
         gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
@@ -285,10 +285,9 @@ class SimpleARTrainer:
             num_iters = len(self.val_dataloader)
         self.simple_var.eval()
 
-        total_loss = torch.tensor(0.0).to(self.device)
-        total_acc_mean = torch.tensor(0.0).to(self.device)
-        total_acc_sos = torch.tensor(0.0).to(self.device)
-        
+        total_loss = torch.tensor(0.0, device=self.device)
+        total_acc_mean = torch.tensor(0.0, device=self.device)
+        total_acc_sos = torch.tensor(0.0, device=self.device)
         if self.rank == 0:
             pbar = tqdm.tqdm(range(num_iters), desc="Val: ", total=num_iters)
         
@@ -298,8 +297,8 @@ class SimpleARTrainer:
 
             if i >= num_iters:
                 break
-            image_embed_sam = image_embed_sam.to(self.device)
-            single_mask_normalized = single_mask_normalized.to(self.device)
+            image_embed_sam = image_embed_sam.to(self.device, non_blocking=True)
+            single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
             
             gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
             gt_idx_flat = torch.cat(gt_idx, dim=1)
