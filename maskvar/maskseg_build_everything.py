@@ -765,7 +765,7 @@ def build_simple_ar(simple_ar_checkpoint_path: Optional[str] = None, device: str
 
     return simple_ar.to(device)
 
-def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu') -> SimpleVAR:
+def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu', enable_prompt_tokens: bool = False) -> SimpleVAR:
     simple_var = SimpleVAR(
         dim=256,
         depth=2,
@@ -776,6 +776,7 @@ def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, sam_pe: O
         vqvae_dim=32,
         use_sam_pe=(sam_pe is not None),
         sam_pe=sam_pe,
+        enable_prompt_tokens=enable_prompt_tokens,
     )
 
     if simple_var_checkpoint_path is not None:

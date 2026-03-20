@@ -112,23 +112,27 @@ class TransformerCrossBlock(nn.Module):
         return x
 
 class HybridBlock(nn.Module):
-    
-    def __init__(self, dim=256, num_heads=4):
+
+    def __init__(self, dim=256, num_heads=4, enable_prompt_tokens=False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
-        # self.fuse_prompt = TransformerCrossBlock(dim, num_heads)
+        self.enable_prompt_tokens = enable_prompt_tokens
+        if enable_prompt_tokens:
+            self.fuse_prompt = TransformerCrossBlock(dim, num_heads)
         self.fuse_image = TransformerCrossBlock(dim, num_heads)
         self.self_block = TransformerBlock(dim, num_heads)
-    
+
     def forward(self, x: torch.Tensor, image_tokens=None, prompt_tokens=None, block_mask=None):
         """
         x: [B, L, C]
         image_tokens: [B, Li, C]
-        prompt_tokens: [B, Lp, C]
+        prompt_tokens: [B, Lp, C] - sparse prompt embeddings from point clicks
         """
-
-        # x = self.fuse_prompt(x, prompt_tokens, block_mask=block_mask)
+        # Fuse prompt tokens if enabled and provided
+        if self.enable_prompt_tokens and prompt_tokens is not None:
+            x = self.fuse_prompt(x, prompt_tokens, block_mask=None)
+        # Fuse image tokens
         x = self.fuse_image(x, image_tokens, block_mask=None)
         x = x + self.self_block(x, block_mask=block_mask)
 

@@ -30,6 +30,7 @@ from maskvar.datasets import (
 from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset
 from maskvar.datasets.image_feature_cache import ImageFeatureCache
 from maskvar.datasets.sharded_distributed_sampler import ShardedDistributedSampler
+from maskvar.utils.clicker import init_clicks, to_sam_format
 
 
 torch.set_float32_matmul_precision('high')
@@ -68,11 +69,11 @@ def save_train_configuration(args, outdir: Path):
 class SimpleARTrainer:
 
     def __init__(
-        self, 
-        simple_var: SimpleVAR, 
-        vqvae: VQVAE_Single, 
+        self,
+        simple_var: SimpleVAR,
+        vqvae: VQVAE_Single,
         lr: float,
-        train_set: MaskLevelDataset, 
+        train_set: MaskLevelDataset,
         val_set: MaskLevelDataset,
         batch_size: int,
         accumulate_steps: int,
@@ -87,10 +88,12 @@ class SimpleARTrainer:
         prefetch_factor: int = 2,
         shuffle_dataloader: bool = True,
         find_unused_parameters: bool = True,
+        prompt_encoder=None,
     ):
         # models
         self.simple_var: SimpleVAR = simple_var
         self.vqvae: VQVAE_Single = vqvae
+        self.prompt_encoder = prompt_encoder
 
         # optimizer
         self.optimizer = torch.optim.AdamW(simple_var.parameters(), lr=lr)
@@ -187,9 +190,92 @@ class SimpleARTrainer:
             self.sampler = ShardedDistributedSampler(self.train_set, rank=self.rank, world_size=self.world_size, shard_size=1024)
             self.val_sampler = DistributedSampler(self.val_set)
 
+    def get_clicks_in_batch(self, single_mask, num_clicks=2):
+        """
+        Generate initial clicks for each sample in the batch.
+
+        Args:
+            single_mask: (B, 1, H, W) torch tensor, 0-1 binary masks
+            num_clicks: number of initial clicks to generate per sample
+
+        Returns:
+            List[List[Tuple[int, int, int]]]: List of click lists, one per sample.
+                Each click is (y, x, label) where label=1 for positive click.
+        """
+        # Convert to numpy and squeeze channel dimension: (B, 1, H, W) -> (B, H, W)
+        masks_np = single_mask.squeeze(1).cpu().numpy()
+
+        batch_clicks = []
+        for mask in masks_np:
+            # Generate num_clicks initial positive clicks
+            click_list, _, _ = init_clicks(
+                gt_mask=mask,
+                num_random_clicks=num_clicks,
+                random_sample=True
+            )
+            batch_clicks.append(click_list)
+
+        return batch_clicks
+    
+    def clicks_to_prompt_embedding(self, batch_clicks):
+        """
+        Convert batch of clicks to SAM prompt embeddings.
+
+        Args:
+            batch_clicks: List[List[Tuple[int, int, int]]], clicks for each sample in batch
+                         Each click is (y, x, label) where label=1 for positive, 0 for negative
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (sparse_embeddings, dense_embeddings)
+                - sparse_embeddings: (B, N, embed_dim) - point and box embeddings
+                - dense_embeddings: (B, embed_dim, H, W) - mask embeddings (no mask used here)
+        """
+        if self.prompt_encoder is None:
+            raise ValueError("prompt_encoder is not initialized. Please pass prompt_encoder to SimpleARTrainer.")
+
+        batch_size = len(batch_clicks)
+        all_coords = []
+        all_labels = []
+
+        # Find max number of clicks in batch for padding
+        max_clicks = max(len(clicks) for clicks in batch_clicks)
+
+        for clicks in batch_clicks:
+            # Convert clicks to SAM format using to_sam_format from clicker.py
+            coords, labels = to_sam_format(clicks, pad_size=max_clicks, device=self.device)
+            all_coords.append(coords)
+            all_labels.append(labels)
+
+        # Stack to batch tensors: (B, N, 2) and (B, N)
+        coords_batch = torch.stack(all_coords, dim=0)  # (B, N, 2)
+        labels_batch = torch.stack(all_labels, dim=0)  # (B, N)
+
+        # Pass through SAM prompt encoder
+        with torch.no_grad():
+            sparse_embeddings, dense_embeddings = self.prompt_encoder(
+                points=(coords_batch, labels_batch),
+                boxes=None,
+                masks=None
+            )
+
+        return sparse_embeddings, dense_embeddings
+
     def train_step(self, inner_iter_count, image, image_embed_sam, single_mask_normalized, single_mask):
         image_embed_sam = image_embed_sam.to(self.device, non_blocking=True)
         single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
+
+        # Generate initial clicks from ground truth masks (on CPU)
+        batch_clicks = self.get_clicks_in_batch(single_mask, num_clicks=2)
+
+        # Convert clicks to SAM prompt embeddings (if prompt_encoder is available)
+        if self.prompt_encoder is not None:
+            sparse_embeddings, dense_embeddings = self.clicks_to_prompt_embedding(batch_clicks)
+            # TODO: Use prompt embeddings in the model
+            # sparse_embeddings: (B, N, 256) - point embeddings
+            # dense_embeddings: (B, 256, 32, 32) - dense positional encoding
+        else:
+            sparse_embeddings = None
+            dense_embeddings = None
 
         gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
         gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
@@ -199,7 +285,8 @@ class SimpleARTrainer:
             logits = self.simple_var(
                 idx=gt_idx,
                 image_feat=image_embed_sam,
-                vqvae=self.vqvae
+                vqvae=self.vqvae,
+                sparse_embeddings=sparse_embeddings
             )
 
             acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
@@ -403,6 +490,7 @@ if __name__ == "__main__":
     parser.add_argument('--vqvae_checkpoint', type=str, default='out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth')
     parser.add_argument('--use_sam_pe', action='store_true')
     parser.add_argument('--prompt_encoder_checkpoint', type=str, default=None)
+    parser.add_argument('--enable_clicks', action='store_true', help='Enable prompt encoder with click embeddings')
     parser.add_argument('--disable_find_unused_parameters', action='store_true')
     # image embedding caching
     parser.add_argument('--image_feature_cache_dir', type=str, default="")
@@ -490,12 +578,20 @@ if __name__ == "__main__":
     if args.use_sam_pe:
         prompt_encoder = builder_map['prompt_encoder'](args.prompt_encoder_checkpoint)
         sam_pe = prompt_encoder.get_dense_pe() # BCHW
-        del prompt_encoder
+        if args.enable_clicks:
+            prompt_encoder = prompt_encoder.to(device).eval()
+            for param in prompt_encoder.parameters():
+                param.requires_grad = False
+        else:
+            prompt_encoder = None
     else:
         sam_pe = None
+        prompt_encoder = None
+        if args.enable_clicks:
+            raise ValueError("--enable_clicks requires --use_sam_pe to be enabled")
 
     # simple_var = build_simple_var(simple_var_checkpoint_path=checkpoint_path, device=device)
-    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, sam_pe=sam_pe, device=device)
+    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, sam_pe=sam_pe, device=device, enable_prompt_tokens=args.enable_clicks)
     # vqvae = build_vqvae_single_5_stages_v1('out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth', require_grad=False)
     vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False).to(device)
 
@@ -522,6 +618,7 @@ if __name__ == "__main__":
         prefetch_factor=args.prefetch_factor,
         shuffle_dataloader=(not args.use_dummy_dataset_for_debug),
         find_unused_parameters=(not args.disable_find_unused_parameters),
+        prompt_encoder=prompt_encoder,
     )
 
     outer_iters = args.outer_iters

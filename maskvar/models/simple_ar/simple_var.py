@@ -12,22 +12,24 @@ class SimpleVAR(nn.Module):
     def __init__(self,
                  dim=256,
                  depth=2,
-                 vocab_size=4096, 
-                 device='cpu', 
-                 patch_num=[1, 4, 8, 16, 32], 
+                 vocab_size=4096,
+                 device='cpu',
+                 patch_num=[1, 4, 8, 16, 32],
                  num_heads=4,
                  vqvae_dim=256,
                  use_sam_pe=False,
-                 sam_pe=None
+                 sam_pe=None,
+                 enable_prompt_tokens=False,
                  ):
         super().__init__()
         self.patch_num = patch_num
+        self.enable_prompt_tokens = enable_prompt_tokens
         # self.blocks = nn.ModuleList([
         #     TransformerBlock(dim, num_heads=num_heads)
         #     for _ in range(depth)
         # ])
         self.blocks = nn.ModuleList([
-            HybridBlock(dim, num_heads=num_heads)
+            HybridBlock(dim, num_heads=num_heads, enable_prompt_tokens=enable_prompt_tokens)
             for _ in range(depth)
         ])
         self.vocab_size = vocab_size
@@ -158,18 +160,18 @@ class SimpleVAR(nn.Module):
 
         return feats
     
-    def forward(self, idx, image_feat: torch.Tensor, vqvae: VQVAE_Single, epsilon=0.001):
+    def forward(self, idx, image_feat: torch.Tensor, vqvae: VQVAE_Single, sparse_embeddings=None, epsilon=0.001):
         """
         Training pass for SimpleVAR model.
 
         1. Convert discrete codes to VQVAE input format
         2. Preprocess input for SimpleVAR
         3. Forward pass with block mask
-        
+
         Args:
             idx: List of (B, l) - Input discrete codes from VQVAE
             image_feat: (B, C, H, W) - Image features from SAM
-            simple_var: SimpleVAR model instance
+            sparse_embeddings: (B, N, C) - Optional sparse prompt embeddings (e.g., from point clicks)
             vqvae: VQVAE model instance
 
         Returns: logits (B, l, vocab_size)
@@ -185,7 +187,7 @@ class SimpleVAR(nn.Module):
 
         x = self.preprocess(x)
         image_tokens = self.preprocess_image_feat(image_feat)
-        logits = self.block_forward(x, image_tokens=image_tokens, block_mask=self.block_mask)
+        logits = self.block_forward(x, image_tokens=image_tokens, prompt_tokens=sparse_embeddings, block_mask=self.block_mask)
         return logits
 
     def block_forward(self, x: torch.Tensor, image_tokens: torch.Tensor, prompt_tokens=None, block_mask=None):
@@ -250,19 +252,20 @@ class SimpleVAR(nn.Module):
         return next_token
 
 
-def simple_var_train_pass(idx, image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single, epsilon=0.001):
+def simple_var_train_pass(idx, image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single, sparse_embeddings=None, epsilon=0.001):
     """
     Training pass for SimpleVAR model.
 
     1. Convert discrete codes to VQVAE input format
     2. Preprocess input for SimpleVAR
     3. Forward pass with block mask
-    
+
     Args:
         idx: List of (B, l) - Input discrete codes from VQVAE
         image_feat: (B, C, H, W) - Image features from SAM
         simple_var: SimpleVAR model instance
         vqvae: VQVAE model instance
+        sparse_embeddings: (B, N, C) - Optional sparse prompt embeddings (e.g., from point clicks)
 
     Returns: logits (B, l, vocab_size)
     """
@@ -277,16 +280,20 @@ def simple_var_train_pass(idx, image_feat: torch.Tensor, simple_var: SimpleVAR, 
 
     x = simple_var.preprocess(x)
     image_tokens = simple_var.preprocess_image_feat(image_feat)
-    logits = simple_var.block_forward(x, image_tokens=image_tokens, block_mask=simple_var.block_mask)
+    logits = simple_var.block_forward(x, image_tokens=image_tokens, prompt_tokens=sparse_embeddings, block_mask=simple_var.block_mask)
     return logits
 
 @torch.no_grad()
-def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single):
+def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae: VQVAE_Single, sparse_embeddings=None):
     """
     Autoregressive inference using top-k/top-p sampling
 
-    image_feat: (B, C, H, W) image features from SAM
-    
+    Args:
+        image_feat: (B, C, H, W) image features from SAM
+        simple_var: SimpleVAR model instance
+        vqvae: VQVAE model instance
+        sparse_embeddings: (B, N, C) - Optional sparse prompt embeddings (e.g., from point clicks)
+
     Returns: sampled token sequences of shape (B, l)
     """
     B = image_feat.shape[0]
@@ -316,7 +323,7 @@ def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae:
         current_token = current_token + pos_embed + level_embed
 
         # Forward pass to get logits. No need for block masking during inference
-        logits = simple_var.block_forward(current_token, image_tokens=image_tokens, block_mask=None) # (B, pn*pn, vocab_size)
+        logits = simple_var.block_forward(current_token, image_tokens=image_tokens, prompt_tokens=sparse_embeddings, block_mask=None) # (B, pn*pn, vocab_size)
         # Sample next token
         logits_flat = rearrange(logits, 'b l v -> (b l) v')
         next_tokens = simple_var.sample_with_top_k_(logits_flat, top_k=1)
