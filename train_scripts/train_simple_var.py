@@ -237,8 +237,8 @@ class SimpleARTrainer:
         all_coords = []
         all_labels = []
 
-        # Find max number of clicks in batch for padding
-        max_clicks = max(len(clicks) for clicks in batch_clicks)
+        # Find max number of clicks in batch for padding, ensure at least 4
+        max_clicks = max(max(len(clicks) for clicks in batch_clicks), 4)
 
         for clicks in batch_clicks:
             # Convert clicks to SAM format using to_sam_format from clicker.py

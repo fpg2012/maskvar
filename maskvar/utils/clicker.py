@@ -13,9 +13,21 @@ def init_clicks(gt_mask, num_random_clicks=1, not_clicked_map=None, random_sampl
     num_random_clicks:  number of init clicks
     not_clicked_map:    1 means not clicked, 0 mean clicked. used to avoid duplicate click. np.ndarray of shape [H, W]
     random_sample:      whether sample from the probability map. num_random_clicks must be 1 if random_sample set to False
+
+    Returns:
+        Tuple[List[Tuple[int, int, int]], np.ndarray, np.ndarray]: (click_list, eroded_mask, dt)
+        Returns empty list if gt_mask is empty.
     """
     assert random_sample or (not random_sample and num_random_clicks == 1), \
         f"num_random_clicks must be 1 if random_sample set to False, got {num_random_clicks}"
+
+    # Check if mask is empty (all zeros)
+    if gt_mask.sum() == 0:
+        # Return empty click list and dummy arrays for eroded_mask and dt
+        empty_mask = np.zeros_like(gt_mask, dtype=np.uint8)
+        empty_dt = np.zeros_like(gt_mask, dtype=np.float32)
+        return [], empty_mask, empty_dt
+
     click_list = []
     if not_clicked_map is None:
         not_clicked_map = np.ones_like(gt_mask, dtype=bool)

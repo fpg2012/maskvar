@@ -271,7 +271,7 @@ class SimpleVARSamDecoder(nn.Module):
 
         return feats, image_pe
     
-    def forward(self, idx, image_feat: torch.Tensor, vqvae: VQVAE_Single, epsilon=0.001):
+    def forward(self, idx, image_feat: torch.Tensor, vqvae: VQVAE_Single, sparse_embeddings=None, epsilon=0.001):
         """
         Training pass for SimpleVAR model.
 
@@ -303,6 +303,7 @@ class SimpleVARSamDecoder(nn.Module):
             x=x,
             image_tokens=image_tokens,
             image_pe=image_pe,
+            prompt_tokens=sparse_embeddings,
             block_mask=self.block_mask
         )
         return logits
@@ -429,7 +430,7 @@ class SimpleVARSamDecoder(nn.Module):
 #     pass
 
 @torch.no_grad()
-def simple_var_sd_inference(image_feat: torch.Tensor, simple_var: SimpleVARSamDecoder, vqvae: VQVAE_Single):
+def simple_var_sd_inference(image_feat: torch.Tensor, simple_var: SimpleVARSamDecoder, vqvae: VQVAE_Single, sparse_embeddings=None):
     """
     Autoregressive inference using top-k/top-p sampling
 
@@ -468,6 +469,7 @@ def simple_var_sd_inference(image_feat: torch.Tensor, simple_var: SimpleVARSamDe
             x=current_token,
             image_tokens=image_tokens,
             image_pe=image_pe,
+            prompt_tokens=sparse_embeddings,
             block_mask=None
         ) # (B, pn*pn, vocab_size)
         # Sample next token

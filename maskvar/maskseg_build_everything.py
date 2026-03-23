@@ -794,7 +794,10 @@ def build_simple_var(simple_var_checkpoint_path: Optional[str] = None, sam_pe: O
 
     return simple_var.to(device)
 
-def build_simple_var_sam_decoder(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu') -> SimpleVARSamDecoder:
+def build_simple_var_sam_decoder(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu', enable_prompt_tokens: bool = False) -> SimpleVARSamDecoder:
+    # NOTE: enable_prompt_tokens is kept for interface compatibility with build_simple_var.
+    # SimpleVARSamDecoder inherently supports prompt tokens via AdaptedMaskDecoder,
+    # so this parameter is not used in the function body.
     adapted_2way_transformer = AdaptedTwoWayTransformer(
         depth=2,
         embedding_dim=256,
@@ -835,7 +838,10 @@ def build_simple_var_sam_decoder(simple_var_checkpoint_path: Optional[str] = Non
 
     return simple_var.to(device)
 
-def build_simple_var_sam_decoder_mlp_adapter(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu') -> SimpleVARSamDecoder:
+def build_simple_var_sam_decoder_mlp_adapter(simple_var_checkpoint_path: Optional[str] = None, sam_pe: Optional[torch.Tensor] = None, device: str = 'cpu', enable_prompt_tokens: bool = False) -> SimpleVARSamDecoder:
+    # NOTE: enable_prompt_tokens is kept for interface compatibility with build_simple_var.
+    # SimpleVARSamDecoder inherently supports prompt tokens via AdaptedMaskDecoder,
+    # so this parameter is not used in the function body.
     adapted_2way_transformer = AdaptedTwoWayTransformer(
         depth=2,
         embedding_dim=256,
