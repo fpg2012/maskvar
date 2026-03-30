@@ -477,7 +477,7 @@ if __name__ == "__main__":
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--resume_iters', type=int, default=0)
     # dataset
-    parser.add_argument('--dataset', choices=['hqseg44k', 'cocolvis'], type=str, default='hqseg44k')
+    parser.add_argument('--dataset', choices=['hqseg44k', 'cocolvis', 'coconut_hf'], type=str, default='hqseg44k')
     parser.add_argument('--use_dummy_dataset_for_debug', action='store_true')
     parser.add_argument('--dl_workers', type=int, default=4)
     parser.add_argument('--prefetch_factor', type=int, default=2)
@@ -534,7 +534,12 @@ if __name__ == "__main__":
         # sam_image_encoder = sam_image_encoder.to(device)
         # sam_image_encoder = torch.compile(sam_image_encoder)
 
-    dataset_dir = 'data/sam-hq' if args.dataset == 'hqseg44k' else 'data/coco_lvis'
+    dataset_dir_map = {
+        "hqseg44k": "data/sam-hq",
+        "coco_lvis": "data/coco_lvis",
+        "coconut_hf": "data/coconut_hf",
+    }
+    dataset_dir = dataset_dir_map[args.dataset]
     index_mapping_path = f'data/flat/{args.dataset}'
     # train_set, val_set = build_hqseg44k_dataset('data/sam-hq') # validate on train set
     train_set, val_set = builder_map['dataset'][args.dataset](dataset_dir)
