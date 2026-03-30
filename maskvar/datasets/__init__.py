@@ -3,3 +3,4 @@ from .my_seg_dataset import MySegDataset
 from .coco_lvis import LvisDataset
 from .hqseg44k import HQSeg44KTrainDataset, HQSeg44KTestDataset
 from .coconut_hf import CoconutHFDataset, CoconutHFConverter
+from .coco_image_only import CocoImageOnlyDataset

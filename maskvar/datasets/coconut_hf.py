@@ -205,7 +205,8 @@ class CoconutHFDataset(MySegDataset):
 
         for i, inst_id in enumerate(unique_ids):
             # Extract binary mask for this instance
-            binary_mask = (panoptic_mask == inst_id).astype(np.uint8)
+            # Use uint16 to avoid overflow when mask_id > 255
+            binary_mask = (panoptic_mask == inst_id).astype(np.uint16)
 
             # Check if it's a thing (using isthing field from COCONut)
             seg_info = segment_map.get(int(inst_id), {})
@@ -228,7 +229,17 @@ class CoconutHFDataset(MySegDataset):
             image: (H, W, 3) numpy array (RGB)
             layers: (H, W, L) numpy array with instance masks
             instances_info: dict[int, InstanceInfo]
+            image_id: int, COCO image_id
         """
+        # Get image_id from image_info (same logic as _load_image)
+        row = self.df.iloc[index]
+        image_info = row['image_info']
+        if isinstance(image_info, dict):
+            file_name = image_info.get('file_name', '')
+            image_id = int(Path(file_name).stem)
+        else:
+            image_id = index
+
         # Load image and panoptic mask
         image = self._load_image(index)
         panoptic_mask = self._load_mask(index)
@@ -271,7 +282,7 @@ class CoconutHFDataset(MySegDataset):
             image = self.transform(image)
             layers = self.transform(layers)
 
-        return image, layers, instances_info
+        return image, layers, instances_info, image_id
 
 
 class CoconutHFConverter:

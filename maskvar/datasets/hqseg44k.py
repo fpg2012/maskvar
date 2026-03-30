@@ -99,8 +99,8 @@ class HQSeg44KTrainDataset(MySegDataset):
         }
         if self.transform:
             result = self.transform((img, mask, instances_info))
-            return result
-        return img, mask, instances_info  # 格式: (image, layers, instances_info)
+            return (*result, idx)  # 格式: (image, layers, instances_info, image_id)
+        return img, mask, instances_info, idx  # 格式: (image, layers, instances_info, image_id)
     
 class HQSeg44KTestDataset(MySegDataset):
     def __init__(self, data_root='datasets/sam-hq', transform=None, img_size=(256, 256)):
@@ -199,4 +199,4 @@ class HQSeg44KTestDataset(MySegDataset):
                 node_level=0      # 实例层级
             )
         }
-        return img, mask, instances_info  # 格式: (image, layers, instances_info)
+        return img, mask, instances_info, idx  # 格式: (image, layers, instances_info, image_id)

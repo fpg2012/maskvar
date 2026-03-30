@@ -13,6 +13,7 @@ class MySegDataset(torch.utils.data.Dataset):
     - image: (H, W, 3) numpy array (RGB)
     - layers: (H, W, L) numpy array with instance masks
     - instances_info: dict[int, InstanceInfo]
+    - image_id: int, unique identifier for the image (e.g., COCO image_id)
 
     Subclasses should define:
     - DEFAULT_NUM_MASKS_SPLITS: for distributed training
@@ -75,7 +76,7 @@ class MySegDataset(torch.utils.data.Dataset):
         """Returns the total number of samples in the dataset."""
         raise NotImplementedError("Subclasses must implement __len__")
 
-    def __getitem__(self, index: int) -> Tuple[np.ndarray, np.ndarray, Dict[int, InstanceInfo]]:
+    def __getitem__(self, index: int) -> Tuple[np.ndarray, np.ndarray, Dict[int, InstanceInfo], int]:
         """
         Get a sample from the dataset.
 
@@ -83,9 +84,10 @@ class MySegDataset(torch.utils.data.Dataset):
             index: Sample index
 
         Returns:
-            tuple: (image, layers, instances_info) where:
+            tuple: (image, layers, instances_info, image_id) where:
                 - image: (H, W, 3) numpy array (RGB)
                 - layers: (H, W, L) numpy array with instance masks
                 - instances_info: dict mapping instance IDs to InstanceInfo
+                - image_id: int, unique identifier for the image
         """
         raise NotImplementedError("Subclasses must implement __getitem__")

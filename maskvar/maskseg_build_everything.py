@@ -1013,7 +1013,7 @@ def build_hqseg44k_dataset(dataset_path='data/sam-hq') -> Tuple[HQSeg44KTrainDat
 
 
 def build_coconut_hf_dataset(
-    dataset_path='data/coconut',
+    dataset_path='data/coconut_hf',
     stuff_prob=1.0,
 ) -> Tuple[CoconutHFDataset, CoconutHFDataset]:
     """
@@ -1023,7 +1023,7 @@ def build_coconut_hf_dataset(
     For validation, we typically use a subset or separate val parquet.
     """
     trainset = CoconutHFDataset(
-        parquet_path=f"{dataset_path}/train",
+        parquet_path=f"{dataset_path}/train/",
         image_root=f"{dataset_path}/train2017",
         stuff_prob=stuff_prob,
     )
@@ -1031,7 +1031,7 @@ def build_coconut_hf_dataset(
     # For validation, use a subset of training data
     # In practice, you may want to use a separate val parquet file
     valset = CoconutHFDataset(
-        parquet_path=f"{dataset_path}/val",
+        parquet_path=f"{dataset_path}/val/",
         image_root=f"{dataset_path}/val2017",
         stuff_prob=stuff_prob,
     )

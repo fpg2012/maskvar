@@ -78,7 +78,7 @@ class MaskLevelDataset(IterableDataset):
             if i % world_size != rank:
                 continue
 
-            image, mask, instance_info = self.dataset[i]
+            image, mask, instance_info, image_id = self.dataset[i]
             image, image_embed_sam = self.preprocess_image(image, index=i)
             for instance_idx in instance_info.keys():
                 single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, instance_idx)

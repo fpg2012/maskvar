@@ -138,4 +138,4 @@ class LvisDataset(MySegDataset):
             image = self.transform(image)
             layers = self.transform(layers)
 
-        return image, layers, instances_info
+        return image, layers, instances_info, int(image_id)
