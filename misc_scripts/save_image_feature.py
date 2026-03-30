@@ -18,7 +18,7 @@ from maskvar.utils import preprocess_image
 torch.set_float32_matmul_precision('high')
 
 def my_collate_fn(batch, image_size_encoder, device, dtype):
-    return torch.stack([preprocess_image(image, image_size_encoder, device, dtype) for image, _, _ in batch])
+    return torch.stack([preprocess_image(image, image_size_encoder, device, dtype) for image, _, _, _ in batch])
 
 def cache_image_features_dry_run(dataset, image_encoder, image_size_encoder, dtype=torch.float32, batch_size=16, shard_size=512, device='cpu'):
     collate_fn = lambda batch: my_collate_fn(batch, image_size_encoder, device, dtype)
@@ -58,7 +58,7 @@ def cache_image_features(save_dir, dataset, image_encoder, image_size_encoder, d
             gc.collect()
             arr = []
             cur_shard_index += 1
-    
+
     if len(arr) > 0:
         np.save(save_dir / f"batch_{cur_shard_index:06d}.npy", np.concatenate(arr, axis=0))
         arr = []
