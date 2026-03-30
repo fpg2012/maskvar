@@ -21,9 +21,12 @@ from maskvar.maskseg_build_everything import (
 from maskvar.models.vqvae_single import VQVAE_Single
 from maskvar.models.simple_ar import (
     SimpleVAR,
+    SimpleVARSamDecoder,
     simple_var_train_pass,
     simple_var_inference,
+    simple_var_sd_inference,
 )
+from maskvar.utils.clicker import init_clicks, to_sam_format
 from maskvar.datasets import (
     MaskLevelDataset,
     MaskLevelDatasetDummy,
@@ -40,19 +43,25 @@ torch.set_float32_matmul_precision('high')
 class SimpleVAREvaluator:
 
     def __init__(
-        self, 
-        simple_var: SimpleVAR, 
+        self,
+        simple_var: SimpleVAR | SimpleVARSamDecoder,
         vqvae: VQVAE_Single,
-        val_set: MaskLevelDataset, 
-        batch_size: int, 
+        val_set: MaskLevelDataset,
+        batch_size: int,
         out_dir: Path,
         device: str,
         loss_weight_per_level=[1, 1, 1, 1, 1],
         dataset_name: str = "dataset",
+        prompt_encoder=None,
+        enable_clicks: bool = False,
+        model_type: str = "simple_var",
     ):
         # models
-        self.simple_var: SimpleVAR = simple_var
+        self.simple_var = simple_var
         self.vqvae: VQVAE_Single = vqvae
+        self.prompt_encoder = prompt_encoder
+        self.enable_clicks = enable_clicks
+        self.model_type = model_type
 
         # device
         self.device = device
@@ -60,7 +69,7 @@ class SimpleVAREvaluator:
         # dataset
         self.val_set = val_set
         self.batch_size = batch_size
-        
+
         # loss
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
 
@@ -120,11 +129,19 @@ class SimpleVAREvaluator:
             gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
             gt_idx_flat = torch.cat(gt_idx, dim=1)
 
-            logits = simple_var_train_pass(
+            # Generate clicks if enabled
+            if self.enable_clicks:
+                batch_clicks = self.get_clicks_in_batch(single_mask, num_clicks=2)
+                sparse_embeddings = self.clicks_to_prompt_embedding(batch_clicks)
+            else:
+                sparse_embeddings = None
+
+            # Use model's forward method directly (works for both simple_var and simple_var_sd)
+            logits = self.simple_var(
                 idx=gt_idx,
                 image_feat=image_embed_sam,
-                simple_var=self.simple_var, 
-                vqvae=self.vqvae
+                vqvae=self.vqvae,
+                sparse_embeddings=sparse_embeddings
             )
             
             acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
@@ -158,8 +175,16 @@ class SimpleVAREvaluator:
             batch_size=self.batch_size,
             shuffle=False,
             drop_last=True,
+            num_workers=4,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True
         )
-        
+
+        # Determine if we're using SimpleVARSamDecoder based on model_type
+        is_sd_model = self.model_type == 'simple_var_sd'
+        patch_num = self.simple_var.patch_num
+
         acc_means = []
         acc_soss = []
         ious = []
@@ -173,13 +198,28 @@ class SimpleVAREvaluator:
 
             image_embed_sam = image_embed_sam.to(self.device)
             single_mask_normalized = single_mask_normalized.to(self.device)
-            single_mask = single_mask.to(device)
+            single_mask = single_mask.to(self.device)
+
+            # Generate clicks if enabled
+            if self.enable_clicks:
+                batch_clicks = self.get_clicks_in_batch(single_mask, num_clicks=2)
+                sparse_embeddings = self.clicks_to_prompt_embedding(batch_clicks)
+            else:
+                sparse_embeddings = None
 
             gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
             gt_idx_flat = torch.cat(gt_idx, dim=1)
 
-            result = simple_var_inference(image_embed_sam, self.simple_var, self.vqvae)
-            
+            # Use appropriate inference function based on model type
+            if is_sd_model:
+                result = simple_var_sd_inference(
+                    image_embed_sam, self.simple_var, self.vqvae, sparse_embeddings
+                )
+            else:
+                result = simple_var_inference(
+                    image_embed_sam, self.simple_var, self.vqvae, sparse_embeddings
+                )
+
             flat_ids = torch.cat(result, dim=1)
             acc_mean = (flat_ids == gt_idx_flat).float().mean().item()
             acc_sos = (flat_ids[:, 1:] == gt_idx_flat[:, :-1]).float().mean().item()
@@ -187,12 +227,12 @@ class SimpleVAREvaluator:
             acc_means.append(acc_mean)
             acc_soss.append(acc_sos)
 
-            # pred with teacher input
-            logits = simple_var_train_pass(
+            # pred with teacher input - use model's forward method directly
+            logits = self.simple_var(
                 idx=gt_idx,
                 image_feat=image_embed_sam,
-                simple_var=self.simple_var, 
-                vqvae=self.vqvae
+                vqvae=self.vqvae,
+                sparse_embeddings=sparse_embeddings
             )
             acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
             acc_mean_teacher = acc.mean().item()
@@ -201,7 +241,7 @@ class SimpleVAREvaluator:
             id_seq_teach = logits.argmax(dim=-1)
             id_seq_teach_Bl = []
             start_pos = 0
-            for pn in simple_var.patch_num:
+            for pn in patch_num:
                 end_pos = start_pos + pn * pn
                 id_seq_teach_Bl.append(id_seq_teach[:, start_pos:end_pos])
                 start_pos = end_pos
@@ -212,11 +252,11 @@ class SimpleVAREvaluator:
 
             iou_batch = calc_iou(decoded_masks[-1], single_mask)
             ious.append(iou_batch.mean().item())
-            
+
             if visualize:
                 # executor.submit(self.visualize_batch, i, image, iou_batch, decoded_masks, decoded_masks_gt, decoded_masks_pred_with_teacher)
                 self.visualize_batch(i, image, iou_batch, decoded_masks, decoded_masks_gt, decoded_masks_pred_with_teacher)
-        
+
         print(f"Average IOU: {sum(ious)/len(ious):.4f}")
         print(f"Average accuracy (no teacher): {sum(acc_means)/len(acc_means):.4f}")
         print(f"Average accuracy (with teacher): {sum(acc_means_teacher)/len(acc_means_teacher):.4f}")
@@ -234,6 +274,45 @@ class SimpleVAREvaluator:
         result = self.vqvae.idxBl_to_img(indices, same_shape=True)
         return result
 
+    def get_clicks_in_batch(self, single_mask, num_clicks=2):
+        """Generate initial clicks for each sample in the batch."""
+        masks_np = single_mask.squeeze(1).cpu().numpy()
+        batch_clicks = []
+        for mask in masks_np:
+            click_list, _, _ = init_clicks(
+                gt_mask=mask,
+                num_random_clicks=num_clicks,
+                random_sample=True
+            )
+            batch_clicks.append(click_list)
+        return batch_clicks
+
+    def clicks_to_prompt_embedding(self, batch_clicks):
+        """Convert batch of clicks to SAM prompt embeddings."""
+        if self.prompt_encoder is None:
+            raise ValueError("prompt_encoder is not initialized.")
+
+        batch_size = len(batch_clicks)
+        all_coords = []
+        all_labels = []
+        max_clicks = max(max(len(clicks) for clicks in batch_clicks), 4)
+
+        for clicks in batch_clicks:
+            coords, labels = to_sam_format(clicks, pad_size=max_clicks, device=self.device)
+            all_coords.append(coords)
+            all_labels.append(labels)
+
+        coords_batch = torch.stack(all_coords, dim=0)
+        labels_batch = torch.stack(all_labels, dim=0)
+
+        with torch.no_grad():
+            sparse_embeddings, _ = self.prompt_encoder(
+                points=(coords_batch, labels_batch),
+                boxes=None,
+                masks=None
+            )
+        return sparse_embeddings
+
     def visualize_batch(self, step, image, iou_batch, decoded_masks, decoded_masks_gt, decoded_masks_pred_with_teacher):
         for j in range(self.batch_size):
             cur_iou = iou_batch[j].item()
@@ -241,7 +320,7 @@ class SimpleVAREvaluator:
             fig, ax = plt.subplots(1, 4, figsize=(15,4))
             ax[0].imshow(restore_normalized_image(image[j]).permute(1, 2, 0).cpu().numpy())
             ax[0].axis('off')
-            ax[0].set_title(f'Image {i*self.batch_size + j}, IOU: {cur_iou:.3f}')
+            ax[0].set_title(f'Image {step*self.batch_size + j}, IOU: {cur_iou:.3f}')
 
             result_gt = [m[j].unsqueeze(0) for m in decoded_masks_gt]
             result_mask_pred = [m[j].unsqueeze(0) for m in decoded_masks]
@@ -287,6 +366,8 @@ if __name__ == "__main__":
     parser.add_argument('--vqvae_checkpoint', type=str, default='out/out_vqvae_5_stages_v1/ckpt/vqvae_single_epoch_50.pth')
     # image cache dir
     parser.add_argument('--image_feature_cache_dir', type=str, default=None)
+    # clicks
+    parser.add_argument('--enable_clicks', action='store_true', help='Enable prompt encoder with click embeddings')
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -311,7 +392,7 @@ if __name__ == "__main__":
         device=device,
     )
 
-    train_set, val_set = builder_map['dataset'][args.dataset]('data/sam-hq') # validate on train set
+    train_set, val_set = builder_map['dataset'][args.dataset]() # validate on train set
 
     val_set_masklevel = MaskLevelFlatDataset(
         index_mapping_path=f'data/flat/{args.dataset}/{args.dataset_split}_index_mapping.npy',
@@ -332,12 +413,21 @@ if __name__ == "__main__":
 
     if args.use_sam_pe:
         prompt_encoder = builder_map['prompt_encoder'](args.image_encoder_checkpoint).to(args.device)
-        sam_pe = prompt_encoder.get_dense_pe().cpu() # BCHW
-        del prompt_encoder
+        sam_pe = prompt_encoder.get_dense_pe().cpu()  # BCHW
+        if args.enable_clicks:
+            prompt_encoder.eval()
+            for param in prompt_encoder.parameters():
+                param.requires_grad = False
+        else:
+            del prompt_encoder
+            prompt_encoder = None
     else:
         sam_pe = None
+        prompt_encoder = None
+        if args.enable_clicks:
+            raise ValueError("--enable_clicks requires --use_sam_pe to be enabled")
 
-    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, sam_pe=sam_pe, device=device)
+    simple_var = builder_map['simple_var'][args.simple_var](simple_var_checkpoint_path=checkpoint_path, sam_pe=sam_pe, device=device, enable_prompt_tokens=args.enable_clicks)
     vqvae = builder_map['vqvae'][args.vqvae](vqvae_checkpoint_path=args.vqvae_checkpoint, require_grad=False)
 
     trainer = SimpleVAREvaluator(
@@ -347,7 +437,10 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         device=device,
         out_dir=outdir,
-        dataset_name=f'{args.dataset}_{args.dataset_split}'
+        dataset_name=f'{args.dataset}_{args.dataset_split}',
+        prompt_encoder=prompt_encoder,
+        enable_clicks=args.enable_clicks,
+        model_type=args.simple_var,
     )
 
     trainer.eval_ar(args.val_iters, visualize=args.visualize)

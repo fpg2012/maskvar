@@ -4,7 +4,10 @@ from .simple_var import (
     simple_var_inference,
     simple_var_train_pass
 )
-from .simple_var_sam_decoder import SimpleVARSamDecoder
+from .simple_var_sam_decoder import (
+    SimpleVARSamDecoder,
+    simple_var_sd_inference,
+)
 from .common import (
     SimpleSelfAttention,
     TransformerBlock,
