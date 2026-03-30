@@ -10,9 +10,12 @@ import cv2
 
 
 from .instance_info import InstanceInfo
+from .my_seg_dataset import MySegDataset
 
-class HQSeg44KTrainDataset(torch.utils.data.Dataset):
+
+class HQSeg44KTrainDataset(MySegDataset):
     def __init__(self, data_root='datasets/sam-hq', transform=None, img_size=(256, 256)):
+        super().__init__()
         self.data_root = Path(data_root)
         self.transform = transform
         self.data_list = []
@@ -99,7 +102,7 @@ class HQSeg44KTrainDataset(torch.utils.data.Dataset):
             return result
         return img, mask, instances_info  # 格式: (image, layers, instances_info)
     
-class HQSeg44KTestDataset(torch.utils.data.Dataset):
+class HQSeg44KTestDataset(MySegDataset):
     def __init__(self, data_root='datasets/sam-hq', transform=None, img_size=(256, 256)):
         """
         初始化测试数据集。
@@ -108,6 +111,7 @@ class HQSeg44KTestDataset(torch.utils.data.Dataset):
             data_root (str): 数据根目录。
             transform (callable, optional): 数据预处理函数。
         """
+        super().__init__()
         self.data_root = Path(data_root)
         self.data_list = []
         

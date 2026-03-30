@@ -11,11 +11,13 @@ from typing import Optional, Iterator, Tuple
 
 from .coco_lvis import LvisDataset
 from .hqseg44k import HQSeg44KTrainDataset
+from .coconut_hf import CoconutHFDataset
+from .my_seg_dataset import MySegDataset
 from .image_feature_cache import ImageFeatureCache
 from ..utils import resize_longest_side
 from ..models.sam import ImageEncoderViT as SamImageEncoder
 
-def count_masks(dataset: LvisDataset | HQSeg44KTrainDataset, world_size=1, rank=0):
+def count_masks(dataset: MySegDataset, world_size=1, rank=0):
     count = 0
     if rank == 0:
         iters = tqdm(range(rank, len(dataset), world_size))
@@ -31,7 +33,7 @@ class MaskLevelDataset(IterableDataset):
 
     def __init__(
         self, 
-        dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
+        dataset: Optional[MySegDataset], 
         device: str, 
         with_image_embed=True,
         mask_filter_thresh=0.1,
@@ -160,7 +162,7 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
 
     def __init__(
         self, 
-        dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
+        dataset: Optional[MySegDataset], 
         device: str, 
         with_image_embed=True,
         mask_filter_thresh=0.1,
@@ -226,7 +228,7 @@ class MaskLevelDatasetRandom(MaskLevelDataset):
 
     def __init__(
         self, 
-        dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
+        dataset: Optional[MySegDataset], 
         device: str, 
         with_image_embed=True,
         mask_filter_thresh=0.1,
@@ -306,7 +308,7 @@ class MaskLevelFlatDataset(Dataset):
     def __init__(
         self, 
         index_mapping_path: Path,
-        dataset: Optional[LvisDataset | HQSeg44KTrainDataset], 
+        dataset: Optional[MySegDataset], 
         with_image_embed=True,
         mask_filter_thresh=0.1,
         dtype=torch.float32,

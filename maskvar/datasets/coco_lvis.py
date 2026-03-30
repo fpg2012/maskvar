@@ -7,9 +7,11 @@ import pickle
 import cv2
 from copy import deepcopy
 
+from .my_seg_dataset import MySegDataset
 from .instance_info import InstanceInfo
 
-class LvisDataset(torch.utils.data.Dataset):
+
+class LvisDataset(MySegDataset):
     def __init__(self, dataset_path, split='train', img_split='train2017', stuff_prob=0.0,
                  allow_list_name=None, anno_file='hannotation.pickle', transform=None):
         """
@@ -24,7 +26,7 @@ class LvisDataset(torch.utils.data.Dataset):
             anno_file (str): Annotation file name
             transform: Optional transform to be applied to images and masks
         """
-        super(LvisDataset, self).__init__()
+        super().__init__()
         self.dataset_path = Path(dataset_path)
         self._split_path = self.dataset_path / split
         self.img_split_path = self.dataset_path / img_split

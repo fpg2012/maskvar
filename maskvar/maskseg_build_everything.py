@@ -19,6 +19,7 @@ from .models.simple_ar.adapted_twt import AdaptedTwoWayTransformer
 from .datasets.mask_level_dataset import MaskLevelDataset
 from .datasets.coco_lvis import LvisDataset
 from .datasets.hqseg44k import HQSeg44KTestDataset, HQSeg44KTrainDataset
+from .datasets.coconut_hf import CoconutHFDataset
 
 
 # def build_maskseg(vqvae_checkpoint_path: Optional[str] = None, maskgit_checkpoint_path: Optional[str] = None, sam_checkpoint_path: Optional[str] = None) -> MaskSeg:
@@ -1010,6 +1011,34 @@ def build_hqseg44k_dataset(dataset_path='data/sam-hq') -> Tuple[HQSeg44KTrainDat
 
     return trainset, testset
 
+
+def build_coconut_hf_dataset(
+    dataset_path='data/coconut',
+    stuff_prob=1.0,
+) -> Tuple[CoconutHFDataset, CoconutHFDataset]:
+    """
+    Build COCONut HF dataset for training and validation.
+
+    Note: COCONut parquet files contain train split only.
+    For validation, we typically use a subset or separate val parquet.
+    """
+    trainset = CoconutHFDataset(
+        parquet_path=f"{dataset_path}/train",
+        image_root=f"{dataset_path}/train2017",
+        stuff_prob=stuff_prob,
+    )
+
+    # For validation, use a subset of training data
+    # In practice, you may want to use a separate val parquet file
+    valset = CoconutHFDataset(
+        parquet_path=f"{dataset_path}/val",
+        image_root=f"{dataset_path}/val2017",
+        stuff_prob=stuff_prob,
+    )
+
+    return trainset, valset
+
+
 builder_map = {
     "maskvar": {
         "maskvar": build_maskvar,
@@ -1044,5 +1073,6 @@ builder_map = {
     "dataset": {
         "cocolvis": build_cocolvis_dataset,
         "hqseg44k": build_hqseg44k_dataset,
+        "coconut_hf": build_coconut_hf_dataset,
     }
 }
