@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Test script to check how many masks in hqseg44k dataset cause NaN probabilities in init_clicks.
+Test script to check how many masks in dataset cause NaN probabilities in init_clicks.
+Uses MaskLevelFlatDataset to align with training script behavior.
 """
-import sys
-sys.path.insert(0, '/data/clc/maskseg')
-
 import numpy as np
 import cv2
 from pathlib import Path
 from tqdm import tqdm
 import argparse
+import torch
 
-from maskvar.datasets.hqseg44k import HQSeg44KTrainDataset
+from maskvar.maskseg_build_everything import builder_map
 from maskvar.utils.clicker import init_clicks
+from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset
 
 
 def check_mask_for_nan(mask, num_tests=10):
@@ -34,57 +34,77 @@ def check_mask_for_nan(mask, num_tests=10):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', type=str, default='data/sam-hq')
+    parser.add_argument('--dataset', type=str, default='hqseg44k')
     parser.add_argument('--output', type=str, default='click_nan_problems.txt')
     args = parser.parse_args()
 
-    print(f"Loading HQSeg-44K dataset from {args.data_root}...")
-    dataset = HQSeg44KTrainDataset(data_root=args.data_root)
-    print(f"Total images: {len(dataset)}")
+    print(f"Loading {args.dataset} dataset...")
+    train_set, val_set = builder_map["dataset"][args.dataset]()
+    print(f"Total images: {len(train_set)}")
+
+    # Setup dataset paths
+    dataset_dir_map = {
+        "hqseg44k": "data/sam-hq",
+        "coco_lvis": "data/coco_lvis",
+        "coconut_hf": "data/coconut_hf",
+    }
+    dataset_dir = dataset_dir_map.get(args.dataset, f"data/{args.dataset}")
+    index_mapping_path = f'data/flat/{args.dataset}'
+
+    # Create MaskLevelFlatDataset to match training behavior
+    # Note: with_image_embed=False since we only need masks for this test
+    print("Creating MaskLevelFlatDataset...")
+    train_set_masklevel = MaskLevelFlatDataset(
+        index_mapping_path=Path(index_mapping_path) / "train_index_mapping.npy",
+        dataset=train_set,
+        with_image_embed=False,
+        image_feature_cache=None,
+        mask_filter_thresh=0.1,
+        dtype=torch.float32,
+    )
+    print(f"Total masks in MaskLevelFlatDataset: {len(train_set_masklevel)}")
 
     problem_cases = []
     total_masks = 0
     nan_count = 0
     empty_click_count = 0
 
-    for img_idx in tqdm(range(len(dataset)), desc="Checking masks"):
-        image, mask, instance_info = dataset[img_idx]
+    for idx in tqdm(range(len(train_set_masklevel)), desc="Checking masks"):
+        _, _, _, single_mask = train_set_masklevel[idx]
+        total_masks += 1
 
-        for instance_idx in instance_info.keys():
-            total_masks += 1
+        # single_mask is a torch tensor (1, H, W), convert to numpy
+        single_mask_np = single_mask.squeeze(0).cpu().numpy()
 
-            # Extract single mask
-            single_mask = mask[:, :, instance_info[instance_idx].mapping[0]] == instance_info[instance_idx].mapping[1]
-            single_mask = single_mask.astype(np.float32)
+        # Check if mask is valid (after preprocessing in MaskLevelFlatDataset)
+        if single_mask_np.sum() == 0:
+            problem_cases.append({
+                'dataset_idx': idx,
+                'reason': 'empty_mask',
+                'mask_sum': 0,
+                'mask_shape': single_mask_np.shape,
+            })
+            nan_count += 1
+            continue
 
-            # Check if mask is valid
-            if single_mask.sum() == 0:
-                problem_cases.append({
-                    'image_idx': img_idx,
-                    'instance_idx': instance_idx,
-                    'reason': 'empty_mask',
-                    'mask_sum': 0,
-                    'mask_shape': single_mask.shape
-                })
+        # Test init_clicks
+        has_nan, reason = check_mask_for_nan(single_mask_np, num_tests=2)
+
+        if has_nan:
+            pr_cs = {
+                'dataset_idx': idx,
+                'reason': reason,
+                'mask_sum': float(single_mask_np.sum()),
+                'mask_shape': single_mask_np.shape,
+                'mask_nonzero': int((single_mask_np > 0).sum()),
+                'global_idx': total_masks,
+            }
+            problem_cases.append(pr_cs)
+            print(pr_cs)
+            if reason == "nan_probabilities":
                 nan_count += 1
-                continue
-
-            # Test init_clicks
-            has_nan, reason = check_mask_for_nan(single_mask, num_tests=1)
-
-            if has_nan:
-                problem_cases.append({
-                    'image_idx': img_idx,
-                    'instance_idx': instance_idx,
-                    'reason': reason,
-                    'mask_sum': float(single_mask.sum()),
-                    'mask_shape': single_mask.shape,
-                    'mask_nonzero': int((single_mask > 0).sum())
-                })
-                if reason == "nan_probabilities":
-                    nan_count += 1
-                else:
-                    empty_click_count += 1
+            else:
+                empty_click_count += 1
 
     # Summary
     print("\n" + "=" * 60)

@@ -194,7 +194,7 @@ class MaskLevelDatasetDummy(MaskLevelDataset):
         for _ in range(len(self.dataset)):
             # sample a data point from dataset
             index = self.rng.integers(0, len(self.dataset))
-            image, mask, instance_info = self.dataset[index]
+            image, mask, instance_info, image_id = self.dataset[index]
             image, image_embed_sam = self.preprocess_image(image, index=index)
 
             for instance_idx in instance_info.keys():  # Take first count instances only
@@ -347,7 +347,7 @@ class MaskLevelFlatDataset(Dataset):
         image_index = self.index_mapping[index][0]
         mask_index = self.index_mapping[index][1]
 
-        image, mask, instance_info = self.dataset[image_index]
+        image, mask, instance_info, image_id = self.dataset[image_index]
         if self.skip_preprocess:
             image = torch.from_numpy(image.astype(np.float32))
         else:

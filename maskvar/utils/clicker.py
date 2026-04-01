@@ -49,13 +49,22 @@ def init_clicks(gt_mask, num_random_clicks=1, not_clicked_map=None, random_sampl
             if random_sample:
                 # Sample a point based on the probability map
                 flat_probs = ((dt*not_clicked_map)**2).flatten()
-                flat_probs = flat_probs / flat_probs.sum()  # Normalize to probabilities
+                probs_sum = flat_probs.sum()
+                if probs_sum == 0:
+                    # If distance transform is all zeros, use uniform distribution
+                    flat_probs = np.ones_like(flat_probs) / len(flat_probs)
+                else:
+                    flat_probs = flat_probs / probs_sum  # Normalize to probabilities
                 idx = np.random.choice(len(flat_probs), p=flat_probs)
                 y, x = np.unravel_index(idx, dt.shape)
             else:
                 # Sample the fixed probability
                 flat_probs = (dt*not_clicked_map).flatten()
-                idx = np.argmax(flat_probs)
+                if flat_probs.sum() == 0:
+                    # If distance transform is all zeros, use uniform distribution
+                    idx = np.random.choice(len(flat_probs))
+                else:
+                    idx = np.argmax(flat_probs)
                 y, x = np.unravel_index(idx, dt.shape)    
             
             # Add random click (1 for positive since sampling from gt_mask)

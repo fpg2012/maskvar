@@ -359,6 +359,7 @@ def build_vqvae_single_4_stages_v2(vqvae_checkpoint_path: Optional[str] = None, 
     
     return vqvae
 
+# NOTE: currently the best vqvae to use
 def build_vqvae_single_5_stages_v1(vqvae_checkpoint_path: Optional[str] = None, require_grad = False) -> VQVAE_Single:
     vocab_size = 4096  # 码本大小
     z_channels = 32   # 潜在空间通道数
