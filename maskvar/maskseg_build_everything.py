@@ -3,6 +3,7 @@ from functools import partial
 from typing import Optional, Tuple
 
 from .models.vqvae_single import VQVAE_Single
+from .models.mask_vqvae import MaskVQVAE
 # from .models.maskgit import MaskGIT
 # from .models.maskseg import MaskSeg
 from .models.flex_maskvar import FlexMaskVAR
@@ -385,6 +386,97 @@ def build_vqvae_single_5_stages_v1(vqvae_checkpoint_path: Optional[str] = None, 
         vqvae.load_state_dict(new_state_dict)
     
     return vqvae
+
+def build_mask_vqvae_v0(
+    checkpoint_path: Optional[str] = None,
+    vqvae_init_checkpoint: Optional[str] = None,
+    require_grad: bool = True,
+    device: str = 'cpu',
+) -> MaskVQVAE:
+    """
+    Build MaskVQVAE v0 model.
+
+    This is the initial version of MaskVQVAE with 5 scales using SAM-style mask decoder.
+
+    Args:
+        checkpoint_path: Path to full MaskVQVAE checkpoint (if resuming training)
+        vqvae_init_checkpoint: Path to VQVAE checkpoint for initializing encoder/quantizer
+        require_grad: Whether to require gradients for model parameters
+        device: Device to load model on
+
+    Returns:
+        MaskVQVAE model
+    """
+    vocab_size = 4096
+    z_channels = 32
+    base_channels = 128
+    beta = 0.25
+    v_patch_nums = (1, 8, 16, 24, 32)
+
+    model = MaskVQVAE(
+        vocab_size=vocab_size,
+        z_channels=z_channels,
+        ch=base_channels,
+        beta=beta,
+        v_patch_nums=v_patch_nums,
+        img_feat_dim=256,  # SAM ViT output dimension
+        transformer_dim=256,
+        transformer_depth=2,
+        transformer_num_heads=8,
+        transformer_mlp_dim=2048,
+        fusion_type='sum',
+        use_sam_mask_decoder=True,
+        test_mode=False,  # Enable training mode
+        ddconfig=dict(
+            in_channels=1,
+            ch_mult=(1, 1, 2, 4),
+            num_res_blocks=2,
+            using_sa=True,
+            using_mid_sa=True,
+        ),
+    )
+
+    # Initialize from pretrained VQVAE if specified
+    if vqvae_init_checkpoint is not None:
+        vqvae_state_dict = torch.load(vqvae_init_checkpoint, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in vqvae_state_dict:
+            vqvae_state_dict = vqvae_state_dict['model_state_dict']
+
+        # Remove _orig_mod prefix if present (from torch.compile)
+        vqvae_state_dict = {k.replace('_orig_mod.', ''): v for k, v in vqvae_state_dict.items()}
+
+        # Load only encoder/quantizer/decoder weights that exist in both models
+        model_state = model.state_dict()
+        pretrained_state = {}
+        for k, v in vqvae_state_dict.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                pretrained_state[k] = v
+
+        model_state.update(pretrained_state)
+        model.load_state_dict(model_state, strict=False)
+
+        print(f"Initialized MaskVQVAE encoder/quantizer from {vqvae_init_checkpoint}")
+        print(f"Loaded {len(pretrained_state)}/{len(vqvae_state_dict)} parameters")
+
+    # Load full checkpoint if specified
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        print(f"Loaded MaskVQVAE checkpoint from {checkpoint_path}")
+
+    # Set requires_grad
+    if not require_grad:
+        for param in model.parameters():
+            param.requires_grad = False
+        model.eval()
+    else:
+        model.train()
+
+    return model.to(device)
+
 
 def build_vqvae_single_4_stages_4_slices(vqvae_checkpoint_path: Optional[str] = None, require_grad=False) -> VQVAE_Single:
     vocab_size = 4096  # 码本大小
@@ -1057,6 +1149,9 @@ builder_map = {
         "vqvae_single_5_stages_v1": build_vqvae_single_5_stages_v1,
         "vqvae_single_4_stages_4_slices": build_vqvae_single_4_stages_4_slices,
         "vqvae_single_4_stages_4_slices_v2": build_vqvae_single_4_stages_4_slices_v2,
+    },
+    "mask_vqvae": {
+        "mask_vqvae_v0": build_mask_vqvae_v0,
     },
     "image_encoder": {
         "sam_vitb": build_sam_image_encoder,
