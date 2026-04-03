@@ -306,7 +306,7 @@ def simple_var_inference(image_feat: torch.Tensor, simple_var: SimpleVAR, vqvae:
 
     id_seq = []
     current_token = repeat(
-        rearrange(simple_var.sos, 'c -> 1 1 c'), 
+        rearrange(simple_var.sos, 'c -> 1 1 c'),
         '1 1 c -> b 1 c',
         b=B
     ) # (B, 1, C)

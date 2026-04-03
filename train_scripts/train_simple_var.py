@@ -31,6 +31,9 @@ from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset
 from maskvar.datasets.image_feature_cache import ImageFeatureCache
 from maskvar.datasets.sharded_distributed_sampler import ShardedDistributedSampler
 from maskvar.utils.clicker import init_clicks, to_sam_format
+import matplotlib.pyplot as plt
+import io
+import torchvision
 
 
 torch.set_float32_matmul_precision('high')
@@ -89,6 +92,7 @@ class SimpleARTrainer:
         shuffle_dataloader: bool = True,
         find_unused_parameters: bool = True,
         prompt_encoder=None,
+        log_interval: int = 32,
     ):
         # models
         self.simple_var: SimpleVAR = simple_var
@@ -131,7 +135,7 @@ class SimpleARTrainer:
         # logger
         self.logger = SummaryWriter(log_dir=str(log_dir))
         self.output_dir = checkpoint_dir
-        self.log_duration = 32
+        self.log_duration = log_interval
 
         self.skip_eval = skip_eval
 
@@ -189,6 +193,155 @@ class SimpleARTrainer:
             # self.val_sampler = DistributedSampler(self.val_set)
             self.sampler = ShardedDistributedSampler(self.train_set, rank=self.rank, world_size=self.world_size, shard_size=1024)
             self.val_sampler = DistributedSampler(self.val_set)
+
+    @torch.no_grad()
+    def visualize_masks_to_tensorboard(self, single_mask_normalized, gt_idx, logits, batch_clicks, writer, global_step, tag='val/mask_viz', sample_idx=0, inf_idx_list=None):
+        """
+        Visualize masks, predictions, and clicks from a single sample to tensorboard.
+
+        Args:
+            single_mask_normalized: (B, 1, H, W) normalized ground truth masks
+            gt_idx: List of (B, l) ground truth token indices per scale
+            logits: (B, L, vocab_size) model output logits (teacher forcing)
+            batch_clicks: List of click lists for each sample
+            writer: SummaryWriter instance
+            global_step: global step for logging
+            tag: tag prefix for tensorboard
+            sample_idx: which sample in the batch to visualize (default: 0)
+            inf_idx_list: List of (B, l) optional pure inference token indices (no teacher forcing)
+        """
+        B = single_mask_normalized.shape[0]
+        if sample_idx >= B:
+            sample_idx = 0
+
+        # Get predicted token indices from logits (teacher forcing)
+        pred_idx_flat = logits.argmax(dim=-1)  # (B, L)
+
+        # Split flat indices into per-scale indices
+        pred_idx = []
+        start = 0
+        for level_idx in gt_idx:
+            l = level_idx.shape[1]
+            pred_idx.append(pred_idx_flat[:, start:start+l])
+            start += l
+
+        # Decode predicted tokens to mask
+        pred_masks = self.vqvae.idxBl_to_img(pred_idx, same_shape=False, last_one=True)  # (B, 1, H, W)
+        pred_masks = (pred_masks + 1) / 2  # Denormalize: [-1, 1] -> [0, 1]
+
+        # Decode ground truth tokens to mask (for comparison)
+        gt_masks_decoded = self.vqvae.idxBl_to_img(gt_idx, same_shape=False, last_one=True)
+        gt_masks_decoded = (gt_masks_decoded + 1) / 2
+
+        # Handle inference results if provided
+        if inf_idx_list is not None:
+            inf_masks = self.vqvae.idxBl_to_img(inf_idx_list, same_shape=False, last_one=True)
+            inf_masks = (inf_masks + 1) / 2
+            ncols = 4
+        else:
+            ncols = 3
+
+        # Create figure for single sample
+        fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4))
+        if ncols == 3:
+            axes = [axes[0], axes[1], axes[2]]
+
+        # GT mask
+        gt_mask_np = single_mask_normalized[sample_idx, 0].cpu().numpy()
+        axes[0].imshow(gt_mask_np > 0, cmap='gray')
+        axes[0].set_title('GT Mask')
+        axes[0].axis('off')
+
+        # GT reconstructed from tokens
+        gt_decoded_np = gt_masks_decoded[sample_idx, 0].cpu().numpy()
+        axes[1].imshow(gt_decoded_np > 0.5, cmap='gray')
+        axes[1].set_title('GT from Tokens')
+        axes[1].axis('off')
+
+        # Teacher forced prediction
+        pred_mask_np = pred_masks[sample_idx, 0].cpu().numpy()
+        axes[2].imshow(pred_mask_np > 0.5, cmap='gray')
+        axes[2].set_title('Teacher Forced')
+        axes[2].axis('off')
+
+        # Pure inference prediction (if provided)
+        if inf_idx_list is not None:
+            inf_mask_np = inf_masks[sample_idx, 0].cpu().numpy()
+            axes[3].imshow(inf_mask_np > 0.5, cmap='gray')
+            # Overlay clicks on inference prediction
+            if sample_idx < len(batch_clicks) and len(batch_clicks[sample_idx]) > 0:
+                for (y, x, label) in batch_clicks[sample_idx]:
+                    color = 'green' if label == 1 else 'red'
+                    axes[3].scatter(x, y, c=color, s=100, marker='x', linewidths=2)
+            axes[3].set_title('Pure Inference')
+            axes[3].axis('off')
+        else:
+            # Overlay clicks on teacher forced prediction
+            if sample_idx < len(batch_clicks) and len(batch_clicks[sample_idx]) > 0:
+                for (y, x, label) in batch_clicks[sample_idx]:
+                    color = 'green' if label == 1 else 'red'
+                    axes[2].scatter(x, y, c=color, s=100, marker='x', linewidths=2)
+
+        plt.tight_layout()
+
+        # Save to buffer
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+
+        # Convert to tensor
+        from PIL import Image
+        img = Image.open(buf)
+        img_tensor = torchvision.transforms.ToTensor()(img)
+
+        plt.close(fig)
+        buf.close()
+
+        # Log to tensorboard
+        writer.add_image(tag, img_tensor, global_step)
+
+    @torch.no_grad()
+    def eval_iou(self, logits, gt_idx, gt_mask):
+        """
+        Calculate IoU between predicted mask and ground truth mask.
+
+        Args:
+            logits: (B, L, vocab_size) - model output logits
+            gt_idx: List of (B, l) - ground truth token indices per scale
+            gt_mask: (B, 1, H, W) - ground truth binary masks
+
+        Returns:
+            iou: (B,) - IoU score for each sample in batch
+        """
+        # Get predicted token indices from logits
+        pred_idx_flat = logits.argmax(dim=-1)  # (B, L)
+
+        # Split flat indices into per-scale indices
+        pred_idx = []
+        start = 0
+        for level_idx in gt_idx:
+            l = level_idx.shape[1]
+            pred_idx.append(pred_idx_flat[:, start:start+l])
+            start += l
+
+        # Decode predicted tokens to mask
+        pred_mask = self.vqvae.idxBl_to_img(pred_idx, same_shape=False, last_one=True)  # (B, 1, H, W)
+
+        # Denormalize: [-1, 1] -> [0, 1]
+        pred_mask = (pred_mask + 1) / 2
+
+        # Binarize predictions
+        pred_mask = (pred_mask > 0.5).float()
+        gt_mask = (gt_mask > 0.5).float()
+
+        # Calculate IoU
+        intersection = (pred_mask * gt_mask).sum(dim=(1, 2, 3))  # (B,)
+        union = ((pred_mask + gt_mask) > 0).float().sum(dim=(1, 2, 3))  # (B,)
+
+        # Avoid division by zero
+        iou = intersection / (union + 1e-8)
+
+        return iou
 
     def get_clicks_in_batch(self, single_mask, num_clicks=2):
         """
@@ -279,7 +432,7 @@ class SimpleARTrainer:
 
         gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized) # List of (B, l)
         gt_idx_flat = torch.cat(gt_idx, dim=1) # (B, L)
-        
+
         with torch.autocast(self.device, dtype=self.dtype):
 
             logits = self.simple_var(
@@ -299,12 +452,12 @@ class SimpleARTrainer:
             loss = loss.mean()
             loss = loss / self.accumulate_steps
             loss.backward()
-            
+
             if (inner_iter_count + 1) % self.accumulate_steps == 0:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
-        return loss, acc
+        return loss, acc, logits, batch_clicks
 
     def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0, val_iters=0):
         if num_iters <= 0:
@@ -329,7 +482,7 @@ class SimpleARTrainer:
                 global_iters = iters_count + num_iters * outer_iter + resume_iters
                 iters_count += 1
 
-                loss, acc = self.train_step(
+                loss, acc, logits, batch_clicks = self.train_step(
                     i,
                     image,
                     image_embed_sam,
@@ -338,23 +491,39 @@ class SimpleARTrainer:
                 )
 
                 if global_iters % self.log_duration == 0:
+                    # Calculate IoU
+                    # Reconstruct gt_idx for eval_iou
+                    with torch.no_grad():
+                        single_mask_normalized_iou = single_mask_normalized.to(self.device, non_blocking=True)
+                        gt_idx_iou = self.vqvae.img_to_idxBl(single_mask_normalized_iou)
+                        iou = self.eval_iou(logits, gt_idx_iou, single_mask_normalized_iou)
+                        iou_mean = iou.mean()
+
                     acc_mean = acc.mean()
                     acc_sos = acc[:, 0].mean()
                     if tdist.is_initialized():
                         tdist.all_reduce(acc_mean, op=tdist.ReduceOp.AVG)
                         tdist.all_reduce(acc_sos, op=tdist.ReduceOp.AVG)
                         tdist.all_reduce(loss, op=tdist.ReduceOp.AVG)
+                        tdist.all_reduce(iou_mean, op=tdist.ReduceOp.AVG)
                     loss = loss.item()
                     acc_mean = acc_mean.item()
                     acc_sos = acc_sos.item()
+                    iou_mean = iou_mean.item()
 
                     if self.rank == 0:
                         # update loss and acc in progressive bar
-                        pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
+                        pbar.set_postfix({'loss': f'{loss:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}', 'iou': f'{iou_mean:.4f}'})
                         # log to tensorboard
                         self.logger.add_scalar('train/loss', loss, global_step=global_iters)
                         self.logger.add_scalar('train/acc_mean', acc_mean, global_step=global_iters)
                         self.logger.add_scalar('train/acc_sos', acc_sos, global_step=global_iters)
+                        self.logger.add_scalar('train/iou', iou_mean, global_step=global_iters)
+                        # visualize masks (only first sample in batch)
+                        self.visualize_masks_to_tensorboard(
+                            single_mask_normalized_iou, gt_idx_iou, logits, batch_clicks,
+                            self.logger, global_iters, tag='train/mask_viz', sample_idx=0
+                        )
                 
         if self.rank == 0:
             global_iters = (outer_iter + 1)*num_iters + resume_iters
@@ -368,16 +537,29 @@ class SimpleARTrainer:
         if num_iters < 0:
             print(f'num_iters={num_iters}, skip val')
             return
-        if num_iters == 0 or num_iters > len(self.val_dataloader):
-            num_iters = len(self.val_dataloader)
+        # Handle dataloader without __len__ (e.g., dummy dataset)
+        try:
+            dataloader_len = len(self.val_dataloader)
+        except TypeError:
+            # No __len__ method, use num_iters directly if > 0
+            if num_iters <= 0:
+                print('dataloader has no __len__ and num_iters <= 0, skip val')
+                return
+            dataloader_len = num_iters
+        if num_iters == 0 or num_iters > dataloader_len:
+            num_iters = dataloader_len
         self.simple_var.eval()
 
         total_loss = torch.tensor(0.0, device=self.device)
         total_acc_mean = torch.tensor(0.0, device=self.device)
         total_acc_sos = torch.tensor(0.0, device=self.device)
+        total_iou = torch.tensor(0.0, device=self.device)
         if self.rank == 0:
             pbar = tqdm.tqdm(range(num_iters), desc="Val: ", total=num_iters)
-        
+
+        # Store first batch for visualization
+        first_batch_for_viz = None
+
         for i, (image, image_embed_sam, single_mask_normalized, single_mask) in enumerate(self.val_dataloader):
             if self.rank == 0:
                 pbar.update(1)
@@ -386,7 +568,20 @@ class SimpleARTrainer:
                 break
             image_embed_sam = image_embed_sam.to(self.device, non_blocking=True)
             single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
-            
+
+            # Save first batch for visualization (only on rank 0)
+            if i == 0 and self.rank == 0:
+                first_batch_for_viz = (image_embed_sam.clone(), single_mask_normalized.clone(), single_mask.clone())
+
+            # Generate initial clicks from ground truth masks (consistent with training)
+            batch_clicks = self.get_clicks_in_batch(single_mask, num_clicks=2)
+
+            # Convert clicks to SAM prompt embeddings (if prompt_encoder is available)
+            if self.prompt_encoder is not None:
+                sparse_embeddings, _ = self.clicks_to_prompt_embedding(batch_clicks)
+            else:
+                sparse_embeddings = None
+
             gt_idx = self.vqvae.img_to_idxBl(single_mask_normalized)
             gt_idx_flat = torch.cat(gt_idx, dim=1)
 
@@ -394,14 +589,19 @@ class SimpleARTrainer:
                 logits = self.simple_var(
                     idx=gt_idx,
                     image_feat=image_embed_sam,
-                    vqvae=self.vqvae
+                    vqvae=self.vqvae,
+                    sparse_embeddings=sparse_embeddings
                 )
                 
                 acc = (logits.argmax(dim=-1) == gt_idx_flat).float()
 
                 acc_mean = acc.mean()
                 acc_sos = acc[:, 0].mean()
-                
+
+                # Calculate IoU
+                iou = self.eval_iou(logits, gt_idx, single_mask_normalized)
+                iou_mean = iou.mean()
+
                 logits = rearrange(logits, 'b l c -> b c l')
                 loss = self.loss_function(logits, gt_idx_flat)
                 loss = loss * rearrange(self.loss_weight_per_token, 'L -> 1 L') # will be automatically broadcasted to [B, L]
@@ -409,27 +609,65 @@ class SimpleARTrainer:
                 loss_mean = loss.mean()
 
             if self.rank == 0:
-                pbar.set_postfix({'loss': f'{loss_mean:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}'})
+                pbar.set_postfix({'loss': f'{loss_mean:.4f}', 'acc_mean': f'{acc_mean:.4f}', 'acc_sos': f'{acc_sos:.4f}', 'iou': f'{iou_mean:.4f}'})
 
             total_loss += loss_mean
             total_acc_mean += acc_mean
             total_acc_sos += acc_sos
-        
+            total_iou += iou_mean
+
         if tdist.is_initialized():
             tdist.all_reduce(total_loss, op=tdist.ReduceOp.AVG)
             tdist.all_reduce(total_acc_mean, op=tdist.ReduceOp.AVG)
             tdist.all_reduce(total_acc_sos, op=tdist.ReduceOp.AVG)
+            tdist.all_reduce(total_iou, op=tdist.ReduceOp.AVG)
 
         mean_loss = total_loss / num_iters
         mean_acc_mean = total_acc_mean / num_iters
         mean_acc_sos = total_acc_sos / num_iters
+        mean_iou = total_iou / num_iters
 
         if self.rank == 0:
             self.logger.add_scalar('val/loss', mean_loss.item(), global_step=global_step)
             self.logger.add_scalar('val/acc_mean', mean_acc_mean.item(), global_step=global_step)
             self.logger.add_scalar('val/acc_sos', mean_acc_sos.item(), global_step=global_step)
+            self.logger.add_scalar('val/iou', mean_iou.item(), global_step=global_step)
 
-        return mean_loss, mean_acc_mean, mean_acc_sos
+            # Visualize first batch
+            if first_batch_for_viz is not None:
+                image_embed_sam_viz, single_mask_normalized_viz, single_mask_viz = first_batch_for_viz
+                batch_clicks_viz = self.get_clicks_in_batch(single_mask_viz, num_clicks=2)
+                if self.prompt_encoder is not None:
+                    sparse_embeddings_viz, _ = self.clicks_to_prompt_embedding(batch_clicks_viz)
+                else:
+                    sparse_embeddings_viz = None
+                gt_idx_viz = self.vqvae.img_to_idxBl(single_mask_normalized_viz)
+                with torch.autocast(self.device, dtype=self.dtype):
+                    # Teacher forcing
+                    logits_viz = self.simple_var(
+                        idx=gt_idx_viz,
+                        image_feat=image_embed_sam_viz,
+                        vqvae=self.vqvae,
+                        sparse_embeddings=sparse_embeddings_viz
+                    )
+                    # Pure inference (autoregressive generation)
+                    from maskvar.models.simple_ar import simple_var_inference
+                    inf_idx_list = simple_var_inference(
+                        image_feat=image_embed_sam_viz,
+                        simple_var=self.simple_var.module if hasattr(self.simple_var, 'module') else self.simple_var,
+                        vqvae=self.vqvae,
+                        sparse_embeddings=sparse_embeddings_viz
+                    )
+                    # Convert inf_idx_list to logits format (just for shape compatibility in visualization)
+                    # Actually we need to reconstruct a tensor - but simple_var_inference returns idx
+                    # So we'll handle this differently - pass inf_idx_list separately
+                self.visualize_masks_to_tensorboard(
+                    single_mask_normalized_viz, gt_idx_viz, logits_viz, batch_clicks_viz,
+                    self.logger, global_step, tag='val/mask_viz', sample_idx=0,
+                    inf_idx_list=inf_idx_list
+                )
+
+        return mean_loss, mean_acc_mean, mean_acc_sos, mean_iou
     
     def save_checkpoint(self, iters: int):
         if tdist.is_initialized():
@@ -481,6 +719,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_dummy_dataset_for_debug', action='store_true')
     parser.add_argument('--dl_workers', type=int, default=4)
     parser.add_argument('--prefetch_factor', type=int, default=2)
+    parser.add_argument('--log_interval', type=int, default=32, help='Log to tensorboard every N iterations')
     # configs
     parser.add_argument('--simple_var', type=str, default='simple_var')
     parser.add_argument('--simple_var_init_checkpoint', type=str, default=None)
@@ -492,6 +731,7 @@ if __name__ == "__main__":
     parser.add_argument('--prompt_encoder_checkpoint', type=str, default=None)
     parser.add_argument('--enable_clicks', action='store_true', help='Enable prompt encoder with click embeddings')
     parser.add_argument('--disable_find_unused_parameters', action='store_true')
+    parser.add_argument('--exponential_loss_weight', action='store_true')
     # image embedding caching
     parser.add_argument('--image_feature_cache_dir', type=str, default="")
     # dtype
@@ -606,6 +846,14 @@ if __name__ == "__main__":
 
     local_batch_size = batch_size // world_size
 
+    # loss weight
+    n_stages = len(simple_var.patch_num)
+    if args.exponential_loss_weight:
+        loss_weight = [2**i for i in range(n_stages)][::-1]
+    else:
+        loss_weight = [1 for i in range(n_stages)]
+    print(f'loss weight: {loss_weight}')
+
     trainer = SimpleARTrainer(
         simple_var=simple_var,
         vqvae=vqvae,
@@ -624,6 +872,8 @@ if __name__ == "__main__":
         shuffle_dataloader=(not args.use_dummy_dataset_for_debug),
         find_unused_parameters=(not args.disable_find_unused_parameters),
         prompt_encoder=prompt_encoder,
+        loss_weight_per_level=loss_weight,
+        log_interval=args.log_interval,
     )
 
     outer_iters = args.outer_iters
