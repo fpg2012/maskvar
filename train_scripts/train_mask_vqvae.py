@@ -15,26 +15,27 @@ import sys
 import argparse
 import json
 from pathlib import Path
-from datetime import datetime
-from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as tdist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
-import numpy as np
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import torchvision
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from maskvar.models.mask_vqvae import MaskVQVAE
 from maskvar.maskseg_build_everything import builder_map
+from maskvar.utils.metrics import calc_iou
 
 
 def setup_distributed():
@@ -314,25 +315,35 @@ class MaskVQVAETrainer:
         }
 
     @torch.no_grad()
-    def validate(self, epoch: int) -> dict:
-        """Validate on validation set."""
+    def validate(self, epoch: int, num_vis_samples: int = 8) -> dict:
+        """Validate on validation set.
+
+        Args:
+            epoch: Current epoch number
+            num_vis_samples: Number of samples to visualize
+        """
         self.model.eval()
 
         total_loss = 0.0
         total_recon_loss = 0.0
         total_vq_loss = 0.0
+        total_iou = 0.0
+        num_iou_samples = 0
+
+        # For visualization (only on rank 0)
+        vis_samples = []
 
         if self.rank == 0:
             pbar = tqdm(self.val_loader, desc=f"Val {epoch}")
         else:
             pbar = self.val_loader
 
-        for batch in pbar:
-            _, image_embed_sam, single_mask_normalized, _ = batch
+        for batch_idx, batch in enumerate(pbar):
+            _, image_embed_sam, single_mask_normalized, single_mask = batch
 
             image_embed_sam = image_embed_sam.to(self.device, non_blocking=True)
             single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
-
+            single_mask = single_mask.to(self.device, non_blocking=True)
             with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
                 rec_mask, vq_loss = self.model(
                     single_mask_normalized,
@@ -347,30 +358,133 @@ class MaskVQVAETrainer:
             total_recon_loss += recon_loss.item()
             total_vq_loss += vq_loss.item()
 
+            # Calculate IoU
+            iou = calc_iou(rec_mask, single_mask)
+            total_iou += iou.sum().item()
+            num_iou_samples += iou.shape[0]
+
+            # Collect samples for visualization
+            if self.rank == 0 and len(vis_samples) < num_vis_samples:
+                # Get multi-scale reconstructions
+                model = self.model.module if isinstance(self.model, DDP) else self.model
+                ms_masks = model.img_to_reconstructed_img(
+                    single_mask_normalized,
+                    image_features=image_embed_sam,
+                    last_one=False,
+                )
+                vis_samples.append({
+                    'gt': single_mask_normalized.detach(),
+                    'pred': rec_mask.detach(),
+                    'ms_masks': [m.detach() for m in ms_masks],
+                    'iou': iou.detach(),
+                })
+
             if self.rank == 0:
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'recon': f'{recon_loss.item():.4f}',
                     'vq': f'{vq_loss.item():.4f}',
+                    'iou': f'{iou.mean().item():.4f}',
                 })
 
-        # Average losses
+        # Average losses and IoU
         num_batches = len(self.val_loader)
         avg_loss = total_loss / num_batches
         avg_recon_loss = total_recon_loss / num_batches
         avg_vq_loss = total_vq_loss / num_batches
+        avg_iou = total_iou / num_iou_samples
 
         # All-reduce for distributed training
         if self.world_size > 1:
-            metrics = torch.tensor([avg_loss, avg_recon_loss, avg_vq_loss], device=self.device)
-            tdist.all_reduce(metrics, op=tdist.ReduceOp.AVG)
-            avg_loss, avg_recon_loss, avg_vq_loss = metrics.tolist()
+            metrics = torch.tensor([avg_loss, avg_recon_loss, avg_vq_loss, total_iou, num_iou_samples], device=self.device)
+            tdist.all_reduce(metrics, op=tdist.ReduceOp.SUM)
+            avg_loss, avg_recon_loss, avg_vq_loss = metrics[:3].tolist()
+            avg_loss /= self.world_size
+            avg_recon_loss /= self.world_size
+            avg_vq_loss /= self.world_size
+            avg_iou = metrics[3].item() / metrics[4].item()
+
+        # Visualize on rank 0
+        if self.rank == 0 and vis_samples:
+            self._visualize_validation(vis_samples, epoch)
 
         return {
             'loss': avg_loss,
             'recon_loss': avg_recon_loss,
             'vq_loss': avg_vq_loss,
+            'iou': avg_iou,
         }
+
+    def _visualize_validation(self, vis_samples: list, epoch: int):
+        """Visualize validation samples with multi-scale reconstructions."""
+        model = self.model.module if isinstance(self.model, DDP) else self.model
+        num_scales = len(model.v_patch_nums)
+        num_samples = len(vis_samples)
+
+        # Create figure: 3 columns [GT, Full Pred, Multi-scale Grid]
+        num_cols = 3
+        fig, axes = plt.subplots(num_samples, num_cols, figsize=(12, 4 * num_samples))
+
+        if num_samples == 1:
+            axes = axes.reshape(1, -1)
+
+        for row, sample in enumerate(vis_samples):
+            # Column 0: Ground Truth
+            gt = sample['gt'][0, 0].cpu().numpy() > 0
+            axes[row, 0].imshow(gt, cmap='gray')
+            axes[row, 0].set_title('GT' if row == 0 else '')
+            axes[row, 0].axis('off')
+
+            # Column 1: Full prediction with IoU
+            pred = sample['pred'][0, 0].cpu().numpy() > 0
+            iou = sample['iou'][0].item()
+            axes[row, 1].imshow(pred, cmap='gray')
+            axes[row, 1].set_title(f'Pred (IoU={iou:.3f})' if row == 0 else f'IoU={iou:.3f}')
+            axes[row, 1].axis('off')
+
+            # Column 2: Multi-scale reconstruction using make_grid
+            # Collect all scale masks and create a grid
+            scale_masks = []
+            for ms_mask in sample['ms_masks']:
+                # ms_mask: (1, 1, H, W), take first sample
+                scale_masks.append(ms_mask[0])
+
+            # Stack and create grid: nrow=1 to show horizontally
+            all_masks = torch.cat(scale_masks, dim=0)  # (num_scales, H, W)
+            all_masks = all_masks.unsqueeze(1)  # (num_scales, 1, H, W) for make_grid
+
+            # Normalize to [0, 1] for visualization
+            mask_grid = torchvision.utils.make_grid(
+                all_masks,
+                nrow=num_scales,
+                padding=2,
+                pad_value=1.0,
+                normalize=False,
+            )
+            # mask_grid: (1, H, W*num_scales + padding)
+
+            # Convert to numpy and display
+            mask_grid_np = mask_grid[0].cpu().numpy() > 0
+            axes[row, 2].imshow(mask_grid_np, cmap='gray')
+
+            # Add scale labels as text
+            scale_labels = ' | '.join([f'{pn}x{pn}' for pn in model.v_patch_nums])
+            axes[row, 2].set_title(f'Multi-scale: {scale_labels}' if row == 0 else '')
+            axes[row, 2].axis('off')
+
+        plt.tight_layout()
+
+        # Save to TensorBoard
+        self.writer.add_figure('val/multi_scale_reconstruction', fig, epoch)
+
+        # Save to file
+        vis_dir = self.out_dir / 'visualizations'
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        fig_path = vis_dir / f'epoch_{epoch}_val_vis.png'
+        plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"Saved validation visualization to {fig_path}")
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint."""
@@ -419,7 +533,7 @@ class MaskVQVAETrainer:
 
         return start_epoch
 
-    def train(self, num_epochs: int, start_epoch: int = 0, val_interval: int = 5):
+    def train(self, num_epochs: int, start_epoch: int = 0, val_interval: int = 10):
         """
         Main training loop.
 
@@ -494,7 +608,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size per GPU')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--accumulate_steps', type=int, default=1, help='Gradient accumulation steps')
-    parser.add_argument('--val_interval', type=int, default=5, help='Validation interval (epochs)')
+    parser.add_argument('--val_interval', type=int, default=2, help='Validation interval (epochs)')
 
     # Model configuration
     parser.add_argument('--vocab_size', type=int, default=4096, help='Codebook size')

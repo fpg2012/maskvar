@@ -16,6 +16,7 @@ from .models.tinyvit import TinyViT
 from .models.simple_ar import SimpleAR, SimpleVAR, SimpleVARSamDecoder
 from .models.simple_ar.adapted_mask_decoder import AdaptedMaskDecoder
 from .models.simple_ar.adapted_twt import AdaptedTwoWayTransformer
+from .models.simple_mask_vqvae.simple_mask_vqvae import SimpleMaskVqvae, MaskEncoderLite
 
 from .datasets.mask_level_dataset import MaskLevelDataset
 from .datasets.coco_lvis import LvisDataset
@@ -1034,6 +1035,47 @@ def build_simple_var_16d(simple_var_checkpoint_path: Optional[str] = None, sam_p
 
     return simple_var.to(device)
 
+def build_simple_mask_vqvae(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    sam_checkpoint_path: Optional[str] = None,
+    device: str = 'cpu',
+) -> SimpleMaskVqvae:
+    """
+    Build SimpleMaskVqvae model.
+
+    Both image and mask use the same encoder architecture (MobileSAM/TinyViT).
+    """
+    # Model config (hardcoded)
+    vocab_size = 4096
+    dim = 256
+    beta = 0.25
+
+    image_encoder = build_mobile_sam_image_encoder(sam_checkpoint_path)
+    # mask_encoder = build_mobile_sam_image_encoder(sam_checkpoint_path)
+    mask_encoder = MaskEncoderLite(dim=dim)
+
+    simple_mask_vqvae = SimpleMaskVqvae(
+        image_encoder=image_encoder,
+        mask_encoder=mask_encoder,
+        dim=dim,
+        vocab_size=vocab_size,
+        beta=beta,
+        device=device,
+    )
+
+    if simple_mask_vqvae_checkpoint_path is not None:
+        simple_mask_vqvae_state_dict = torch.load(simple_mask_vqvae_checkpoint_path)
+        if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
+            # 创建一个新的字典，移除 '_orig_mod.' 前缀
+            new_state_dict = {}
+            for key, value in simple_mask_vqvae_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_mask_vqvae_state_dict = new_state_dict
+        simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+
+    return simple_mask_vqvae.to(device)
+
 # def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
 #     maskgit = MaskGIT(
 #         vqvae=vqvae,
@@ -1152,6 +1194,9 @@ builder_map = {
     },
     "mask_vqvae": {
         "mask_vqvae_v0": build_mask_vqvae_v0,
+    },
+    "simple_mask_vqvae": {
+        "simple_mask_vqvae": build_simple_mask_vqvae,
     },
     "image_encoder": {
         "sam_vitb": build_sam_image_encoder,

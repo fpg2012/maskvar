@@ -14,6 +14,7 @@ from torch import Tensor
 
 from ..sam.mask_decoder import MaskDecoder
 from ..sam.transformer import TwoWayTransformer
+from ..sam.prompt_encoder import PositionEmbeddingRandom
 
 
 class PixelSumFusion(nn.Module):
@@ -121,13 +122,10 @@ class MaskDecoderModule(nn.Module):
             else self.transformer
         )
 
-        # Learnable positional encoding for image features
-        # Shape: (1, transformer_dim, max_patch_num, max_patch_num)
-        max_pn = max(v_patch_nums)
-        self.image_pe = nn.Parameter(
-            torch.zeros(1, transformer_dim, max_pn, max_pn)
-        )
-        nn.init.normal_(self.image_pe, std=0.01)
+        # Positional encoding using SAM's PositionEmbeddingRandom
+        # This uses random spatial frequencies to generate sinusoidal positional encoding
+        self.pe_layer = PositionEmbeddingRandom(num_pos_feats=transformer_dim // 2)
+        self.image_embedding_size = (max(v_patch_nums), max(v_patch_nums))  # (H, W) for max scale
 
         # MLP to map tokens to mask prediction space (similar to SAM's hypernetwork)
         # SAM uses multiple MLPs for different mask tokens, we use a shared one
@@ -173,15 +171,16 @@ class MaskDecoderModule(nn.Module):
 
     def _get_positional_encoding(self, size: Tuple[int, int]) -> Tensor:
         """
-        Get positional encoding for given spatial size.
+        Get positional encoding for given spatial size using SAM's PositionEmbeddingRandom.
 
         Args:
             size: (h, w) spatial size
         Returns:
             Positional encoding of shape (1, transformer_dim, h, w)
         """
-        h, w = size
-        return self.image_pe[:, :, :h, :w]
+        # pe_layer.forward returns (C, H, W), add batch dimension
+        pe = self.pe_layer(size)  # (transformer_dim, h, w)
+        return pe.unsqueeze(0)  # (1, transformer_dim, h, w)
 
     def _decode_single_scale(
         self,

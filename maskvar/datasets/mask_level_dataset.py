@@ -121,7 +121,8 @@ class MaskLevelDataset(IterableDataset):
                 #     image_embed_sam = self.sam_encoder(image.unsqueeze(0)).squeeze(0).clone()
                 # image_embed_sam = image_embed_sam.to('cpu')
         else:
-            image_embed_sam = None
+            # Return dummy tensor instead of None to avoid collate issues
+            image_embed_sam = torch.tensor(0.0)
         return image.detach(), image_embed_sam
 
     @torch.no_grad()
@@ -356,7 +357,8 @@ class MaskLevelFlatDataset(Dataset):
         if self.with_image_embed:
             image_embed_sam = torch.from_numpy(self.image_feature_cache[image_index])
         else:
-            image_embed_sam = None
+            # Return dummy tensor instead of None to avoid collate issues
+            image_embed_sam = torch.tensor(0.0)
 
         single_mask_normalized, single_mask = self.preprocess_mask(mask, instance_info, mask_index)
         return image, image_embed_sam, single_mask_normalized, single_mask
@@ -394,7 +396,7 @@ class MaskLevelFlatDataset(Dataset):
         # to tensor
         mask = torch.from_numpy(mask.astype(np.float32)).unsqueeze(0)
 
-        mask = resize_longest_side(mask.unsqueeze(0), self.image_size_mask, 'nearest').squeeze(0)
+        mask = resize_longest_side(mask.unsqueeze(0), self.image_size_mask, 'bilinear').squeeze(0)
         # mask = mask.long()
 
         # pad mask to image_size_mask (default 256)
