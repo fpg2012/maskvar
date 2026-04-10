@@ -658,6 +658,7 @@ class SimpleMaskVqvaeTrainer:
             if 'image' in sample:
                 image = restore_normalized_image(sample['image'][0])
                 image = image.detach().float().cpu().numpy().transpose(1, 2, 0)
+                image = image / 255.0 if image.max() > 1 else image
             else:
                 # Use gray background
                 image = np.ones((*gt.shape, 3)) * 0.5
