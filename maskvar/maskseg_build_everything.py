@@ -1,6 +1,9 @@
-import torch
 from functools import partial
 from typing import Optional, Tuple
+
+import torch
+import timm
+from safetensors.torch import load_file
 
 from .models.vqvae_single import VQVAE_Single
 from .models.mask_vqvae import MaskVQVAE
@@ -1174,6 +1177,34 @@ def build_coconut_hf_dataset(
     return trainset, valset
 
 
+def _build_dino_v3(model_name, checkpoint_path, device):
+    model = timm.create_model(
+        model_name,
+        pretrained=False,  # 不从网络加载权重
+        num_classes=0,     # 移除分类头
+        # features_only=True,
+    )
+
+    state_dict = load_file(checkpoint_path)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+
+    return model
+
+def build_dino_v3_vits(checkpoint_path='ckpt/dino_v3_vits.safetensors', device='cpu'):
+    return _build_dino_v3('vit_small_patch16_dinov3', checkpoint_path, device)
+
+def build_dino_v3_vitb(checkpoint_path='ckpt/dino_v3_vitb.safetensors', device='cpu'):
+    return _build_dino_v3('vit_base_patch16_dinov3', checkpoint_path, device)
+
+def build_dino_v3_transform(dino_v3_model):
+    data_config = timm.data.resolve_model_data_config(dino_v3_model)
+    transforms = timm.data.create_transform(**data_config, is_training=False)
+    return transforms
+
+
 builder_map = {
     "maskvar": {
         "maskvar": build_maskvar,
@@ -1201,6 +1232,8 @@ builder_map = {
     "image_encoder": {
         "sam_vitb": build_sam_image_encoder,
         "mobile_sam": build_mobile_sam_image_encoder,
+        "dino_v3_vitb": build_dino_v3_vitb,
+        "dino_v3_vits": build_dino_v3_vits,
     },
     "prompt_encoder": build_prompt_encoder,
     "simple_ar": build_simple_ar,
