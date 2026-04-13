@@ -20,6 +20,7 @@ from .models.simple_ar import SimpleAR, SimpleVAR, SimpleVARSamDecoder
 from .models.simple_ar.adapted_mask_decoder import AdaptedMaskDecoder
 from .models.simple_ar.adapted_twt import AdaptedTwoWayTransformer
 from .models.simple_mask_vqvae.simple_mask_vqvae import SimpleMaskVqvae, MaskEncoderLite
+from .models.dino_wrapper import DinoV3Wrapper
 
 from .datasets.mask_level_dataset import MaskLevelDataset
 from .datasets.coco_lvis import LvisDataset
@@ -1038,9 +1039,11 @@ def build_simple_var_16d(simple_var_checkpoint_path: Optional[str] = None, sam_p
 
     return simple_var.to(device)
 
+
 def build_simple_mask_vqvae(
     simple_mask_vqvae_checkpoint_path: Optional[str] = None,
-    sam_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
     device: str = 'cpu',
 ) -> SimpleMaskVqvae:
     """
@@ -1053,7 +1056,7 @@ def build_simple_mask_vqvae(
     dim = 256
     beta = 0.25
 
-    image_encoder = build_mobile_sam_image_encoder(sam_checkpoint_path)
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
     # mask_encoder = build_mobile_sam_image_encoder(sam_checkpoint_path)
     mask_encoder = MaskEncoderLite(dim=dim)
 
@@ -1078,6 +1081,50 @@ def build_simple_mask_vqvae(
         simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
 
     return simple_mask_vqvae.to(device)
+
+
+def build_simple_mask_vqvae_dim384(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+) -> SimpleMaskVqvae:
+    """
+    Build SimpleMaskVqvae model.
+
+    Both image and mask use the same encoder architecture (MobileSAM/TinyViT).
+    """
+    # Model config (hardcoded)
+    vocab_size = 4096
+    dim = 384
+    beta = 0.25
+
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    # mask_encoder = build_mobile_sam_image_encoder(sam_checkpoint_path)
+    mask_encoder = MaskEncoderLite(dim=dim)
+
+    simple_mask_vqvae = SimpleMaskVqvae(
+        image_encoder=image_encoder,
+        mask_encoder=mask_encoder,
+        dim=dim,
+        vocab_size=vocab_size,
+        beta=beta,
+        device=device,
+    )
+
+    if simple_mask_vqvae_checkpoint_path is not None:
+        simple_mask_vqvae_state_dict = torch.load(simple_mask_vqvae_checkpoint_path)
+        if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
+            # 创建一个新的字典，移除 '_orig_mod.' 前缀
+            new_state_dict = {}
+            for key, value in simple_mask_vqvae_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_mask_vqvae_state_dict = new_state_dict
+        simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+
+    return simple_mask_vqvae.to(device)
+
 
 # def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:
 #     maskgit = MaskGIT(
@@ -1182,11 +1229,13 @@ def _build_dino_v3(model_name, checkpoint_path, device):
         model_name,
         pretrained=False,  # 不从网络加载权重
         num_classes=0,     # 移除分类头
+        img_size=1024,
         # features_only=True,
     )
 
     state_dict = load_file(checkpoint_path)
     model.load_state_dict(state_dict)
+    # model.set_input_size(1024)
     model.to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
@@ -1194,10 +1243,12 @@ def _build_dino_v3(model_name, checkpoint_path, device):
     return model
 
 def build_dino_v3_vits(checkpoint_path='ckpt/dino_v3_vits.safetensors', device='cpu'):
-    return _build_dino_v3('vit_small_patch16_dinov3', checkpoint_path, device)
+    dinov3 = _build_dino_v3('vit_small_patch16_dinov3', checkpoint_path, device)
+    return DinoV3Wrapper(dinov3)
 
 def build_dino_v3_vitb(checkpoint_path='ckpt/dino_v3_vitb.safetensors', device='cpu'):
-    return _build_dino_v3('vit_base_patch16_dinov3', checkpoint_path, device)
+    dinov3 = _build_dino_v3('vit_base_patch16_dinov3', checkpoint_path, device)
+    return DinoV3Wrapper(dinov3)
 
 def build_dino_v3_transform(dino_v3_model):
     data_config = timm.data.resolve_model_data_config(dino_v3_model)
@@ -1228,6 +1279,7 @@ builder_map = {
     },
     "simple_mask_vqvae": {
         "simple_mask_vqvae": build_simple_mask_vqvae,
+        "simple_mask_vqvae_dim384": build_simple_mask_vqvae_dim384,
     },
     "image_encoder": {
         "sam_vitb": build_sam_image_encoder,

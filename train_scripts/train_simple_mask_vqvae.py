@@ -220,7 +220,7 @@ class DICEBCELoss(nn.Module):
 
 class DiceNFLoss(nn.Module):
 
-    def __init__(self, smooth=1.0, weight_dice=2.0):
+    def __init__(self, smooth=1.0, weight_dice=1.0):
         super().__init__()
         self.dice_loss = DICELoss(smooth=smooth)
         self.focal_loss = NormalizedFocalLossSigmoid()
@@ -908,8 +908,10 @@ def main():
     # Checkpoint
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Resume from checkpoint')
-    parser.add_argument('--sam_checkpoint_path', type=str, default=None,
+    parser.add_argument('--image_encoder_checkpoint', type=str, default=None,
                         help='Path to SAM/MobileSAM checkpoint for initializing encoders')
+    parser.add_argument('--config', type=str, default='simple_mask_vqvae')
+    parser.add_argument('--image_encoder_config', type=str, default='mobile_sam')
 
     # Optimization
     parser.add_argument('--no_compile', action='store_true',
@@ -1014,9 +1016,12 @@ def main():
             print(f"Debug mode: using dummy dataset with different seeds per rank")
 
     # Build model using builder
-    model = builder_map['simple_mask_vqvae']['simple_mask_vqvae'](
+    print(f'Using config: {args.config}')
+    print(f'Using image_encoder: {args.image_encoder_config}')
+    model = builder_map['simple_mask_vqvae'][args.config](
         simple_mask_vqvae_checkpoint_path=args.resume_from,
-        sam_checkpoint_path=args.sam_checkpoint_path,
+        image_encoder_checkpoint=args.image_encoder_checkpoint,
+        image_encoder_config_name=args.image_encoder_config,
         device=device,
     )
 
