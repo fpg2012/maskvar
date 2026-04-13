@@ -74,7 +74,7 @@ class SimpleCrossBlock(nn.Module):
         rotated = torch.stack([rotated_real, rotated_imag], dim=-2)
         return rearrange(rotated, 'b h w d2 c -> b h w (d2 c)')
     
-    def forward(self, q, kv):
+    def forward(self, q, kv, pe_type='rope', image_pe=None):
         """
         q: (b, l, c)
         k: (b, h, w, c)
@@ -96,9 +96,14 @@ class SimpleCrossBlock(nn.Module):
         v = rearrange(v, 'b h w (nh c_head) -> b nh (h w) c_head', nh=self.num_heads, c_head=self.dim_head)
 
         # q = self.apply_2d_rope(q)
-        k = rearrange(k, 'b nh h w c_head -> (b nh) h w c_head')
-        k = self.apply_2d_rope(k)
-        k = rearrange(k, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
+        if pe_type == 'rope':
+            k = rearrange(k, 'b nh h w c_head -> (b nh) h w c_head')
+            k = self.apply_2d_rope(k)
+            k = rearrange(k, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
+        elif pe_tyep == 'sam':
+            k = k + image_pe
+        else:
+            raise ValueError(f"Invalid pe_type: {pe_type}")
 
         # out = flex_attention(q, k, v, attn_mask=None)
         out = F.scaled_dot_product_attention(q, k, v)
@@ -115,7 +120,7 @@ class SimpleCrossBlockReverse(SimpleCrossBlock):
     def __init__(self, dim, num_heads):
         super().__init__(dim, num_heads)
     
-    def forward(self, q, kv):
+    def forward(self, q, kv, pe_type='rope', image_pe=None):
         """
         q: (b, h, w, c)
         k: (b, l, c)
@@ -136,9 +141,14 @@ class SimpleCrossBlockReverse(SimpleCrossBlock):
         k = rearrange(k, 'b l (nh c_head) -> b nh l c_head', nh=self.num_heads, c_head=self.dim_head)
         v = rearrange(v, 'b l (nh c_head) -> b nh l c_head', nh=self.num_heads, c_head=self.dim_head)
 
-        q = rearrange(q, 'b nh h w c_head -> (b nh) h w c_head')
-        q = self.apply_2d_rope(q)
-        q = rearrange(q, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
+        if pe_type == 'rope':
+            q = rearrange(q, 'b nh h w c_head -> (b nh) h w c_head')
+            q = self.apply_2d_rope(q)
+            q = rearrange(q, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
+        elif pe_type == 'sam':
+            q = q + image_pe
+        else:
+            raise ValueError(f"Invalid pe_type: {pe_type}")
 
         # out = flex_attention(q, k, v, attn_mask=None)
         out = F.scaled_dot_product_attention(q, k, v)
@@ -193,19 +203,38 @@ class MaskEncoderLite(nn.Module):
         mask_tokens = rearrange(self.patch_embed(mask), 'b c h w -> b h w c')
         mask_tokens = mask_tokens + self.mlp(self.layer_norm(mask_tokens))
         
-        return mask_tokens
+        return rearrange(mask_tokens, 'b h w c -> b c h w')
 
 
-class SimpleMaskDecoder(nn.Module):
+class TwoWayBlock(nn.Module):
 
-    def __init__(self, dim, num_heads=4, num_queries=4):
+    def __init__(self, dim, num_heads):
         super().__init__()
         self.dim = dim
-        
+
         self.block1 = SimpleCrossBlock(dim, num_heads)
         self.reverse_block1 = SimpleCrossBlockReverse(dim, num_heads)
         self.block2 = SimpleCrossBlock(dim, num_heads)
         self.reverse_block2 = SimpleCrossBlockReverse(dim, num_heads)
+
+    def forward(self, query_tokens, mask_tokens, image_tokens, pe_type='rope', image_pe=None):
+        query_tokens = self.block1(query_tokens, mask_tokens, pe_type=pe_type, image_pe=image_pe)
+        image_tokens = self.reverse_block1(image_tokens, query_tokens, pe_type=pe_type, image_pe=image_pe)
+        query_tokens = self.block2(query_tokens, image_tokens, pe_type=pe_type, image_pe=image_pe)
+        mask_tokens = self.reverse_block2(mask_tokens, query_tokens, pe_type=pe_type, image_pe=image_pe)
+        return query_tokens, mask_tokens, image_tokens
+
+
+class SimpleMaskDecoder(nn.Module):
+
+    def __init__(self, dim, num_heads=4, num_queries=4, num_two_way_blocks=2):
+        super().__init__()
+        self.dim = dim
+        self.num_two_way_blocks = num_two_way_blocks
+
+        self.two_way_blocks = nn.ModuleList([
+            TwoWayBlock(dim, num_heads) for _ in range(num_two_way_blocks)
+        ])
         
         self.query_tokens = nn.Parameter(torch.randn(1, num_queries, dim))
         self.output_upscaling = nn.Sequential(
@@ -215,50 +244,44 @@ class SimpleMaskDecoder(nn.Module):
             nn.ConvTranspose2d(dim // 4, dim // 8, kernel_size=2, stride=2),
             nn.GELU(),
         )
+        self.output_upscaling2 = nn.Sequential(
+            nn.ConvTranspose2d(dim, dim // 4, kernel_size=2, stride=2),
+            LayerNorm2d(dim // 4),
+            nn.GELU(),
+            nn.ConvTranspose2d(dim // 4, dim // 8, kernel_size=2, stride=2),
+            nn.GELU(),
+        )
         self.hyper_in = MLP(dim, dim, dim // 8, 3)
-        self.layer_norm_image = nn.LayerNorm(dim)
-        self.layer_norm_mask = nn.LayerNorm(dim)
 
         self.layer_norm_pre_image = nn.LayerNorm(dim)
         self.layer_norm_pre_query = nn.LayerNorm(dim)
+        self.layer_norm_pre_mask = nn.LayerNorm(dim)
         self.layer_norm_post_image = nn.LayerNorm(dim // 8)
         self.layer_norm_post_query = nn.LayerNorm(dim // 8)
+        self.layer_norm_post_mask = nn.LayerNorm(dim // 8)
     
     def forward(self, mask_tokens: torch.Tensor, image_tokens: torch.Tensor):
         # print(f"[DEBUG] Decoder forward - mask_tokens: {mask_tokens.shape}, image_tokens: {image_tokens.shape}")
         
-        mask_tokens = self.layer_norm_image(image_tokens)
-        # image_tokens = self.layer_norm_mask(mask_tokens)
+        # mask_tokens = self.layer_norm_image(mask_tokens)
+        # image_tokens = self.layer_norm_mask(image_tokens)
 
         query_tokens = repeat(self.query_tokens, '1 l c -> b l c', b=mask_tokens.shape[0])
-        
-        query_tokens = self.block1(query_tokens, mask_tokens)
-        image_tokens = self.reverse_block1(image_tokens, query_tokens)
-        query_tokens = self.block2(query_tokens, image_tokens)
-
-        query_tokens = self.layer_norm_pre_query(query_tokens)
-        image_tokens = self.layer_norm_pre_image(image_tokens)
-        
-        # mask_feature_map = rearrange(mask_tokens, 'b h w c -> b c h w')
-        # image_feature_map = rearrange(image_tokens, 'b h w c -> b c h w')
-
-        # up_mask_map = self.output_upscaling(mask_feature_map)
-        # up_image_map = self.output_upscaling(image_feature_map)
-
-        # # Ensure contiguous memory layout after ConvTranspose2d to avoid stride issues in backward
-        # up_mask_map = up_mask_map.contiguous()
-        # up_image_map = up_image_map.contiguous()
-
-        # masks = torch.einsum('bchw,bchw->bhw', up_mask_map, up_image_map)
+        for blk in self.two_way_blocks:
+            query_tokens, mask_tokens, image_tokens = blk(query_tokens, mask_tokens, image_tokens, pe_type='rope')
 
         image_feature_map = rearrange(image_tokens, 'b h w c -> b c h w')
+        mask_feature_map = rearrange(mask_tokens, 'b h w c -> b c h w')
         up_query_token = self.hyper_in(query_tokens[:, 0, :])
         up_image_map = self.output_upscaling(image_feature_map)
+        # up_mask_map = self.output_upscaling2(mask_feature_map)
 
         up_query_token = self.layer_norm_post_query(up_query_token)
         up_image_map = self.layer_norm_post_image(rearrange(up_image_map, 'b c h w -> b h w c'))
+        # up_mask_map = self.layer_norm_post_mask(rearrange(up_mask_map, 'b c h w -> b h w c'))
 
         masks = torch.einsum('bc,bhwc->bhw', up_query_token, up_image_map).unsqueeze(1)
+        # masks = torch.einsum('bhwc,bhwc->bhw', up_mask_map, up_image_map)
         # try addition
         # masks = rearrange(up_query_token, 'b c -> b c 1 1') + up_image_map
         # masks = torch.mean(masks, dim=1, keepdim=True)
