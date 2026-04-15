@@ -422,3 +422,39 @@ class MaskLevelFlatDataset(Dataset):
         if num_pixels / (H * W) < thresh:
             return False
         return True
+
+
+class MaskLevelFlatSubsetDataset(MaskLevelFlatDataset):
+
+    def __init__(
+        self,
+        subset_list: Path,
+        index_mapping_path: Path,
+        dataset: Optional[MySegDataset], 
+        with_image_embed=True,
+        mask_filter_thresh=0.1,
+        dtype=torch.float32,
+        image_size_encoder=1024,
+        image_size_mask=256,
+        image_feature_cache: Optional[ImageFeatureCache] = None,
+        skip_preprocess=False,
+    ):
+        super().__init__(
+            index_mapping_path=index_mapping_path,
+            dataset=dataset,
+            with_image_embed=with_image_embed,
+            mask_filter_thresh=mask_filter_thresh,
+            dtype=dtype,
+            image_size_encoder=image_size_encoder,
+            image_size_mask=image_size_mask,
+            image_feature_cache=image_feature_cache,
+            skip_preprocess=skip_preprocess,
+        )
+        self.subset_list = np.load(subset_list)
+    
+    def __len__(self):
+        return self.subset_list.shape[0]
+    
+    def __getitem__(self, index):
+        real_index = self.subset_list[index]
+        return super().__getitem__(real_index)

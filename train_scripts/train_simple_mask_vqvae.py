@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 from maskvar.datasets.sharded_distributed_sampler import ShardedDistributedSampler
 from maskvar.maskseg_build_everything import builder_map
 from maskvar.datasets.mask_level_dataset import MaskLevelDatasetDummy
-from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset
+from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset, MaskLevelFlatSubsetDataset
 from maskvar.utils.metrics import calc_iou
 from maskvar.utils import restore_normalized_image
 
@@ -895,6 +895,8 @@ def main():
                         choices=['hqseg44k', 'cocolvis', 'coconut_hf'],
                         help='Dataset name')
     parser.add_argument('--dataset_path', type=str, default=None, help='Dataset path (auto-detected if None)')
+    parser.add_argument('--train_subset_index', type=str, default=None, help='Path to train subset indices (.npy file)')
+    parser.add_argument('--val_subset_index', type=str, default=None, help='Path to val subset indices (.npy file)')
 
     # Training settings
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
@@ -963,27 +965,53 @@ def main():
     # Build MaskLevelDataset
     index_mapping_path = f'data/flat/{args.dataset}'
 
-    train_set = MaskLevelFlatDataset(
-        index_mapping_path=Path(index_mapping_path) / "train_index_mapping.npy",
-        dataset=train_set_base,
-        with_image_embed=False,  # SimpleMaskVqvae encodes images on-the-fly
-        image_feature_cache=None,
-        mask_filter_thresh=0.1,
-        dtype=torch.float32,
-        image_size_encoder=1024,
-        image_size_mask=1024,
-    )
+    if args.train_subset_index:
+        train_set = MaskLevelFlatSubsetDataset(
+            subset_list=Path(args.train_subset_index),
+            index_mapping_path=Path(index_mapping_path) / "train_index_mapping.npy",
+            dataset=train_set_base,
+            with_image_embed=False,  # SimpleMaskVqvae encodes images on-the-fly
+            image_feature_cache=None,
+            mask_filter_thresh=0.1,
+            dtype=torch.float32,
+            image_size_encoder=1024,
+            image_size_mask=1024,
+        )
+    else:
+        train_set = MaskLevelFlatDataset(
+            index_mapping_path=Path(index_mapping_path) / "train_index_mapping.npy",
+            dataset=train_set_base,
+            with_image_embed=False,  # SimpleMaskVqvae encodes images on-the-fly
+            image_feature_cache=None,
+            mask_filter_thresh=0.1,
+            dtype=torch.float32,
+            image_size_encoder=1024,
+            image_size_mask=1024,
+        )
 
-    val_set = MaskLevelFlatDataset(
-        index_mapping_path=Path(index_mapping_path) / "val_index_mapping.npy",
-        dataset=val_set_base,
-        with_image_embed=False,  # SimpleMaskVqvae encodes images on-the-fly
-        image_feature_cache=None,
-        mask_filter_thresh=0.1,
-        dtype=torch.float32,
-        image_size_encoder=1024,
-        image_size_mask=1024,
-    )
+    if args.val_subset_index:
+        val_set = MaskLevelFlatSubsetDataset(
+            subset_list=Path(args.val_subset_index),
+            index_mapping_path=Path(index_mapping_path) / "val_index_mapping.npy",
+            dataset=val_set_base,
+            with_image_embed=False,  # SimpleMaskVqvae encodes images on-the-fly
+            image_feature_cache=None,
+            mask_filter_thresh=0.1,
+            dtype=torch.float32,
+            image_size_encoder=1024,
+            image_size_mask=1024,
+        )
+    else:
+        val_set = MaskLevelFlatDataset(
+            index_mapping_path=Path(index_mapping_path) / "val_index_mapping.npy",
+            dataset=val_set_base,
+            with_image_embed=False,  # SimpleMaskVqvae encodes images on-the-fly
+            image_feature_cache=None,
+            mask_filter_thresh=0.1,
+            dtype=torch.float32,
+            image_size_encoder=1024,
+            image_size_mask=1024,
+        )
 
     # Debug mode: use dummy dataset with fixed samples
     if args.debug:
