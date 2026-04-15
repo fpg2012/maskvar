@@ -906,10 +906,12 @@ def main():
     parser.add_argument('--dtype', type=str, default='float32',
                         choices=['float16', 'float32', 'bfloat16'],
                         help='Training dtype')
+    parser.add_argument('--enable_vq', action='store_true', help='Enable VQ training')
 
     # Checkpoint
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Resume from checkpoint')
+    parser.add_argument('--checkpoint', type=str, default=None, help='model init checkpoint path, will override --resume_from')
     parser.add_argument('--image_encoder_checkpoint', type=str, default=None,
                         help='Path to SAM/MobileSAM checkpoint for initializing encoders')
     parser.add_argument('--config', type=str, default='simple_mask_vqvae')
@@ -1046,10 +1048,18 @@ def main():
     # Build model using builder
     print(f'Using config: {args.config}')
     print(f'Using image_encoder: {args.image_encoder_config}')
+
+    checkpoint_to_use = args.checkpoint
+    if checkpoint_to_use is None:
+        checkpoint_to_use = args.resume_from
+
+    print(f'Loading checkpoint: {checkpoint_to_use}')
+
     model = builder_map['simple_mask_vqvae'][args.config](
-        simple_mask_vqvae_checkpoint_path=args.resume_from,
+        simple_mask_vqvae_checkpoint_path=checkpoint_to_use,
         image_encoder_checkpoint=args.image_encoder_checkpoint,
         image_encoder_config_name=args.image_encoder_config,
+        enable_vq=args.enable_vq,
         device=device,
     )
 

@@ -57,7 +57,6 @@ class SimpleCrossBlock(nn.Module):
         
         return torch.cat([x_h, x_w], dim=-1)
 
-
     def _apply_rotary(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         # x: (B, H, W, D)   D = C//2
         # cos, sin: broadcastable to (..., D//2)
@@ -452,11 +451,12 @@ class SimpleVectorQuantize(nn.Module):
 
 class SimpleMaskVqvae(nn.Module):
 
-    def __init__(self, image_encoder, mask_encoder, dim=256, vocab_size=4096, beta=0.25, device='cuda'):
+    def __init__(self, image_encoder, mask_encoder, dim=256, vocab_size=4096, beta=0.25, enable_vq=True, device='cuda'):
         super().__init__()
         self.dim = dim
         self.vocab_size = vocab_size
         self.beta = beta
+        self.enable_vq = enable_vq
 
         self.image_encoder = image_encoder
         self.mask_encoder = mask_encoder
@@ -490,15 +490,16 @@ class SimpleMaskVqvae(nn.Module):
         image_tokens = rearrange(image_tokens, 'b c h w -> b h w c')
 
         # 2. quantize mask_tokens
-        # if return_usage:
-        #     mask_tokens, vq_loss, vq_usage = self.quant(mask_tokens, return_usage=True)
-        # else:
-        #     mask_tokens, vq_loss = self.quant(mask_tokens)
-        #     vq_usage = None
-        
-        # skip quant now
-        vq_loss = torch.tensor(0.0)
-        vq_usage = torch.tensor(0.0)
+        if self.enable_vq:
+            if return_usage:
+                mask_tokens, vq_loss, vq_usage = self.quant(mask_tokens, return_usage=True)
+            else:
+                mask_tokens, vq_loss = self.quant(mask_tokens)
+                vq_usage = None
+        else:
+            # skip quant
+            vq_loss = torch.tensor(0.0)
+            vq_usage = torch.tensor(0.0)
 
         # 3. decode
         mask = self.mask_decoder(mask_tokens, image_tokens)

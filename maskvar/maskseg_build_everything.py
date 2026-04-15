@@ -1044,6 +1044,7 @@ def build_simple_mask_vqvae(
     simple_mask_vqvae_checkpoint_path: Optional[str] = None,
     image_encoder_checkpoint: Optional[str] = None,
     image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    enable_vq=False,
     device: str = 'cpu',
 ) -> SimpleMaskVqvae:
     """
@@ -1067,6 +1068,7 @@ def build_simple_mask_vqvae(
         vocab_size=vocab_size,
         beta=beta,
         device=device,
+        enable_vq=enable_vq
     )
 
     if simple_mask_vqvae_checkpoint_path is not None:
@@ -1098,6 +1100,7 @@ def build_simple_mask_vqvae_dim384(
     image_encoder_checkpoint: Optional[str] = None,
     image_encoder_config_name: Optional[str] = 'dino_v3_vits',
     device: str = 'cpu',
+    enable_vq=False,
 ) -> SimpleMaskVqvae:
     """
     Build SimpleMaskVqvae model.
@@ -1120,6 +1123,7 @@ def build_simple_mask_vqvae_dim384(
         vocab_size=vocab_size,
         beta=beta,
         device=device,
+        enable_vq=enable_vq,
     )
 
     if simple_mask_vqvae_checkpoint_path is not None:
