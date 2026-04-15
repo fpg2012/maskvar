@@ -1070,15 +1070,25 @@ def build_simple_mask_vqvae(
     )
 
     if simple_mask_vqvae_checkpoint_path is not None:
-        simple_mask_vqvae_state_dict = torch.load(simple_mask_vqvae_checkpoint_path)
+        checkpoint = torch.load(simple_mask_vqvae_checkpoint_path, map_location='cpu', weights_only=True)
+
+        # Handle full checkpoint format from training (contains 'model_state_dict')
+        if 'model_state_dict' in checkpoint:
+            simple_mask_vqvae_state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            simple_mask_vqvae_state_dict = checkpoint
+
+        # Remove '_orig_mod.' prefix from torch.compile
         if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
-            # 创建一个新的字典，移除 '_orig_mod.' 前缀
             new_state_dict = {}
             for key, value in simple_mask_vqvae_state_dict.items():
                 new_key = key.replace('_orig_mod.', '')
                 new_state_dict[new_key] = value
             simple_mask_vqvae_state_dict = new_state_dict
+
         simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+        print(f"Loaded SimpleMaskVqvae checkpoint from {simple_mask_vqvae_checkpoint_path}")
 
     return simple_mask_vqvae.to(device)
 
@@ -1113,15 +1123,25 @@ def build_simple_mask_vqvae_dim384(
     )
 
     if simple_mask_vqvae_checkpoint_path is not None:
-        simple_mask_vqvae_state_dict = torch.load(simple_mask_vqvae_checkpoint_path)
+        checkpoint = torch.load(simple_mask_vqvae_checkpoint_path, map_location='cpu', weights_only=True)
+
+        # Handle full checkpoint format from training (contains 'model_state_dict')
+        if 'model_state_dict' in checkpoint:
+            simple_mask_vqvae_state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            simple_mask_vqvae_state_dict = checkpoint
+
+        # Remove '_orig_mod.' prefix from torch.compile
         if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
-            # 创建一个新的字典，移除 '_orig_mod.' 前缀
             new_state_dict = {}
             for key, value in simple_mask_vqvae_state_dict.items():
                 new_key = key.replace('_orig_mod.', '')
                 new_state_dict[new_key] = value
             simple_mask_vqvae_state_dict = new_state_dict
+
         simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+        print(f"Loaded SimpleMaskVqvae checkpoint from {simple_mask_vqvae_checkpoint_path}")
 
     return simple_mask_vqvae.to(device)
 
