@@ -237,28 +237,37 @@ class SimpleMaskDecoder(nn.Module):
         ])
         
         self.query_tokens = nn.Parameter(torch.randn(1, num_queries, dim))
+        # self.output_upscaling = nn.Sequential(
+        #     nn.ConvTranspose2d(dim, dim // 4, kernel_size=4, stride=4),
+        #     LayerNorm2d(dim // 4),
+        #     nn.GELU(),
+        #     nn.ConvTranspose2d(dim // 4, dim // 8, kernel_size=4, stride=4),
+        #     nn.GELU(),
+        # )
         self.output_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(dim, dim // 4, kernel_size=2, stride=2),
+            nn.PixelShuffle(2),
+            nn.Conv2d(dim//4, dim//4, kernel_size=3, padding=1, bias=False),
             LayerNorm2d(dim // 4),
             nn.GELU(),
-            nn.ConvTranspose2d(dim // 4, dim // 8, kernel_size=2, stride=2),
+            nn.PixelShuffle(2),
+            nn.Conv2d(dim//16, dim//16, kernel_size=3, padding=1, bias=False),
             nn.GELU(),
         )
-        self.output_upscaling2 = nn.Sequential(
-            nn.ConvTranspose2d(dim, dim // 4, kernel_size=2, stride=2),
-            LayerNorm2d(dim // 4),
-            nn.GELU(),
-            nn.ConvTranspose2d(dim // 4, dim // 8, kernel_size=2, stride=2),
-            nn.GELU(),
-        )
-        self.hyper_in = MLP(dim, dim, dim // 8, 3)
+        # self.output_upscaling2 = nn.Sequential(
+        #     nn.ConvTranspose2d(dim, dim // 4, kernel_size=2, stride=2),
+        #     LayerNorm2d(dim // 4),
+        #     nn.GELU(),
+        #     nn.ConvTranspose2d(dim // 4, dim // 8, kernel_size=2, stride=2),
+        #     nn.GELU(),
+        # )
+        self.hyper_in = MLP(dim, dim, dim // 16, 3)
 
-        self.layer_norm_pre_image = nn.LayerNorm(dim)
-        self.layer_norm_pre_query = nn.LayerNorm(dim)
-        self.layer_norm_pre_mask = nn.LayerNorm(dim)
-        self.layer_norm_post_image = nn.LayerNorm(dim // 8)
-        self.layer_norm_post_query = nn.LayerNorm(dim // 8)
-        self.layer_norm_post_mask = nn.LayerNorm(dim // 8)
+        # self.layer_norm_pre_image = nn.LayerNorm(dim)
+        # self.layer_norm_pre_query = nn.LayerNorm(dim)
+        # self.layer_norm_pre_mask = nn.LayerNorm(dim)
+        self.layer_norm_post_image = nn.LayerNorm(dim // 16)
+        self.layer_norm_post_query = nn.LayerNorm(dim // 16)
+        # self.layer_norm_post_mask = nn.LayerNorm(dim // 16)
     
     def forward(self, mask_tokens: torch.Tensor, image_tokens: torch.Tensor):
         # print(f"[DEBUG] Decoder forward - mask_tokens: {mask_tokens.shape}, image_tokens: {image_tokens.shape}")
