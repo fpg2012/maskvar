@@ -628,29 +628,29 @@ def main():
             if args.test_mode == 'normal':
                 # Use original mask
                 mask_input = single_mask_normalized
-                gt_mask_for_iou = single_mask
+                gt_mask_for_iou = single_mask.float() * 2 - 1
             elif args.test_mode == 'bbox':
                 # Use bounding box mask
                 bbox_mask = create_bbox_mask(single_mask)  # single_mask is (1, H, W)
-                mask_input = bbox_mask  # Already (1, H, W)
+                mask_input = bbox_mask.float() * 2 - 1  # Already (1, H, W)
                 gt_mask_for_iou = single_mask
                 print(f"  Sample {i+1}: Using bbox mask")
             elif args.test_mode == 'random_rect':
                 # Use random rectangle mask
                 rect_mask = create_random_rect_mask(h, w)  # (1, H, W)
-                mask_input = rect_mask  # Already (1, H, W)
+                mask_input = rect_mask.float() * 2 - 1  # Already (1, H, W)
                 gt_mask_for_iou = single_mask  # Still use original for reference
                 print(f"  Sample {i+1}: Using random rectangle mask")
             elif args.test_mode == 'circles':
                 # Use circles mask sampled from mask (radius_ratio=0.05 for smaller circles)
                 circles_mask, centers = create_circles_mask(single_mask, num_points=2, radius_ratio=0.05)
-                mask_input = circles_mask  # Already (1, H, W)
+                mask_input = circles_mask.float() * 2 - 1  # Already (1, H, W)
                 gt_mask_for_iou = single_mask
                 print(f"  Sample {i+1}: Using circles mask with {len(centers)} centers: {centers}")
             elif args.test_mode == 'coarse':
                 # Use coarse mask (downsample then upsample)
                 coarse_mask = create_coarse_mask(single_mask, downsample_factor=args.coarse_factor)
-                mask_input = coarse_mask  # Already (1, H, W)
+                mask_input = coarse_mask.float() * 2 - 1  # Already (1, H, W)
                 gt_mask_for_iou = single_mask
                 print(f"  Sample {i+1}: Using coarse mask with factor 1/{args.coarse_factor}")
             else:
