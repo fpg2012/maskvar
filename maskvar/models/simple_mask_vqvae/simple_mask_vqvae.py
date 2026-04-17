@@ -99,7 +99,7 @@ class SimpleCrossBlock(nn.Module):
             k = rearrange(k, 'b nh h w c_head -> (b nh) h w c_head')
             k = self.apply_2d_rope(k)
             k = rearrange(k, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
-        elif pe_tyep == 'sam':
+        elif pe_type == 'sam':
             k = k + image_pe
         else:
             raise ValueError(f"Invalid pe_type: {pe_type}")
@@ -345,7 +345,7 @@ class SimpleVectorQuantize(nn.Module):
         self.using_znorm = using_znorm
 
         self.embedding = nn.Embedding(vocab_size, dim)
-        nn.init.uniform_(self.embedding.weight, -1.0 / vocab_size, 1.0 / vocab_size)
+        nn.init.normal_(self.embedding.weight, mean=0, std=0.5)
 
         # 词表使用统计（EMA）
         self.register_buffer('ema_vocab_hit', torch.zeros(vocab_size))

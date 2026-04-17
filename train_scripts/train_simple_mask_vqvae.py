@@ -254,6 +254,7 @@ class SimpleMaskVqvaeTrainer:
         num_workers: int = 4,
         prefetch_factor: int = 2,
         loss: str = 'nfl',
+        vq_loss_weight: float = 1.0,
         dtype: torch.dtype = torch.float32,
 ):
         self.model = model
@@ -315,6 +316,8 @@ class SimpleMaskVqvaeTrainer:
             self.criterion = DiceNFLoss()
         else:
             raise ValueError(f"Unknown loss: {loss}")
+
+        self.vq_loss_weight = vq_loss_weight
 
         # DataLoader
         self.train_sampler = None
@@ -422,7 +425,7 @@ class SimpleMaskVqvaeTrainer:
                 with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
                     rec_mask, vq_loss, vq_usage = self.model(single_mask_normalized, image, return_usage=True)
                     recon_loss = self.criterion(rec_mask, (single_mask > 0.5).float()).mean()
-                    loss = (recon_loss + vq_loss) / self.accumulate_steps
+                    loss = (recon_loss + self.vq_loss_weight * vq_loss) / self.accumulate_steps
 
                 # Backward pass
                 loss.backward()
@@ -907,6 +910,7 @@ def main():
                         choices=['float16', 'float32', 'bfloat16'],
                         help='Training dtype')
     parser.add_argument('--enable_vq', action='store_true', help='Enable VQ training')
+    parser.add_argument('--vq_loss_weight', type=float, default=1.0, help='Weight for VQ loss')
 
     # Checkpoint
     parser.add_argument('--resume_from', type=str, default=None,
