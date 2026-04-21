@@ -920,6 +920,7 @@ def main():
                         help='Path to SAM/MobileSAM checkpoint for initializing encoders')
     parser.add_argument('--config', type=str, default='simple_mask_vqvae')
     parser.add_argument('--image_encoder_config', type=str, default='mobile_sam')
+    parser.add_argument('--kmeans_centroids', type=str, default=None)
 
     # Optimization
     parser.add_argument('--no_compile', action='store_true',
@@ -1064,6 +1065,7 @@ def main():
         image_encoder_checkpoint=args.image_encoder_checkpoint,
         image_encoder_config_name=args.image_encoder_config,
         enable_vq=args.enable_vq,
+        kmeans_centroids_path=args.kmeans_centroids,
         device=device,
     )
 

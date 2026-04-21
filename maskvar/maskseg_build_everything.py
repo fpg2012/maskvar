@@ -1046,11 +1046,20 @@ def build_simple_mask_vqvae(
     image_encoder_config_name: Optional[str] = 'dino_v3_vits',
     enable_vq=False,
     device: str = 'cpu',
+    kmeans_centroids_path: Optional[str] = None,
 ) -> SimpleMaskVqvae:
     """
     Build SimpleMaskVqvae model.
 
     Both image and mask use the same encoder architecture (MobileSAM/TinyViT).
+
+    Args:
+        simple_mask_vqvae_checkpoint_path: Path to model checkpoint
+        image_encoder_checkpoint: Path to image encoder checkpoint
+        image_encoder_config_name: Name of image encoder config
+        enable_vq: Whether to enable VQ
+        device: Device to load model on
+        kmeans_centroids_path: Path to KMeans centroids for initializing VQ codebook (.npy or .pt)
     """
     # Model config (hardcoded)
     vocab_size = 4096
@@ -1092,6 +1101,10 @@ def build_simple_mask_vqvae(
         simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
         print(f"Loaded SimpleMaskVqvae checkpoint from {simple_mask_vqvae_checkpoint_path}")
 
+    # Initialize VQ codebook from KMeans centroids if provided
+    if kmeans_centroids_path is not None:
+        _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
+
     return simple_mask_vqvae.to(device)
 
 
@@ -1101,11 +1114,20 @@ def build_simple_mask_vqvae_dim384(
     image_encoder_config_name: Optional[str] = 'dino_v3_vits',
     device: str = 'cpu',
     enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
 ) -> SimpleMaskVqvae:
     """
-    Build SimpleMaskVqvae model.
+    Build SimpleMaskVqvae model with dim=384.
 
     Both image and mask use the same encoder architecture (MobileSAM/TinyViT).
+
+    Args:
+        simple_mask_vqvae_checkpoint_path: Path to model checkpoint
+        image_encoder_checkpoint: Path to image encoder checkpoint
+        image_encoder_config_name: Name of image encoder config
+        device: Device to load model on
+        enable_vq: Whether to enable VQ
+        kmeans_centroids_path: Path to KMeans centroids for initializing VQ codebook (.npy or .pt)
     """
     # Model config (hardcoded)
     vocab_size = 4096
@@ -1147,7 +1169,53 @@ def build_simple_mask_vqvae_dim384(
         simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
         print(f"Loaded SimpleMaskVqvae checkpoint from {simple_mask_vqvae_checkpoint_path}")
 
+    # Initialize VQ codebook from KMeans centroids if provided
+    if kmeans_centroids_path is not None:
+        _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
+
     return simple_mask_vqvae.to(device)
+
+
+def _initialize_codebook_from_kmeans(model: SimpleMaskVqvae, centroids_path: str):
+    """
+    Initialize VQ codebook using KMeans centroids.
+
+    Args:
+        model: SimpleMaskVqvae instance
+        centroids_path: Path to KMeans centroids file (.npy or .pt)
+    """
+    import numpy as np
+
+    # Load centroids based on file extension
+    if centroids_path.endswith('.npy'):
+        centroids = np.load(centroids_path)
+        centroids = torch.from_numpy(centroids).float()
+    elif centroids_path.endswith('.pt') or centroids_path.endswith('.pth'):
+        centroids = torch.load(centroids_path, map_location='cpu')
+        if isinstance(centroids, np.ndarray):
+            centroids = torch.from_numpy(centroids).float()
+    else:
+        raise ValueError(f"Unsupported file format: {centroids_path}. Use .npy or .pt/.pth")
+
+    # Validate dimensions
+    if centroids.shape[0] != model.vocab_size:
+        raise ValueError(
+            f"Vocab size mismatch: centroids have {centroids.shape[0]} clusters, "
+            f"but model expects vocab_size={model.vocab_size}"
+        )
+    if centroids.shape[1] != model.dim:
+        raise ValueError(
+            f"Dimension mismatch: centroids have dim={centroids.shape[1]}, "
+            f"but model expects dim={model.dim}"
+        )
+
+    # Initialize the embedding weights
+    with torch.no_grad():
+        model.quant.embedding.weight.copy_(centroids)
+
+    print(f"Initialized VQ codebook from KMeans centroids: {centroids_path}")
+    print(f"  Centroids shape: {centroids.shape}")
+    print(f"  Centroids mean: {centroids.mean().item():.4f}, std: {centroids.std().item():.4f}")
 
 
 # def build_maskgit(vqvae: VQVAE_Single, maskgit_checkpoint_path: Optional[str] = None) -> MaskGIT:

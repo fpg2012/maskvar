@@ -3,7 +3,7 @@
 # COCONut contains more diverse segmentation masks including stuff classes
 
 N_NODE=${1:-4}
-OUTDIR=${2:-out/ddp_simple_mask_vqvae_coconut_ep5_17vq}
+OUTDIR=${2:-out/ddp_simple_mask_vqvae_coconut_ep5_18vq_kmeans_init}
 export MASTER_PORT=${3:-29500}
 export OMP_NUM_THREADS=4
 
@@ -14,7 +14,7 @@ if [ $N_NODE -eq 0 ]; then
     --inner_iters 0 \
     --val_iters 0 \
     --batch_size 16 \
-    --learning_rate 2e-4 \
+    --learning_rate 1e-4 \
     --accumulate_steps 1 \
     --num_workers 8 \
     --prefetch_factor 4 \
@@ -28,7 +28,9 @@ if [ $N_NODE -eq 0 ]; then
     --freeze_image_encoder \
     --train_subset_index data/subset/coconut_hf_train-25_percent.npy \
     --enable_vq \
-    --checkpoint out/ddp_simple_mask_vqvae_coconut_ep10_16pixelshuffle_conv/checkpoints/latest.pth
+    --vq_loss_weight 1.0 \
+    --checkpoint out/ddp_simple_mask_vqvae_coconut_ep10_16pixelshuffle_conv/checkpoints/latest.pth \
+    --kmeans_centroids notebooks/out/kmeans_init/kmeans_centroids_n4096.pt
 else
     torchrun --nproc_per_node=$N_NODE train_scripts/train_simple_mask_vqvae.py \
     --out_dir $OUTDIR \
@@ -36,7 +38,7 @@ else
     --inner_iters 0 \
     --val_iters 0 \
     --batch_size 16 \
-    --learning_rate 2e-4 \
+    --learning_rate 1e-4 \
     --accumulate_steps 1 \
     --num_workers 8 \
     --prefetch_factor 4 \
@@ -51,5 +53,7 @@ else
     --log_interval 64 \
     --train_subset_index data/subset/coconut_hf_train-25_percent.npy \
     --enable_vq \
-    --checkpoint out/ddp_simple_mask_vqvae_coconut_ep10_16pixelshuffle_conv/checkpoints/latest.pth
+    --vq_loss_weight 1.0 \
+    --checkpoint out/ddp_simple_mask_vqvae_coconut_ep10_16pixelshuffle_conv/checkpoints/latest.pth \
+    --kmeans_centroids notebooks/out/kmeans_init/kmeans_centroids_n4096.pt
 fi
