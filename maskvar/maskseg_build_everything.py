@@ -19,7 +19,10 @@ from .models.tinyvit import TinyViT
 from .models.simple_ar import SimpleAR, SimpleVAR, SimpleVARSamDecoder
 from .models.simple_ar.adapted_mask_decoder import AdaptedMaskDecoder
 from .models.simple_ar.adapted_twt import AdaptedTwoWayTransformer
-from .models.simple_mask_vqvae.simple_mask_vqvae import SimpleMaskVqvae, MaskEncoderLite
+from .models.simple_mask_vqvae import (
+    SimpleMaskVqvae, MaskEncoderLite,
+    SimpleMaskVqvaeV2,
+)
 from .models.dino_wrapper import DinoV3Wrapper
 
 from .datasets.mask_level_dataset import MaskLevelDataset
@@ -1176,6 +1179,74 @@ def build_simple_mask_vqvae_dim384(
     return simple_mask_vqvae.to(device)
 
 
+def build_simple_mask_vqvae_v2_dim384(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
+) -> SimpleMaskVqvae:
+    """
+    Build SimpleMaskVqvae model with dim=384.
+
+    Both image and mask use the same encoder architecture (MobileSAM/TinyViT).
+
+    Args:
+        simple_mask_vqvae_checkpoint_path: Path to model checkpoint
+        image_encoder_checkpoint: Path to image encoder checkpoint
+        image_encoder_config_name: Name of image encoder config
+        device: Device to load model on
+        enable_vq: Whether to enable VQ
+        kmeans_centroids_path: Path to KMeans centroids for initializing VQ codebook (.npy or .pt)
+    """
+    # Model config (hardcoded)
+    vocab_size = 4096
+    dim = 384
+    beta = 0.25
+
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    # mask_encoder = build_mobile_sam_image_encoder(sam_checkpoint_path)
+    mask_encoder = MaskEncoderLite(dim=dim)
+
+    simple_mask_vqvae = SimpleMaskVqvaeV2(
+        image_encoder=image_encoder,
+        mask_encoder=mask_encoder,
+        dim=dim,
+        vocab_size=vocab_size,
+        beta=beta,
+        device=device,
+        enable_vq=enable_vq,
+    )
+
+    if simple_mask_vqvae_checkpoint_path is not None:
+        checkpoint = torch.load(simple_mask_vqvae_checkpoint_path, map_location='cpu', weights_only=True)
+
+        # Handle full checkpoint format from training (contains 'model_state_dict')
+        if 'model_state_dict' in checkpoint:
+            simple_mask_vqvae_state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            simple_mask_vqvae_state_dict = checkpoint
+
+        # Remove '_orig_mod.' prefix from torch.compile
+        if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
+            new_state_dict = {}
+            for key, value in simple_mask_vqvae_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_mask_vqvae_state_dict = new_state_dict
+
+        simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+        print(f"Loaded SimpleMaskVqvae checkpoint from {simple_mask_vqvae_checkpoint_path}")
+
+    # Initialize VQ codebook from KMeans centroids if provided
+    if kmeans_centroids_path is not None:
+        _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
+
+    return simple_mask_vqvae.to(device)
+
+
 def _initialize_codebook_from_kmeans(model: SimpleMaskVqvae, centroids_path: str):
     """
     Initialize VQ codebook using KMeans centroids.
@@ -1372,6 +1443,7 @@ builder_map = {
     "simple_mask_vqvae": {
         "simple_mask_vqvae": build_simple_mask_vqvae,
         "simple_mask_vqvae_dim384": build_simple_mask_vqvae_dim384,
+        "simple_mask_vqvae_v2_dim384": build_simple_mask_vqvae_v2_dim384,
     },
     "image_encoder": {
         "sam_vitb": build_sam_image_encoder,

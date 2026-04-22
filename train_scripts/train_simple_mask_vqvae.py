@@ -256,6 +256,7 @@ class SimpleMaskVqvaeTrainer:
         loss: str = 'nfl',
         vq_loss_weight: float = 1.0,
         dtype: torch.dtype = torch.float32,
+        find_unused_parameters=True,
 ):
         self.model = model
         self.device = device
@@ -287,7 +288,7 @@ class SimpleMaskVqvaeTrainer:
             self.model = DDP(
                 self.model,
                 device_ids=[self.local_rank],
-                find_unused_parameters=True,
+                find_unused_parameters=find_unused_parameters,
                 gradient_as_bucket_view=False,
             )
 
@@ -925,6 +926,7 @@ def main():
     # Optimization
     parser.add_argument('--no_compile', action='store_true',
                         help='Disable torch.compile for model acceleration')
+    parser.add_argument('--disable_find_unused_parameters', action='store_true')
 
     # Debug
     parser.add_argument('--debug', action='store_true', help='Debug mode (use dummy dataset)')
@@ -1108,6 +1110,7 @@ def main():
         prefetch_factor=args.prefetch_factor,
         loss=args.loss,
         dtype=dtype,
+        find_unused_parameters=not args.disable_find_unused_parameters,
     )
 
     # Resume from checkpoint (already handled by builder, but trainer needs to load optimizer state)
