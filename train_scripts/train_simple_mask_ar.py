@@ -114,6 +114,7 @@ class SimpleMaskARTrainer:
         train_vis_interval_mult: int = 20,
         enable_timing: bool = False,
         profiler=None,
+        infer_val_batches: int = 4,
     ):
         self.model = model
         self.vqvae_model = vqvae_model
@@ -124,6 +125,7 @@ class SimpleMaskARTrainer:
         self.train_vis_interval_mult = train_vis_interval_mult
         self.enable_timing = enable_timing
         self.profiler = profiler
+        self.infer_val_batches = infer_val_batches
 
         # Distributed training setup
         if tdist.is_initialized():
@@ -316,24 +318,28 @@ class SimpleMaskARTrainer:
         return mask_logits
 
     @torch.no_grad()
-    def compute_mask_predictions(self, logits, image_tokens, gt_mask):
-        """Compute teacher-forcing and pure-autoregressive mask predictions plus IoU."""
+    def compute_mask_predictions(self, logits, image_tokens, gt_mask, compute_infer: bool = True):
+        """Compute teacher-forcing predictions and optional pure-autoregressive predictions plus IoU."""
         teacher_token_ids = logits.argmax(dim=-1)
         teacher_mask_logits = self.decode_token_ids_to_mask_logits(
             teacher_token_ids,
             image_tokens,
             output_size=gt_mask.shape[-2:],
         )
-
-        infer_token_ids = self._get_ar_model().autoregressive_infer(image_tokens)
-        infer_mask_logits = self.decode_token_ids_to_mask_logits(
-            infer_token_ids,
-            image_tokens,
-            output_size=gt_mask.shape[-2:],
-        )
-
         teacher_iou = calc_iou(teacher_mask_logits, gt_mask)
-        infer_iou = calc_iou(infer_mask_logits, gt_mask)
+
+        infer_token_ids = None
+        infer_mask_logits = None
+        infer_iou = None
+
+        if compute_infer:
+            infer_token_ids = self._get_ar_model().autoregressive_infer(image_tokens)
+            infer_mask_logits = self.decode_token_ids_to_mask_logits(
+                infer_token_ids,
+                image_tokens,
+                output_size=gt_mask.shape[-2:],
+            )
+            infer_iou = calc_iou(infer_mask_logits, gt_mask)
 
         return {
             'teacher_token_ids': teacher_token_ids,
@@ -629,10 +635,14 @@ class SimpleMaskARTrainer:
         if self.world_size > 1:
             tdist.barrier()
 
-        self.validate(num_val_iters=val_iters, outer_iter=outer_iter)
+        self.validate(
+            num_val_iters=val_iters,
+            outer_iter=outer_iter,
+            infer_val_batches=getattr(self, 'infer_val_batches', 4),
+        )
 
     @torch.no_grad()
-    def validate(self, num_val_iters: int = 0, outer_iter: int = 0) -> dict:
+    def validate(self, num_val_iters: int = 0, outer_iter: int = 0, infer_val_batches: int = 4) -> dict:
         """Validate on validation set."""
         if num_val_iters < 0:
             return {'loss': 0.0, 'accuracy': 0.0, 'teacher_iou': 0.0, 'infer_iou': 0.0}
@@ -645,6 +655,7 @@ class SimpleMaskARTrainer:
         total_infer_iou = 0.0
         num_batches = 0
         num_iou_samples = 0
+        num_infer_iou_samples = 0
         vis_samples = []
 
         if num_val_iters == 0:
@@ -683,18 +694,26 @@ class SimpleMaskARTrainer:
             # Calculate accuracy
             pred_ids = logits.argmax(dim=-1)
             correct = (pred_ids == token_ids).float().mean()
-            vis_outputs = self.compute_mask_predictions(logits, image_tokens, single_mask)
+            compute_infer = iters_count < infer_val_batches
+            vis_outputs = self.compute_mask_predictions(
+                logits,
+                image_tokens,
+                single_mask,
+                compute_infer=compute_infer,
+            )
             teacher_iou = vis_outputs['teacher_iou']
             infer_iou = vis_outputs['infer_iou']
 
             total_loss += loss.item()
             total_acc += correct.item()
             total_teacher_iou += teacher_iou.sum().item()
-            total_infer_iou += infer_iou.sum().item()
             num_batches += 1
             num_iou_samples += teacher_iou.shape[0]
+            if infer_iou is not None:
+                total_infer_iou += infer_iou.sum().item()
+                num_infer_iou_samples += infer_iou.shape[0]
 
-            if self.rank == 0 and len(vis_samples) < 8:
+            if self.rank == 0 and infer_iou is not None and len(vis_samples) < 8:
                 remain = 8 - len(vis_samples)
                 for idx in range(min(remain, image.shape[0])):
                     vis_samples.append({
@@ -708,12 +727,14 @@ class SimpleMaskARTrainer:
 
             if self.rank == 0:
                 pbar.update(1)
-                pbar.set_postfix({
+                postfix = {
                     'loss': f'{loss.item():.4f}',
                     'acc': f'{correct.item():.4f}',
                     'teacher_iou': f'{teacher_iou.mean().item():.4f}',
-                    'infer_iou': f'{infer_iou.mean().item():.4f}',
-                })
+                }
+                if infer_iou is not None:
+                    postfix['infer_iou'] = f'{infer_iou.mean().item():.4f}'
+                pbar.set_postfix(postfix)
 
             iters_count += 1
 
@@ -723,11 +744,11 @@ class SimpleMaskARTrainer:
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         avg_acc = total_acc / num_batches if num_batches > 0 else 0.0
         avg_teacher_iou = total_teacher_iou / num_iou_samples if num_iou_samples > 0 else 0.0
-        avg_infer_iou = total_infer_iou / num_iou_samples if num_iou_samples > 0 else 0.0
+        avg_infer_iou = total_infer_iou / num_infer_iou_samples if num_infer_iou_samples > 0 else 0.0
 
         if self.world_size > 1:
             metrics = torch.tensor(
-                [total_loss, total_acc, total_teacher_iou, total_infer_iou, num_batches, num_iou_samples],
+                [total_loss, total_acc, total_teacher_iou, total_infer_iou, num_batches, num_iou_samples, num_infer_iou_samples],
                 device=self.device,
             )
             tdist.all_reduce(metrics, op=tdist.ReduceOp.SUM)
@@ -735,7 +756,7 @@ class SimpleMaskARTrainer:
             avg_loss = metrics[0].item() / total_val_iters
             avg_acc = metrics[1].item() / total_val_iters
             avg_teacher_iou = metrics[2].item() / metrics[5].item()
-            avg_infer_iou = metrics[3].item() / metrics[5].item()
+            avg_infer_iou = metrics[3].item() / metrics[6].item() if metrics[6].item() > 0 else 0.0
 
         if self.rank == 0:
             if vis_samples:
@@ -857,6 +878,8 @@ def main():
         help='Run a very short end-to-end smoketest that forces frequent logging and visualization',
     )
     parser.add_argument('--timing', action='store_true', help='Print lightweight timing breakdown on log steps')
+    parser.add_argument('--val_infer_batches', type=int, default=4,
+                        help='Number of validation batches to run pure inference IoU and visualization on')
     parser.add_argument('--profile', action='store_true', help='Enable short torch profiler trace at startup')
     parser.add_argument('--profile_wait', type=int, default=1, help='Profiler wait steps')
     parser.add_argument('--profile_warmup', type=int, default=1, help='Profiler warmup steps')
@@ -1076,6 +1099,7 @@ def main():
         train_vis_interval_mult=1 if args.debug_smoketest else 20,
         enable_timing=args.timing or args.debug_smoketest,
         profiler=profiler,
+        infer_val_batches=args.val_infer_batches,
     )
 
     # Resume from checkpoint

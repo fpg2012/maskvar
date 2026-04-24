@@ -53,6 +53,7 @@ else
     --train_subset_index data/subset/coconut_hf_train-25_percent.npy \
     --log_interval 128 \
     --disable_find_unused_parameters \
+    --resume_from $OUTDIR/checkpoints/iter_5968.pth \
     # --resume_from path/to/checkpoint.pth \
     # --no_compile \
 fi
