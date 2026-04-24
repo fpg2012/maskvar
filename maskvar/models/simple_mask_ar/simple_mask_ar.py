@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask
 from einops import rearrange
 
 from .basic import RotaryPositionEmbedding, SimpleCrossBlock, SimpleSelfBlock
@@ -33,9 +32,36 @@ class SimpleMaskARBlock(nn.Module):
             image_tokens: (b, h, w, c) - spatial format
             coords: (l, 2) - coordinates for each position in sequence
         """
+        _, h, w, _ = image_tokens.shape
         x_seq = self.cross_block.forward_seq(x_seq, image_tokens, coords)
-        x_seq = self.self_block.forward_seq(x_seq, coords, block_mask=None)
+        x_seq = self.self_block.forward_seq(x_seq, coords, block_mask=None, spatial_shape=(h, w))
         return x_seq
+
+    def precompute_cross_kv(self, image_tokens):
+        return self.cross_block.precompute_kv(image_tokens)
+
+    def forward_step(self, x_step, cross_cache, self_cache, coord):
+        """
+        Incremental autoregressive step for a single token.
+
+        Args:
+            x_step: (b, 1, c)
+            cross_cache: tuple(cached_k, cached_v, h, w)
+            self_cache: optional tuple(cache_k, cache_v)
+            coord: (1, 2)
+        """
+        cached_k, cached_v, h, w = cross_cache
+        cache_k, cache_v = (self_cache if self_cache is not None else (None, None))
+
+        x_step = self.cross_block.forward_step(x_step, cached_k, cached_v, coord, h, w)
+        x_step, new_k, new_v = self.self_block.forward_step(
+            x_step,
+            coord,
+            cache_k=cache_k,
+            cache_v=cache_v,
+            spatial_shape=(h, w),
+        )
+        return x_step, (new_k, new_v)
 
 
 class SimpleMaskAR(nn.Module):
@@ -52,7 +78,6 @@ class SimpleMaskAR(nn.Module):
         self.embed = nn.Embedding(self.vocab_size, dim)
         self.cls = nn.Linear(dim, self.vocab_size)
 
-        self.block_mask = None
         self.rope = RotaryPositionEmbedding(h=h, w=w)
 
         self.sos = nn.Parameter(torch.randn(dim))
@@ -63,16 +88,6 @@ class SimpleMaskAR(nn.Module):
 
     def get_device(self):
         return next(self.parameters()).device
-
-    def init_block_mask(self):
-        """Initialize causal block mask for training."""
-        def mask_mod(b, h, q_idx, k_idx) -> bool:
-            return (q_idx >= k_idx)
-
-        device = self.get_device()
-        # L = H*W (including sos at position 0)
-        L = self.max_len
-        self.block_mask = create_block_mask(mask_mod, B=None, H=None, Q_LEN=L, KV_LEN=L, device=device)
 
     def preprocess(self, x: torch.Tensor):
         """
@@ -115,13 +130,10 @@ class SimpleMaskAR(nn.Module):
 
         Note: The last position's prediction is not used in loss (no ground truth).
         """
-        if self.block_mask is None:
-            self.init_block_mask()
-
         x = self.preprocess(x)  # (B, H, W, C)
 
         for block in self.blocks:
-            x = block(x, image_tokens, block_mask=self.block_mask)
+            x = block(x, image_tokens, block_mask=None)
 
         # Classify to get logits
         logits = self.cls(x)  # (B, H, W, vocab_size)
@@ -149,23 +161,27 @@ class SimpleMaskAR(nn.Module):
             device=device, dtype=torch.long
         )  # (H*W, 2)
 
-        # Initialize sequence with sos token embedding
-        sos_embed = self.sos.view(1, 1, self.dim).expand(B, 1, -1)  # (B, 1, C)
-        x_seq = sos_embed  # (B, 1, C)
+        # Initialize step input with sos embedding and per-block caches.
+        x_step = self.sos.view(1, 1, self.dim).expand(B, 1, -1)  # (B, 1, C)
+        cross_caches = [block.precompute_cross_kv(image_tokens) for block in self.blocks]
+        self_caches = [None for _ in self.blocks]
 
         generated_ids = []
 
         for i in range(H * W):
-            # Current position coordinates (up to position i, which is i+1 tokens)
-            curr_coords = coords[:i+1]  # (i+1, 2)
+            curr_coord = coords[i:i+1]  # (1, 2)
 
-            # Forward pass through all blocks
-            x_out = x_seq
-            for block in self.blocks:
-                x_out = block.forward_seq(x_out, image_tokens, curr_coords)
+            x_out = x_step
+            for block_idx, block in enumerate(self.blocks):
+                x_out, self_caches[block_idx] = block.forward_step(
+                    x_out,
+                    cross_caches[block_idx],
+                    self_caches[block_idx],
+                    curr_coord,
+                )
 
             # Get logits for the current (last) position
-            logits = self.cls(x_out[:, -1, :])  # (B, vocab_size)
+            logits = self.cls(x_out[:, 0, :])  # (B, vocab_size)
 
             # Sample next token
             if temperature == 0:
@@ -181,8 +197,7 @@ class SimpleMaskAR(nn.Module):
 
             # Append next token embedding to sequence (for next iteration)
             if i < H * W - 1:
-                next_embed = self.embed(next_token).unsqueeze(1)  # (B, 1, C)
-                x_seq = torch.cat([x_seq, next_embed], dim=1)  # (B, i+2, C)
+                x_step = self.embed(next_token).unsqueeze(1)  # (B, 1, C)
 
         # Stack generated tokens and reshape to spatial
         generated = torch.stack(generated_ids, dim=1)  # (B, H*W)

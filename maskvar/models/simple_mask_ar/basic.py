@@ -1,8 +1,7 @@
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import flex_attention
 import torch.nn.functional as F
-from einops import repeat, rearrange
+from einops import rearrange
 
 
 class RotaryPositionEmbedding(nn.Module):
@@ -164,6 +163,8 @@ class SimpleCrossBlock(nn.Module):
 
         k = self.rope.apply_2d_rope(k)
         q = self.rope.apply_2d_rope(q)
+        k = k.to(v.dtype)
+        q = q.to(v.dtype)
 
         k = rearrange(k, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
         q = rearrange(q, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
@@ -171,6 +172,7 @@ class SimpleCrossBlock(nn.Module):
         # out = flex_attention(q, k, v, attn_mask=None)
         out = F.scaled_dot_product_attention(q, k, v)
         out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
+        out = rearrange(out, 'b (h w) c -> b h w c', h=h, w=w)
         out = q_input + self.out_proj(out)
 
         out = out + self.ffn(self.layernorm(out))
@@ -205,11 +207,13 @@ class SimpleCrossBlock(nn.Module):
         # Apply RoPE with coordinates for q (sequence)
         q = rearrange(q, 'b nh l c_head -> (b nh) l c_head')
         q = self.rope.apply_2d_rope_with_coords(q, q_coords, h, w)
+        q = q.to(v.dtype)
         q = rearrange(q, '(b nh) l c_head -> b nh l c_head', b=b, nh=self.num_heads)
 
         # Apply RoPE for k (spatial)
         k = rearrange(k, 'b nh h w c_head -> (b nh) h w c_head')
         k = self.rope.apply_2d_rope(k)
+        k = k.to(v.dtype)
         k = rearrange(k, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
 
         # Attention
@@ -217,6 +221,57 @@ class SimpleCrossBlock(nn.Module):
         out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
         out = q_input + self.out_proj(out)
 
+        out = out + self.ffn(self.layernorm(out))
+
+        return out
+
+    def precompute_kv(self, kv):
+        """
+        Precompute static image K/V for autoregressive inference.
+
+        Args:
+            kv: (b, h, w, c) - image tokens in spatial format
+        Returns:
+            cached_k, cached_v, h, w
+        """
+        b, h, w, _ = kv.shape
+        kv = self.linear_kv(kv)
+        k, v = kv.chunk(2, dim=-1)
+
+        k = rearrange(k, 'b h w (nh c_head) -> b nh h w c_head', nh=self.num_heads, c_head=self.dim_head)
+        v = rearrange(v, 'b h w (nh c_head) -> b nh (h w) c_head', nh=self.num_heads, c_head=self.dim_head)
+
+        k = rearrange(k, 'b nh h w c_head -> (b nh) h w c_head')
+        k = self.rope.apply_2d_rope(k)
+        k = k.to(v.dtype)
+        k = rearrange(k, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
+
+        return k, v, h, w
+
+    def forward_step(self, q_step, cached_k, cached_v, coord, h, w):
+        """
+        Incremental cross-attention for a single autoregressive step.
+
+        Args:
+            q_step: (b, 1, c)
+            cached_k: (b, nh, hw, c_head)
+            cached_v: (b, nh, hw, c_head)
+            coord: (1, 2)
+            h, w: full spatial shape for RoPE scaling
+        """
+        b, _, _ = q_step.shape
+        q_input = q_step
+
+        q = self.linear_q(q_step)
+        q = rearrange(q, 'b l (nh c_head) -> b nh l c_head', nh=self.num_heads, c_head=self.dim_head)
+        q = rearrange(q, 'b nh l c_head -> (b nh) l c_head')
+        q = self.rope.apply_2d_rope_with_coords(q, coord, h, w)
+        q = q.to(cached_v.dtype)
+        q = rearrange(q, '(b nh) l c_head -> b nh l c_head', b=b, nh=self.num_heads)
+
+        out = F.scaled_dot_product_attention(q, cached_k, cached_v)
+        out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
+        out = q_input + self.out_proj(out)
         out = out + self.ffn(self.layernorm(out))
 
         return out
@@ -263,19 +318,22 @@ class SimpleSelfBlock(nn.Module):
 
         k = self.rope.apply_2d_rope(k)
         q = self.rope.apply_2d_rope(q)
+        k = k.to(v.dtype)
+        q = q.to(v.dtype)
 
         k = rearrange(k, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
         q = rearrange(q, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
 
-        out = flex_attention(q, k, v, block_mask=attn_mask)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
+        out = rearrange(out, 'b (h w) c -> b h w c', h=h, w=w)
         out = qkv_input + self.out_proj(out)
 
         out = out + self.ffn(self.layernorm(out))
 
         return out
 
-    def forward_seq(self, x_seq, coords, block_mask=None):
+    def forward_seq(self, x_seq, coords, block_mask=None, spatial_shape=None):
         """
         Forward for inference with sequence format.
 
@@ -283,11 +341,14 @@ class SimpleSelfBlock(nn.Module):
             x_seq: (b, l, c) - input tokens in sequence format
             coords: (l, 2) - (row, col) coordinates for each position
             block_mask: optional block mask for flex_attention
+            spatial_shape: optional full spatial shape (h, w) used for RoPE scaling
         """
         b, l, c = x_seq.shape
-        # Infer h, w from coords
-        h = coords[:, 0].max().item() + 1
-        w = coords[:, 1].max().item() + 1
+        if spatial_shape is None:
+            h = coords[:, 0].max().item() + 1
+            w = coords[:, 1].max().item() + 1
+        else:
+            h, w = spatial_shape
 
         qkv_input = x_seq
 
@@ -305,16 +366,64 @@ class SimpleSelfBlock(nn.Module):
 
         q = self.rope.apply_2d_rope_with_coords(q, coords, h, w)
         k = self.rope.apply_2d_rope_with_coords(k, coords, h, w)
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
 
         q = rearrange(q, '(b nh) l c_head -> b nh l c_head', b=b, nh=self.num_heads)
         k = rearrange(k, '(b nh) l c_head -> b nh l c_head', b=b, nh=self.num_heads)
         v = rearrange(v, 'b nh l c_head -> b nh l c_head')
 
         # Attention
-        out = flex_attention(q, k, v, block_mask=block_mask)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
         out = qkv_input + self.out_proj(out)
 
         out = out + self.ffn(self.layernorm(out))
 
         return out
+
+    def forward_step(self, x_step, coord, cache_k=None, cache_v=None, spatial_shape=None):
+        """
+        Incremental causal self-attention for a single autoregressive step.
+
+        Args:
+            x_step: (b, 1, c)
+            coord: (1, 2)
+            cache_k: optional cached keys, (b, nh, t, c_head)
+            cache_v: optional cached values, (b, nh, t, c_head)
+            spatial_shape: full spatial shape (h, w) for RoPE scaling
+        """
+        b, _, _ = x_step.shape
+        if spatial_shape is None:
+            h = coord[:, 0].max().item() + 1
+            w = coord[:, 1].max().item() + 1
+        else:
+            h, w = spatial_shape
+
+        qkv_input = x_step
+        qkv = self.linear_qkv(x_step)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        q = rearrange(q, 'b l (nh c_head) -> b nh l c_head', nh=self.num_heads, c_head=self.dim_head)
+        k = rearrange(k, 'b l (nh c_head) -> b nh l c_head', nh=self.num_heads, c_head=self.dim_head)
+        v = rearrange(v, 'b l (nh c_head) -> b nh l c_head', nh=self.num_heads, c_head=self.dim_head)
+
+        q = rearrange(q, 'b nh l c_head -> (b nh) l c_head')
+        k = rearrange(k, 'b nh l c_head -> (b nh) l c_head')
+        q = self.rope.apply_2d_rope_with_coords(q, coord, h, w)
+        k = self.rope.apply_2d_rope_with_coords(k, coord, h, w)
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
+        q = rearrange(q, '(b nh) l c_head -> b nh l c_head', b=b, nh=self.num_heads)
+        k = rearrange(k, '(b nh) l c_head -> b nh l c_head', b=b, nh=self.num_heads)
+
+        if cache_k is not None:
+            k = torch.cat([cache_k, k], dim=2)
+            v = torch.cat([cache_v, v], dim=2)
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
+        out = qkv_input + self.out_proj(out)
+        out = out + self.ffn(self.layernorm(out))
+
+        return out, k, v
