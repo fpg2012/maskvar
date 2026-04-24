@@ -23,6 +23,7 @@ from .models.simple_mask_vqvae import (
     SimpleMaskVqvae, MaskEncoderLite,
     SimpleMaskVqvaeV2,
 )
+from .models.simple_mask_ar import SimpleMaskAR
 from .models.dino_wrapper import DinoV3Wrapper
 
 from .datasets.mask_level_dataset import MaskLevelDataset
@@ -1247,6 +1248,57 @@ def build_simple_mask_vqvae_v2_dim384(
     return simple_mask_vqvae.to(device)
 
 
+def build_simple_mask_ar(
+    checkpoint_path: Optional[str] = None,
+    device: str = 'cpu',
+) -> SimpleMaskAR:
+    """
+    Build SimpleMaskAR model.
+
+    Args:
+        checkpoint_path: Path to model checkpoint
+        device: Device to load model on
+
+    Returns:
+        SimpleMaskAR model
+    """
+    # Fixed hyperparameters
+    dim = 384
+    depth = 2
+    vocab_size = 4096
+    h = 64  # 1024 / 16
+    w = 64  # 1024 / 16
+    num_heads = 4
+
+    model = SimpleMaskAR(
+        dim=dim,
+        depth=depth,
+        vocab_size=vocab_size,
+        h=h,
+        w=w,
+        num_heads=num_heads,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+
+        # Handle full checkpoint format from training
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+
+        # Remove '_orig_mod.' prefix from torch.compile
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+        model.load_state_dict(state_dict)
+        print(f"Loaded SimpleMaskAR checkpoint from {checkpoint_path}")
+
+    return model.to(device)
+
+
 def _initialize_codebook_from_kmeans(model: SimpleMaskVqvae, centroids_path: str):
     """
     Initialize VQ codebook using KMeans centroids.
@@ -1459,6 +1511,9 @@ builder_map = {
         "simple_var_6d": build_simple_var_6d,
         "simple_var_sd": build_simple_var_sam_decoder,
         "simple_var_sd_mlp_adapter": build_simple_var_sam_decoder_mlp_adapter,
+    },
+    "simple_mask_ar": {
+        "simple_mask_ar": build_simple_mask_ar,
     },
     "dataset": {
         "cocolvis": build_cocolvis_dataset,
