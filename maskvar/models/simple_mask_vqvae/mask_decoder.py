@@ -4,17 +4,18 @@ from torch import nn
 from einops import rearrange, repeat
 from ..sam import MaskDecoder as SamMaskDecoder
 from .basic import LayerNorm2d, TwoWayBlock, SimpleTwoWayBlock, MLP, SimpleTwoWayBlock
-
+from ..rope2d import RotaryPositionEmbedding2D
 
 class SimpleMaskDecoder(nn.Module):
 
-    def __init__(self, dim, num_heads=4, num_queries=4, num_two_way_blocks=2):
+    def __init__(self, rope: RotaryPositionEmbedding2D, dim, num_heads=4, num_queries=4, num_two_way_blocks=2):
         super().__init__()
         self.dim = dim
         self.num_two_way_blocks = num_two_way_blocks
+        self.rope = rope
 
         self.two_way_blocks = nn.ModuleList([
-            TwoWayBlock(dim, num_heads) for _ in range(num_two_way_blocks)
+            TwoWayBlock(rope, dim, num_heads) for _ in range(num_two_way_blocks)
         ])
         
         self.query_tokens = nn.Parameter(torch.randn(1, num_queries, dim))
@@ -82,8 +83,9 @@ class SimpleMaskDecoder(nn.Module):
 
 class SimpleMaskDecoderV2(nn.Module):
 
-    def __init__(self, dim, num_heads=4, num_queries=4, num_two_way_blocks=2):
+    def __init__(self, rope: RotaryPositionEmbedding2D, dim, num_heads=4, num_queries=4, num_two_way_blocks=2):
         super().__init__()
+        self.rope = rope
         self.dim = dim
         self.num_heads = num_heads
         self.num_queries = num_queries
@@ -104,7 +106,7 @@ class SimpleMaskDecoderV2(nn.Module):
         self.layer_norm_post_query = nn.LayerNorm(dim // 16)
 
         self.two_way_blocks = nn.ModuleList([
-            SimpleTwoWayBlock(dim, num_heads) for _ in range(num_two_way_blocks)
+            SimpleTwoWayBlock(rope=self.rope, dim=dim, num_heads=num_heads) for _ in range(num_two_way_blocks)
         ])
 
     def forward(self, query_tokens: torch.Tensor, image_tokens: torch.Tensor):

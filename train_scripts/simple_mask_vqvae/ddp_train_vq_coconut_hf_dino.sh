@@ -3,7 +3,7 @@
 # COCONut contains more diverse segmentation masks including stuff classes
 
 N_NODE=${1:-4}
-OUTDIR=${2:-out/ddp_simple_mask_vqvae_coconut_ep5_18vq_kmeans_init}
+OUTDIR=${2:-out/ddp_simple_mask_vqvae_coconut_ep5_19bugfix_retrain}
 export MASTER_PORT=${3:-29500}
 export OMP_NUM_THREADS=4
 

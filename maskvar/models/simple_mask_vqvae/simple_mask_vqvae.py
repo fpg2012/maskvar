@@ -8,11 +8,11 @@ from einops import rearrange, repeat
 from .basic import SimpleCrossBlock
 from .mask_decoder import SimpleMaskDecoder, SimpleMaskDecoderV2
 from .quant import SimpleVectorQuantize
-
+from ..rope2d import RotaryPositionEmbedding2D
 
 class SimpleMaskVqvae(nn.Module):
 
-    def __init__(self, image_encoder, mask_encoder, dim=256, vocab_size=4096, beta=0.25, enable_vq=True, device='cuda'):
+    def __init__(self, image_encoder, mask_encoder, dim=256, vocab_size=4096, beta=0.25, h=64, w=64, enable_vq=True, device='cuda'):
         super().__init__()
         self.dim = dim
         self.vocab_size = vocab_size
@@ -21,8 +21,10 @@ class SimpleMaskVqvae(nn.Module):
 
         self.image_encoder = image_encoder
         self.mask_encoder = mask_encoder
+
+        self.rope = RotaryPositionEmbedding2D(h=h, w=w)
         
-        self.mask_decoder = SimpleMaskDecoder(dim=dim)
+        self.mask_decoder = SimpleMaskDecoder(rope=self.rope, dim=dim)
         self.quant = SimpleVectorQuantize(
             dim=dim,
             vocab_size=vocab_size,
@@ -81,11 +83,11 @@ class SimpleMaskVqvae(nn.Module):
 
 class MaskFeatureCompactor(nn.Module):
 
-    def __init__(self, dim=256, num_queries=8, num_heads=8, depth=1):
+    def __init__(self, rope: RotaryPositionEmbedding2D, dim=256, num_queries=8, num_heads=4, depth=1):
         super().__init__()
         self.query_tokens = nn.Parameter(torch.randn(1, num_queries, dim))
         self.cross_blocks = nn.ModuleList([
-           SimpleCrossBlock(dim=dim, num_heads=num_heads) for _ in range(depth)
+           SimpleCrossBlock(rope=rope, dim=dim, num_heads=num_heads) for _ in range(depth)
         ])
         self.depth = depth
 
@@ -102,18 +104,20 @@ class MaskFeatureCompactor(nn.Module):
 
 class SimpleMaskVqvaeV2(nn.Module):
 
-    def __init__(self, image_encoder, mask_encoder, dim=256, num_queries=8, vocab_size=4096, beta=0.25, enable_vq=True, device='cuda'):
+    def __init__(self, image_encoder, mask_encoder, dim=256, num_queries=8, vocab_size=4096, beta=0.25, h=64, w=64, enable_vq=True, device='cuda'):
         super().__init__()
         self.dim = dim
         self.vocab_size = vocab_size
         self.beta = beta
         self.enable_vq = enable_vq
+        self.rope = RotaryPositionEmbedding2D(h=h, w=w)
 
         self.image_encoder = image_encoder
         self.mask_encoder = mask_encoder
         
-        self.mask_decoder = SimpleMaskDecoderV2(dim=dim, num_heads=4, num_queries=num_queries)
+        self.mask_decoder = SimpleMaskDecoderV2(rope=self.rope, dim=dim, num_heads=4, num_queries=num_queries)
         self.mask_feature_compactor: MaskFeatureCompactor = MaskFeatureCompactor(
+            rope=self.rope,
             dim=dim,
             num_queries=num_queries,
             num_heads=4,
