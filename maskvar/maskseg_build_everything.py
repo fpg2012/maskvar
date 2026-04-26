@@ -24,6 +24,7 @@ from .models.simple_mask_vqvae import (
     SimpleMaskVqvaeV2,
 )
 from .models.simple_mask_ar import SimpleMaskAR
+from .models.simple_mask_ar import SimpleQueryTokenAR
 from .models.dino_wrapper import DinoV3Wrapper
 
 from .datasets.mask_level_dataset import MaskLevelDataset
@@ -1299,6 +1300,44 @@ def build_simple_mask_ar(
     return model.to(device)
 
 
+def build_simple_query_token_ar(
+    checkpoint_path: Optional[str] = None,
+    device: str = 'cpu',
+) -> SimpleQueryTokenAR:
+    dim = 384
+    depth = 2
+    vocab_size = 4096
+    num_queries = 8
+    image_token_len = 64 * 64
+    num_heads = 4
+
+    model = SimpleQueryTokenAR(
+        dim=dim,
+        depth=depth,
+        vocab_size=vocab_size,
+        num_queries=num_queries,
+        image_token_len=image_token_len,
+        num_heads=num_heads,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+        model.load_state_dict(state_dict)
+        print(f"Loaded SimpleQueryTokenAR checkpoint from {checkpoint_path}")
+
+    return model.to(device)
+
+
 def _initialize_codebook_from_kmeans(model: SimpleMaskVqvae, centroids_path: str):
     """
     Initialize VQ codebook using KMeans centroids.
@@ -1514,6 +1553,7 @@ builder_map = {
     },
     "simple_mask_ar": {
         "simple_mask_ar": build_simple_mask_ar,
+        "simple_query_token_ar": build_simple_query_token_ar,
     },
     "dataset": {
         "cocolvis": build_cocolvis_dataset,

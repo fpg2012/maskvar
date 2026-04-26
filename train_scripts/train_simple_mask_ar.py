@@ -272,7 +272,7 @@ class SimpleMaskARTrainer:
             image: (B, 3, H, W)
 
         Returns:
-            token_ids: (B, h, w) - token indices in spatial format
+            token_ids: (B, L) - token indices in sequence format
         """
         with torch.no_grad():
             with torch.autocast(
@@ -280,22 +280,13 @@ class SimpleMaskARTrainer:
                 dtype=self.dtype,
                 enabled=(self.device.startswith('cuda') and self.dtype != torch.float32),
             ):
-                # Get mask/image tokens with mixed precision for speed.
-                mask_tokens = self.vqvae_model.mask_encoder(mask_normalized)  # (B, C, h, w)
-                image_tokens = self.vqvae_model.image_encoder(image)  # (B, C, h, w)
+                token_ids, image_tokens = self._get_ar_model().encode_mask_to_token_ids(
+                    self.vqvae_model,
+                    mask_normalized,
+                    image,
+                )
 
-            # Convert to BLC format for quantization
-            B, C, h, w = mask_tokens.shape
-            mask_tokens_blc = rearrange(mask_tokens, 'b c h w -> b (h w) c')
-
-            # Keep VQ lookup in float32 for stable nearest-neighbor assignment.
-            token_ids = self.vqvae_model.quant.x_to_idx(mask_tokens_blc.float())  # (B, h*w)
-            token_ids = token_ids.view(B, h, w)  # (B, h, w)
-
-            # Also return image tokens in spatial format (B, h, w, C)
-            image_tokens_spatial = rearrange(image_tokens, 'b c h w -> b h w c')
-
-        return token_ids, image_tokens_spatial
+        return token_ids, image_tokens
 
     def _get_ar_model(self):
         return self.model.module if isinstance(self.model, DDP) else self.model
@@ -303,21 +294,12 @@ class SimpleMaskARTrainer:
     @torch.no_grad()
     def decode_token_ids_to_mask_logits(self, token_ids, image_tokens, output_size):
         """Decode VQ token ids back to mask logits using the frozen VQVAE decoder."""
-        B, h, w = token_ids.shape
-        token_ids_seq = rearrange(token_ids, 'b h w -> b (h w)')
-        mask_tokens = self.vqvae_model.quant.idx_to_x(token_ids_seq)
-        mask_tokens = rearrange(mask_tokens, 'b (h w) c -> b h w c', h=h, w=w)
-        mask_logits = self.vqvae_model.mask_decoder(mask_tokens, image_tokens)
-
-        if mask_logits.shape[-2:] != output_size:
-            mask_logits = F.interpolate(
-                mask_logits,
-                size=output_size,
-                mode='bilinear',
-                align_corners=False,
-            )
-
-        return mask_logits
+        return self._get_ar_model().decode_token_ids_to_mask_logits(
+            self.vqvae_model,
+            token_ids,
+            image_tokens,
+            output_size,
+        )
 
     @torch.no_grad()
     def compute_mask_predictions(self, token_ids, logits, image_tokens, gt_mask, compute_infer: bool = False):
@@ -539,24 +521,22 @@ class SimpleMaskARTrainer:
                 self._timer_start(encode_timer)
                 with torch.no_grad():
                     token_ids, image_tokens = self.encode_mask_to_tokens(single_mask_normalized, image)
-                    # token_ids: (B, h, w), image_tokens: (B, h, w, C)
+                    # token_ids: (B, L), image_tokens: (B, L_img, C)
                 self._timer_end(encode_timer)
 
                 # Forward pass
                 step_timer = self._new_timer()
                 self._timer_start(step_timer)
                 with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
-                    # Model predicts logits for all positions
-                    # Input: token_ids (B, h, w), last token will be dropped internally
-                    logits = self.model(token_ids, image_tokens)  # (B, h, w, vocab_size)
+                    logits = self.model(token_ids, image_tokens)  # (B, L, vocab_size)
 
                     # Compute loss against the original token ids.
                     # The model internally prepends sos and drops the last input token.
-                    B, h, w, vocab_size = logits.shape
+                    B, L, vocab_size = logits.shape
 
                     # Flatten logits and targets
-                    logits_flat = rearrange(logits, 'b h w vocab -> (b h w) vocab')
-                    token_ids_flat = rearrange(token_ids, 'b h w -> (b h w)')
+                    logits_flat = rearrange(logits, 'b l vocab -> (b l) vocab')
+                    token_ids_flat = rearrange(token_ids, 'b l -> (b l)')
 
                     # No explicit target shift is needed here because preprocess aligns
                     # [sos, t0, ..., t(L-2)] with targets [t0, ..., t(L-1)].
@@ -604,7 +584,7 @@ class SimpleMaskARTrainer:
                                 single_mask,
                                 compute_infer=False,
                             )
-                            pred_ids = logits.argmax(dim=-1)  # (B, h, w)
+                            pred_ids = logits.argmax(dim=-1)  # (B, L)
                             correct = (pred_ids == token_ids).float().mean()
                             teacher_iou_mean = vis_outputs['teacher_iou'].mean().item()
 
@@ -714,10 +694,10 @@ class SimpleMaskARTrainer:
 
             with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
                 logits = self.model(token_ids, image_tokens)
-                B, h, w, vocab_size = logits.shape
+                B, L, vocab_size = logits.shape
 
-                logits_flat = rearrange(logits, 'b h w vocab -> (b h w) vocab')
-                token_ids_flat = rearrange(token_ids, 'b h w -> (b h w)')
+                logits_flat = rearrange(logits, 'b l vocab -> (b l) vocab')
+                token_ids_flat = rearrange(token_ids, 'b l -> (b l)')
                 targets = token_ids_flat
 
                 loss = F.cross_entropy(logits_flat, targets, reduction='mean')

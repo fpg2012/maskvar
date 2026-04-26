@@ -92,7 +92,7 @@ class SimpleMaskAR(nn.Module):
     def preprocess(self, x: torch.Tensor):
         """
         Training preprocess.
-        x: (B, H, W) - spatial token indices, the last token will be dropped
+        x: (B, L) - token indices in row-major order, the last token will be dropped
         Returns: (B, H, W, C) - spatial embeddings with sos at (0,0)
 
         Processing:
@@ -104,12 +104,11 @@ class SimpleMaskAR(nn.Module):
         So position (0,0) has sos, and original token at (0,0) goes to (0,1), etc.
         The token at (h-1, w-1) is dropped.
         """
-        B, H, W = x.shape
-        # Embed tokens
-        x_embed = self.embed(x)  # (B, H, W, C)
+        B, L = x.shape
+        if L != self.max_len:
+            raise ValueError(f"Expected token length {self.max_len}, got {L}")
 
-        # Flatten to sequence
-        x_seq = rearrange(x_embed, 'b h w c -> b (h w) c')  # (B, H*W, C)
+        x_seq = self.embed(x)  # (B, H*W, C)
 
         # Drop last token and prepend sos
         x_seq = x_seq[:, :-1, :]  # (B, H*W-1, C) - drop last
@@ -117,27 +116,72 @@ class SimpleMaskAR(nn.Module):
         x_seq = torch.cat([sos_seq, x_seq], dim=1)  # (B, H*W, C)
 
         # Reshape back to spatial
-        x_spatial = x_seq.view(B, H, W, self.dim)  # (B, H, W, C)
+        x_spatial = x_seq.view(B, self.h, self.w, self.dim)  # (B, H, W, C)
 
         return x_spatial
+
+    def _image_tokens_to_spatial(self, image_tokens: torch.Tensor):
+        if image_tokens.dim() != 3:
+            raise ValueError(f"Expected image_tokens to have shape (B, L, C), got {tuple(image_tokens.shape)}")
+        B, L, C = image_tokens.shape
+        if L != self.max_len:
+            raise ValueError(f"Expected image token length {self.max_len}, got {L}")
+        return image_tokens.view(B, self.h, self.w, C)
 
     def forward(self, x: torch.Tensor, image_tokens: torch.Tensor):
         """
         Training forward.
-        x: (B, H, W) - spatial token indices in row-major order
-        image_tokens: (B, H, W, C)
-        Returns: logits (B, H, W, vocab_size) for next token prediction
+        x: (B, L) - token indices in row-major order
+        image_tokens: (B, L_img, C)
+        Returns: logits (B, L, vocab_size) for next token prediction
 
         Note: The last position's prediction is not used in loss (no ground truth).
         """
         x = self.preprocess(x)  # (B, H, W, C)
+        image_tokens = self._image_tokens_to_spatial(image_tokens)
 
         for block in self.blocks:
             x = block(x, image_tokens, block_mask=None)
 
         # Classify to get logits
         logits = self.cls(x)  # (B, H, W, vocab_size)
-        return logits
+        return rearrange(logits, 'b h w vocab -> b (h w) vocab')
+
+    def encode_mask_to_token_ids(self, vqvae_model, mask_normalized: torch.Tensor, image: torch.Tensor):
+        with torch.no_grad():
+            mask_tokens = vqvae_model.mask_encoder(mask_normalized)  # (B, C, h, w)
+            image_tokens = vqvae_model.image_encoder(image)  # (B, C, h, w)
+
+            B, C, h, w = mask_tokens.shape
+            if h * w != self.max_len:
+                raise ValueError(f"VQ token length {h*w} does not match AR max_len {self.max_len}")
+
+            mask_tokens_blc = rearrange(mask_tokens, 'b c h w -> b (h w) c')
+            token_ids = vqvae_model.quant.x_to_idx(mask_tokens_blc.float())  # (B, L)
+            image_tokens_blc = rearrange(image_tokens, 'b c h w -> b (h w) c')
+
+        return token_ids, image_tokens_blc
+
+    @torch.no_grad()
+    def decode_token_ids_to_mask_logits(self, vqvae_model, token_ids, image_tokens, output_size):
+        B, L = token_ids.shape
+        if L != self.max_len:
+            raise ValueError(f"Expected token length {self.max_len}, got {L}")
+
+        mask_tokens = vqvae_model.quant.idx_to_x(token_ids)
+        mask_tokens = rearrange(mask_tokens, 'b (h w) c -> b h w c', h=self.h, w=self.w)
+        image_tokens_spatial = self._image_tokens_to_spatial(image_tokens)
+        mask_logits = vqvae_model.mask_decoder(mask_tokens, image_tokens_spatial)
+
+        if mask_logits.shape[-2:] != output_size:
+            mask_logits = nn.functional.interpolate(
+                mask_logits,
+                size=output_size,
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        return mask_logits
 
     @torch.no_grad()
     def autoregressive_infer(
@@ -158,13 +202,15 @@ class SimpleMaskAR(nn.Module):
 
         Returns:
             generated_ids:
-                - (B, H, W) when num_samples == 1
-                - (B, num_samples, H, W) when num_samples > 1
+                - (B, L) when num_samples == 1
+                - (B, num_samples, L) when num_samples > 1
         """
         if num_samples < 1:
             raise ValueError(f"num_samples must be >= 1, got {num_samples}")
 
-        B, H, W, C = image_tokens.shape
+        image_tokens_spatial = self._image_tokens_to_spatial(image_tokens)
+        B, _, C = image_tokens.shape
+        H, W = self.h, self.w
         device = image_tokens.device
         batch_size = B * num_samples
 
@@ -178,7 +224,7 @@ class SimpleMaskAR(nn.Module):
         x_step = self.sos.view(1, 1, self.dim).expand(batch_size, 1, -1)  # (B * num_samples, 1, C)
         cross_caches = []
         for block in self.blocks:
-            cached_k, cached_v, h, w = block.precompute_cross_kv(image_tokens)
+            cached_k, cached_v, h, w = block.precompute_cross_kv(image_tokens_spatial)
             if num_samples > 1:
                 cached_k = cached_k.repeat_interleave(num_samples, dim=0)
                 cached_v = cached_v.repeat_interleave(num_samples, dim=0)
@@ -221,7 +267,6 @@ class SimpleMaskAR(nn.Module):
         # Stack generated tokens and reshape to spatial
         generated = torch.stack(generated_ids, dim=1)  # (B * num_samples, H*W)
         if num_samples == 1:
-            return generated.view(B, H, W)
+            return generated
 
-        generated = generated.view(B, num_samples, H * W)
-        return generated.view(B, num_samples, H, W)
+        return generated.view(B, num_samples, H * W)
