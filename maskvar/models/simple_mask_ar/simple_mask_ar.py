@@ -140,7 +140,13 @@ class SimpleMaskAR(nn.Module):
         return logits
 
     @torch.no_grad()
-    def autoregressive_infer(self, image_tokens: torch.Tensor, temperature=1.0, top_k=None):
+    def autoregressive_infer(
+        self,
+        image_tokens: torch.Tensor,
+        temperature=1.0,
+        top_k=None,
+        num_samples: int = 1,
+    ):
         """
         Autoregressive inference in row-major order.
 
@@ -148,12 +154,19 @@ class SimpleMaskAR(nn.Module):
             image_tokens: (B, H, W, C)
             temperature: sampling temperature (0 for greedy)
             top_k: top-k sampling (None to disable)
+            num_samples: number of sampled sequences per input image
 
         Returns:
-            generated_ids: (B, H, W) - generated token indices in spatial format
+            generated_ids:
+                - (B, H, W) when num_samples == 1
+                - (B, num_samples, H, W) when num_samples > 1
         """
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+
         B, H, W, C = image_tokens.shape
         device = image_tokens.device
+        batch_size = B * num_samples
 
         # Pre-generate coordinates for all positions in row-major order
         coords = torch.tensor(
@@ -162,8 +175,14 @@ class SimpleMaskAR(nn.Module):
         )  # (H*W, 2)
 
         # Initialize step input with sos embedding and per-block caches.
-        x_step = self.sos.view(1, 1, self.dim).expand(B, 1, -1)  # (B, 1, C)
-        cross_caches = [block.precompute_cross_kv(image_tokens) for block in self.blocks]
+        x_step = self.sos.view(1, 1, self.dim).expand(batch_size, 1, -1)  # (B * num_samples, 1, C)
+        cross_caches = []
+        for block in self.blocks:
+            cached_k, cached_v, h, w = block.precompute_cross_kv(image_tokens)
+            if num_samples > 1:
+                cached_k = cached_k.repeat_interleave(num_samples, dim=0)
+                cached_v = cached_v.repeat_interleave(num_samples, dim=0)
+            cross_caches.append((cached_k, cached_v, h, w))
         self_caches = [None for _ in self.blocks]
 
         generated_ids = []
@@ -181,26 +200,28 @@ class SimpleMaskAR(nn.Module):
                 )
 
             # Get logits for the current (last) position
-            logits = self.cls(x_out[:, 0, :])  # (B, vocab_size)
+            logits = self.cls(x_out[:, 0, :])  # (B * num_samples, vocab_size)
 
             # Sample next token
             if temperature == 0:
-                next_token = logits.argmax(dim=-1)  # (B,)
+                next_token = logits.argmax(dim=-1)  # (B * num_samples,)
             else:
                 if top_k is not None:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('inf')
                 probs = torch.softmax(logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B,)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B * num_samples,)
 
             generated_ids.append(next_token)
 
             # Append next token embedding to sequence (for next iteration)
             if i < H * W - 1:
-                x_step = self.embed(next_token).unsqueeze(1)  # (B, 1, C)
+                x_step = self.embed(next_token).unsqueeze(1)  # (B * num_samples, 1, C)
 
         # Stack generated tokens and reshape to spatial
-        generated = torch.stack(generated_ids, dim=1)  # (B, H*W)
-        generated_spatial = generated.view(B, H, W)  # (B, H, W)
+        generated = torch.stack(generated_ids, dim=1)  # (B * num_samples, H*W)
+        if num_samples == 1:
+            return generated.view(B, H, W)
 
-        return generated_spatial
+        generated = generated.view(B, num_samples, H * W)
+        return generated.view(B, num_samples, H, W)
