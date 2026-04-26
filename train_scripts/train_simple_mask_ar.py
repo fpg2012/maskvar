@@ -115,6 +115,7 @@ class SimpleMaskARTrainer:
         enable_timing: bool = False,
         profiler=None,
         infer_val_batches: int = 4,
+        enable_infer_iou: bool = False,
     ):
         self.model = model
         self.vqvae_model = vqvae_model
@@ -126,6 +127,7 @@ class SimpleMaskARTrainer:
         self.enable_timing = enable_timing
         self.profiler = profiler
         self.infer_val_batches = infer_val_batches
+        self.enable_infer_iou = enable_infer_iou
 
         # Distributed training setup
         if tdist.is_initialized():
@@ -318,8 +320,15 @@ class SimpleMaskARTrainer:
         return mask_logits
 
     @torch.no_grad()
-    def compute_mask_predictions(self, logits, image_tokens, gt_mask, compute_infer: bool = True):
-        """Compute teacher-forcing predictions and optional pure-autoregressive predictions plus IoU."""
+    def compute_mask_predictions(self, token_ids, logits, image_tokens, gt_mask, compute_infer: bool = False):
+        """Compute GT-token reconstruction, teacher predictions and optional pure-autoregressive predictions plus IoU."""
+        gt_token_mask_logits = self.decode_token_ids_to_mask_logits(
+            token_ids,
+            image_tokens,
+            output_size=gt_mask.shape[-2:],
+        )
+        gt_token_iou = calc_iou(gt_token_mask_logits, gt_mask)
+
         teacher_token_ids = logits.argmax(dim=-1)
         teacher_mask_logits = self.decode_token_ids_to_mask_logits(
             teacher_token_ids,
@@ -342,6 +351,8 @@ class SimpleMaskARTrainer:
             infer_iou = calc_iou(infer_mask_logits, gt_mask)
 
         return {
+            'gt_token_mask_logits': gt_token_mask_logits,
+            'gt_token_iou': gt_token_iou,
             'teacher_token_ids': teacher_token_ids,
             'teacher_mask_logits': teacher_mask_logits,
             'infer_token_ids': infer_token_ids,
@@ -355,13 +366,15 @@ class SimpleMaskARTrainer:
         tag: str,
         vis_samples: list,
         save_name: str | None = None,
+        include_infer: bool = False,
     ):
-        """Visualize GT, teacher-forcing prediction and pure autoregressive prediction."""
+        """Visualize GT mask, GT-token reconstruction, teacher prediction and optional pure autoregressive prediction."""
         if self.writer is None or not vis_samples:
             return
 
         num_samples = len(vis_samples)
-        fig, axes = plt.subplots(num_samples, 6, figsize=(24, 4 * num_samples))
+        num_cols = 8 if include_infer else 6
+        fig, axes = plt.subplots(num_samples, num_cols, figsize=(4 * num_cols, 4 * num_samples))
         if num_samples == 1:
             axes = axes.reshape(1, -1)
 
@@ -385,13 +398,13 @@ class SimpleMaskARTrainer:
         for row, sample in enumerate(vis_samples):
             image = restore_normalized_image(sample['image'][0]).float().cpu().numpy().transpose(1, 2, 0) / 255.0
             gt = sample['gt'][0, 0].float().cpu().numpy() > 0
+            gt_token_pred = sample['gt_token_pred'][0, 0].float().cpu().numpy() > 0
+            gt_token_iou = sample['gt_token_iou'][0].item()
             teacher_pred = sample['teacher_pred'][0, 0].float().cpu().numpy() > 0
-            infer_pred = sample['infer_pred'][0, 0].float().cpu().numpy() > 0
             teacher_iou = sample['teacher_iou'][0].item()
-            infer_iou = sample['infer_iou'][0].item()
 
+            gt_token_overlay = build_overlay(image, gt, gt_token_pred)
             teacher_overlay = build_overlay(image, gt, teacher_pred)
-            infer_overlay = build_overlay(image, gt, infer_pred)
 
             axes[row, 0].imshow(image)
             axes[row, 0].set_title('Image' if row == 0 else '')
@@ -401,25 +414,40 @@ class SimpleMaskARTrainer:
             axes[row, 1].set_title('GT Mask' if row == 0 else '')
             axes[row, 1].axis('off')
 
-            axes[row, 2].imshow(teacher_pred, cmap='gray', vmin=0, vmax=1)
+            axes[row, 2].imshow(gt_token_pred, cmap='gray', vmin=0, vmax=1)
             axes[row, 2].set_title(
-                f'Teacher Pred (IoU={teacher_iou:.3f})' if row == 0 else f'IoU={teacher_iou:.3f}'
+                f'GT Token Recon (IoU={gt_token_iou:.3f})' if row == 0 else f'IoU={gt_token_iou:.3f}'
             )
             axes[row, 2].axis('off')
 
-            axes[row, 3].imshow(teacher_overlay)
-            axes[row, 3].set_title('Teacher Overlay' if row == 0 else '')
+            axes[row, 3].imshow(gt_token_overlay)
+            axes[row, 3].set_title('GT Token Overlay' if row == 0 else '')
             axes[row, 3].axis('off')
 
-            axes[row, 4].imshow(infer_pred, cmap='gray', vmin=0, vmax=1)
+            axes[row, 4].imshow(teacher_pred, cmap='gray', vmin=0, vmax=1)
             axes[row, 4].set_title(
-                f'Infer Pred (IoU={infer_iou:.3f})' if row == 0 else f'IoU={infer_iou:.3f}'
+                f'Teacher Pred (IoU={teacher_iou:.3f})' if row == 0 else f'IoU={teacher_iou:.3f}'
             )
             axes[row, 4].axis('off')
 
-            axes[row, 5].imshow(infer_overlay)
-            axes[row, 5].set_title('Infer Overlay' if row == 0 else '')
+            axes[row, 5].imshow(teacher_overlay)
+            axes[row, 5].set_title('Teacher Overlay' if row == 0 else '')
             axes[row, 5].axis('off')
+
+            if include_infer:
+                infer_pred = sample['infer_pred'][0, 0].float().cpu().numpy() > 0
+                infer_iou = sample['infer_iou'][0].item()
+                infer_overlay = build_overlay(image, gt, infer_pred)
+
+                axes[row, 6].imshow(infer_pred, cmap='gray', vmin=0, vmax=1)
+                axes[row, 6].set_title(
+                    f'Infer Pred (IoU={infer_iou:.3f})' if row == 0 else f'IoU={infer_iou:.3f}'
+                )
+                axes[row, 6].axis('off')
+
+                axes[row, 7].imshow(infer_overlay)
+                axes[row, 7].set_title('Infer Overlay' if row == 0 else '')
+                axes[row, 7].axis('off')
 
         plt.tight_layout()
         self.writer.add_figure(tag, fig, self.global_step)
@@ -436,10 +464,10 @@ class SimpleMaskARTrainer:
         self,
         image: torch.Tensor,
         gt_mask: torch.Tensor,
+        gt_token_mask_logits: torch.Tensor,
+        gt_token_iou: torch.Tensor,
         teacher_mask_logits: torch.Tensor,
-        infer_mask_logits: torch.Tensor,
         teacher_iou: torch.Tensor,
-        infer_iou: torch.Tensor,
         num_samples: int = 2,
     ):
         vis_samples = []
@@ -449,19 +477,20 @@ class SimpleMaskARTrainer:
             vis_samples.append({
                 'image': image[i:i + 1].detach().cpu(),
                 'gt': gt_mask[i:i + 1].detach().cpu(),
+                'gt_token_pred': gt_token_mask_logits[i:i + 1].detach().cpu(),
+                'gt_token_iou': gt_token_iou[i:i + 1].detach().cpu(),
                 'teacher_pred': teacher_mask_logits[i:i + 1].detach().cpu(),
-                'infer_pred': infer_mask_logits[i:i + 1].detach().cpu(),
                 'teacher_iou': teacher_iou[i:i + 1].detach().cpu(),
-                'infer_iou': infer_iou[i:i + 1].detach().cpu(),
             })
 
-        self._visualize_prediction_samples('train/visualization', vis_samples)
+        self._visualize_prediction_samples('train/visualization', vis_samples, include_infer=False)
 
     def _visualize_validation(self, vis_samples: list):
         self._visualize_prediction_samples(
             'val/visualization',
             vis_samples,
             save_name=f'iter_{self.global_step}_val_vis.png',
+            include_infer=self.enable_infer_iou,
         )
 
     def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0, val_iters: int = 0, log_interval: int = 10):
@@ -568,46 +597,48 @@ class SimpleMaskARTrainer:
 
                         # Calculate accuracy
                         with torch.no_grad():
+                            vis_outputs = self.compute_mask_predictions(
+                                token_ids,
+                                logits,
+                                image_tokens,
+                                single_mask,
+                                compute_infer=False,
+                            )
                             pred_ids = logits.argmax(dim=-1)  # (B, h, w)
                             correct = (pred_ids == token_ids).float().mean()
+                            teacher_iou_mean = vis_outputs['teacher_iou'].mean().item()
 
                         pbar.set_postfix({
                             'loss': f'{loss_val:.4f}',
                             'acc': f'{correct.item():.4f}',
+                            'teacher_iou': f'{teacher_iou_mean:.4f}',
                         })
 
                         self.writer.add_scalar('train/loss', loss_val, global_step=global_iters)
                         self.writer.add_scalar('train/accuracy', correct.item(), global_step=global_iters)
+                        self.writer.add_scalar('train/teacher_iou', teacher_iou_mean, global_step=global_iters)
 
                         vis_time_ms = None
 
                         if global_iters % (log_interval * self.train_vis_interval_mult) == 0:
                             vis_timer = self._new_timer()
                             self._timer_start(vis_timer)
-                            with torch.no_grad():
-                                vis_outputs = self.compute_mask_predictions(logits, image_tokens, single_mask)
-                                teacher_iou_mean = vis_outputs['teacher_iou'].mean().item()
-                                infer_iou_mean = vis_outputs['infer_iou'].mean().item()
                             self._timer_end(vis_timer)
                             vis_time_ms = self._timer_ms(vis_timer)
-
-                            self.writer.add_scalar('train/teacher_iou', teacher_iou_mean, global_step=global_iters)
-                            self.writer.add_scalar('train/infer_iou', infer_iou_mean, global_step=global_iters)
 
                             pbar.set_postfix({
                                 'loss': f'{loss_val:.4f}',
                                 'acc': f'{correct.item():.4f}',
                                 'teacher_iou': f'{teacher_iou_mean:.4f}',
-                                'infer_iou': f'{infer_iou_mean:.4f}',
                             })
 
                             self._visualize_train_samples(
                                 image,
                                 single_mask,
+                                vis_outputs['gt_token_mask_logits'],
+                                vis_outputs['gt_token_iou'],
                                 vis_outputs['teacher_mask_logits'],
-                                vis_outputs['infer_mask_logits'],
                                 vis_outputs['teacher_iou'],
-                                vis_outputs['infer_iou'],
                                 num_samples=2,
                             )
 
@@ -694,8 +725,9 @@ class SimpleMaskARTrainer:
             # Calculate accuracy
             pred_ids = logits.argmax(dim=-1)
             correct = (pred_ids == token_ids).float().mean()
-            compute_infer = iters_count < infer_val_batches
+            compute_infer = self.enable_infer_iou and (iters_count < infer_val_batches)
             vis_outputs = self.compute_mask_predictions(
+                token_ids,
                 logits,
                 image_tokens,
                 single_mask,
@@ -719,6 +751,8 @@ class SimpleMaskARTrainer:
                     vis_samples.append({
                         'image': image[idx:idx + 1].detach().cpu(),
                         'gt': single_mask[idx:idx + 1].detach().cpu(),
+                        'gt_token_pred': vis_outputs['gt_token_mask_logits'][idx:idx + 1].detach().cpu(),
+                        'gt_token_iou': vis_outputs['gt_token_iou'][idx:idx + 1].detach().cpu(),
                         'teacher_pred': vis_outputs['teacher_mask_logits'][idx:idx + 1].detach().cpu(),
                         'infer_pred': vis_outputs['infer_mask_logits'][idx:idx + 1].detach().cpu(),
                         'teacher_iou': teacher_iou[idx:idx + 1].detach().cpu(),
@@ -768,7 +802,8 @@ class SimpleMaskARTrainer:
             self.writer.add_scalar('val/loss', avg_loss, global_step=self.global_step)
             self.writer.add_scalar('val/accuracy', avg_acc, global_step=self.global_step)
             self.writer.add_scalar('val/teacher_iou', avg_teacher_iou, global_step=self.global_step)
-            self.writer.add_scalar('val/infer_iou', avg_infer_iou, global_step=self.global_step)
+            if self.enable_infer_iou:
+                self.writer.add_scalar('val/infer_iou', avg_infer_iou, global_step=self.global_step)
 
         self.model.train()
 
@@ -880,6 +915,8 @@ def main():
     parser.add_argument('--timing', action='store_true', help='Print lightweight timing breakdown on log steps')
     parser.add_argument('--val_infer_batches', type=int, default=4,
                         help='Number of validation batches to run pure inference IoU and visualization on')
+    parser.add_argument('--enable_infer_iou', action='store_true',
+                        help='Enable pure autoregressive inference IoU. Default is disabled.')
     parser.add_argument('--profile', action='store_true', help='Enable short torch profiler trace at startup')
     parser.add_argument('--profile_wait', type=int, default=1, help='Profiler wait steps')
     parser.add_argument('--profile_warmup', type=int, default=1, help='Profiler warmup steps')
@@ -1100,6 +1137,7 @@ def main():
         enable_timing=args.timing or args.debug_smoketest,
         profiler=profiler,
         infer_val_batches=args.val_infer_batches,
+        enable_infer_iou=args.enable_infer_iou,
     )
 
     # Resume from checkpoint
