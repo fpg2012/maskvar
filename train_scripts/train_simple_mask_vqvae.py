@@ -919,9 +919,13 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None, help='model init checkpoint path, will override --resume_from')
     parser.add_argument('--image_encoder_checkpoint', type=str, default=None,
                         help='Path to SAM/MobileSAM checkpoint for initializing encoders')
-    parser.add_argument('--config', type=str, default='simple_mask_vqvae')
-    parser.add_argument('--image_encoder_config', type=str, default='mobile_sam')
-    parser.add_argument('--kmeans_centroids', type=str, default=None)
+    parser.add_argument('--config', type=str, default='simple_mask_vqvae',
+                        choices=sorted(builder_map['simple_mask_vqvae'].keys()),
+                        help='SimpleMaskVqvae builder config, including V2 variants')
+    parser.add_argument('--image_encoder_config', type=str, default='mobile_sam',
+                        choices=sorted(builder_map['image_encoder'].keys()))
+    parser.add_argument('--kmeans_centroids', type=str, default=None,
+                        help='Path to KMeans centroids (.npy/.pt/.pth). Works for V1/V2 when vocab_size and dim match the selected config.')
 
     # Optimization
     parser.add_argument('--no_compile', action='store_true',
