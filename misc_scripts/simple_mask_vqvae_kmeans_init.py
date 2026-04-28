@@ -69,8 +69,8 @@ def parse_args() -> argparse.Namespace:
         "--token-source",
         type=str,
         default="auto",
-        choices=["auto", "mask_encoder", "compactor"],
-        help="Latent source for clustering. V1 usually uses mask_encoder; V2 uses compactor.",
+        choices=["auto", "mask_encoder", "compactor", "multiscale"],
+        help="Latent source for clustering. V1 usually uses mask_encoder; V2 uses compactor; multiscale uses all pooled scales.",
     )
 
     parser.add_argument(
@@ -230,8 +230,12 @@ def infer_token_source(
     if requested_source != "auto":
         if requested_source == "compactor" and not hasattr(model, "mask_feature_compactor"):
             raise ValueError("Requested --token-source=compactor, but model does not have mask_feature_compactor.")
+        if requested_source == "multiscale" and not hasattr(model, "_extract_multiscale_tokens"):
+            raise ValueError("Requested --token-source=multiscale, but model does not support multiscale token extraction.")
         return requested_source
 
+    if hasattr(model, "_extract_multiscale_tokens"):
+        return "multiscale"
     if isinstance(model, SimpleMaskVqvaeV2) or hasattr(model, "mask_feature_compactor"):
         return "compactor"
     return "mask_encoder"
@@ -264,6 +268,8 @@ def extract_latent_tokens(
         if token_source == "compactor":
             mask_tokens = rearrange(mask_tokens, "b c h w -> b h w c")
             latent_tokens = model.mask_feature_compactor(mask_tokens)
+        elif token_source == "multiscale":
+            latent_tokens = torch.cat(model._extract_multiscale_tokens(mask_normalized), dim=1)
         else:
             latent_tokens = rearrange(mask_tokens, "b c h w -> b (h w) c")
 
