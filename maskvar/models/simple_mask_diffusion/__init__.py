@@ -1,0 +1,1 @@
+from .simple_mask_dit import SimpleMaskLatentDiT
