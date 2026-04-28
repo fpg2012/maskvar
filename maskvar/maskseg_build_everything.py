@@ -20,11 +20,15 @@ from .models.simple_ar import SimpleAR, SimpleVAR, SimpleVARSamDecoder
 from .models.simple_ar.adapted_mask_decoder import AdaptedMaskDecoder
 from .models.simple_ar.adapted_twt import AdaptedTwoWayTransformer
 from .models.simple_mask_vqvae import (
-    SimpleMaskVqvae, MaskEncoderLite,
-    SimpleMaskVqvaeV2,
+    SimpleMaskVqvae, MaskEncoderLite, MaskEncoderLite16x16,
+    SimpleMaskVqvaeV2, SimpleMaskVqvaeV3, SimpleMaskVqvaeV4,
+    SimpleMaskVqvaeShapeOnly,
+    SimpleMaskVqvaeMultiScale,
 )
 from .models.simple_mask_ar import SimpleMaskAR
 from .models.simple_mask_ar import SimpleQueryTokenAR
+from .models.simple_mask_vae import SimpleMaskVAEV2
+from .models.simple_mask_diffusion import SimpleMaskLatentDiT
 from .models.dino_wrapper import DinoV3Wrapper
 
 from .datasets.mask_level_dataset import MaskLevelDataset
@@ -1181,6 +1185,118 @@ def build_simple_mask_vqvae_dim384(
     return simple_mask_vqvae.to(device)
 
 
+def build_simple_mask_vqvae_v3_16x16_dim384(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
+) -> SimpleMaskVqvae:
+    """
+    Build SimpleMaskVqvae with a 16x16 spatial mask-token grid.
+
+    This keeps the V1-style spatial latent interface, but reduces the mask
+    token sequence from 64x64=4096 to 16x16=256 for faster AR experiments.
+    """
+    vocab_size = 4096
+    dim = 384
+    beta = 0.25
+
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    mask_encoder = MaskEncoderLite16x16(dim=dim)
+
+    simple_mask_vqvae = SimpleMaskVqvae(
+        image_encoder=image_encoder,
+        mask_encoder=mask_encoder,
+        dim=dim,
+        vocab_size=vocab_size,
+        beta=beta,
+        device=device,
+        enable_vq=enable_vq,
+    )
+
+    if simple_mask_vqvae_checkpoint_path is not None:
+        checkpoint = torch.load(simple_mask_vqvae_checkpoint_path, map_location='cpu', weights_only=True)
+
+        if 'model_state_dict' in checkpoint:
+            simple_mask_vqvae_state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            simple_mask_vqvae_state_dict = checkpoint
+
+        if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
+            new_state_dict = {}
+            for key, value in simple_mask_vqvae_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_mask_vqvae_state_dict = new_state_dict
+
+        simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+        print(f"Loaded SimpleMaskVqvae checkpoint from {simple_mask_vqvae_checkpoint_path}")
+
+    if kmeans_centroids_path is not None:
+        _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
+
+    return simple_mask_vqvae.to(device)
+
+
+def build_simple_mask_vqvae_multiscale_dim384(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
+) -> SimpleMaskVqvaeMultiScale:
+    """
+    Build multi-scale SimpleMaskVqvae with scales [1, 2, 4, 8, 16, 32, 64].
+
+    The decoder is the existing SimpleMaskDecoder; only the tokenizer/fusion
+    path is multi-scale.
+    """
+    vocab_size = 4096
+    dim = 384
+    beta = 0.25
+
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    mask_encoder = MaskEncoderLite(dim=dim)
+
+    simple_mask_vqvae = SimpleMaskVqvaeMultiScale(
+        image_encoder=image_encoder,
+        mask_encoder=mask_encoder,
+        dim=dim,
+        vocab_size=vocab_size,
+        beta=beta,
+        scales=(1, 2, 4, 8, 16, 32, 64),
+        device=device,
+        enable_vq=enable_vq,
+    )
+
+    if simple_mask_vqvae_checkpoint_path is not None:
+        checkpoint = torch.load(simple_mask_vqvae_checkpoint_path, map_location='cpu', weights_only=True)
+
+        if 'model_state_dict' in checkpoint:
+            simple_mask_vqvae_state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            simple_mask_vqvae_state_dict = checkpoint
+
+        if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
+            simple_mask_vqvae_state_dict = {
+                key.replace('_orig_mod.', ''): value
+                for key, value in simple_mask_vqvae_state_dict.items()
+            }
+
+        simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+        print(f"Loaded SimpleMaskVqvaeMultiScale checkpoint from {simple_mask_vqvae_checkpoint_path}")
+
+    if kmeans_centroids_path is not None:
+        _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
+
+    return simple_mask_vqvae.to(device)
+
+
 def build_simple_mask_vqvae_v2_dim384(
     simple_mask_vqvae_checkpoint_path: Optional[str] = None,
     image_encoder_checkpoint: Optional[str] = None,
@@ -1243,6 +1359,160 @@ def build_simple_mask_vqvae_v2_dim384(
         print(f"Loaded SimpleMaskVqvae checkpoint from {simple_mask_vqvae_checkpoint_path}")
 
     # Initialize VQ codebook from KMeans centroids if provided
+    if kmeans_centroids_path is not None:
+        _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
+
+    return simple_mask_vqvae.to(device)
+
+
+def _build_simple_mask_vqvae_query_variant_dim384(
+    model_cls,
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
+):
+    vocab_size = 4096
+    dim = 384
+    beta = 0.25
+
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    mask_encoder = MaskEncoderLite(dim=dim)
+
+    simple_mask_vqvae = model_cls(
+        image_encoder=image_encoder,
+        mask_encoder=mask_encoder,
+        dim=dim,
+        vocab_size=vocab_size,
+        beta=beta,
+        device=device,
+        enable_vq=enable_vq,
+    )
+
+    if simple_mask_vqvae_checkpoint_path is not None:
+        checkpoint = torch.load(simple_mask_vqvae_checkpoint_path, map_location='cpu', weights_only=True)
+
+        if 'model_state_dict' in checkpoint:
+            simple_mask_vqvae_state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            simple_mask_vqvae_state_dict = checkpoint
+
+        if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
+            simple_mask_vqvae_state_dict = {
+                key.replace('_orig_mod.', ''): value
+                for key, value in simple_mask_vqvae_state_dict.items()
+            }
+
+        simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+        print(f"Loaded {model_cls.__name__} checkpoint from {simple_mask_vqvae_checkpoint_path}")
+
+    if kmeans_centroids_path is not None:
+        _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
+
+    return simple_mask_vqvae.to(device)
+
+
+def build_simple_mask_vqvae_v3_dim384(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
+) -> SimpleMaskVqvaeV3:
+    return _build_simple_mask_vqvae_query_variant_dim384(
+        SimpleMaskVqvaeV3,
+        simple_mask_vqvae_checkpoint_path=simple_mask_vqvae_checkpoint_path,
+        image_encoder_checkpoint=image_encoder_checkpoint,
+        image_encoder_config_name=image_encoder_config_name,
+        device=device,
+        enable_vq=enable_vq,
+        kmeans_centroids_path=kmeans_centroids_path,
+    )
+
+
+def build_simple_mask_vqvae_v4_dim384(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
+) -> SimpleMaskVqvaeV4:
+    return _build_simple_mask_vqvae_query_variant_dim384(
+        SimpleMaskVqvaeV4,
+        simple_mask_vqvae_checkpoint_path=simple_mask_vqvae_checkpoint_path,
+        image_encoder_checkpoint=image_encoder_checkpoint,
+        image_encoder_config_name=image_encoder_config_name,
+        device=device,
+        enable_vq=enable_vq,
+        kmeans_centroids_path=kmeans_centroids_path,
+    )
+
+
+def build_simple_mask_vqvae_shape_only_dim384(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
+) -> SimpleMaskVqvaeShapeOnly:
+    """
+    Build shape-only SimpleMaskVqvae model with dim=384.
+
+    The signature intentionally matches other builders so the existing trainer
+    can reuse the same argument plumbing. Image encoder arguments are ignored.
+
+    Args:
+        simple_mask_vqvae_checkpoint_path: Path to model checkpoint
+        image_encoder_checkpoint: Unused, kept for trainer compatibility
+        image_encoder_config_name: Unused, kept for trainer compatibility
+        device: Device to load model on
+        enable_vq: Whether to enable VQ
+        kmeans_centroids_path: Path to KMeans centroids for initializing VQ codebook (.npy or .pt)
+    """
+    del image_encoder_checkpoint, image_encoder_config_name
+
+    vocab_size = 4096
+    dim = 384
+    beta = 0.25
+    num_queries = 8
+
+    mask_encoder = MaskEncoderLite(dim=dim)
+
+    simple_mask_vqvae = SimpleMaskVqvaeShapeOnly(
+        mask_encoder=mask_encoder,
+        dim=dim,
+        num_queries=num_queries,
+        vocab_size=vocab_size,
+        beta=beta,
+        device=device,
+        enable_vq=enable_vq,
+    )
+
+    if simple_mask_vqvae_checkpoint_path is not None:
+        checkpoint = torch.load(simple_mask_vqvae_checkpoint_path, map_location='cpu', weights_only=True)
+
+        if 'model_state_dict' in checkpoint:
+            simple_mask_vqvae_state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            simple_mask_vqvae_state_dict = checkpoint
+
+        if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
+            new_state_dict = {}
+            for key, value in simple_mask_vqvae_state_dict.items():
+                new_key = key.replace('_orig_mod.', '')
+                new_state_dict[new_key] = value
+            simple_mask_vqvae_state_dict = new_state_dict
+
+        simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict)
+        print(f"Loaded SimpleMaskVqvaeShapeOnly checkpoint from {simple_mask_vqvae_checkpoint_path}")
+
     if kmeans_centroids_path is not None:
         _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
 
@@ -1334,6 +1604,74 @@ def build_simple_query_token_ar(
 
         model.load_state_dict(state_dict)
         print(f"Loaded SimpleQueryTokenAR checkpoint from {checkpoint_path}")
+
+    return model.to(device)
+
+
+def build_simple_mask_vae_v2_dim384(
+    checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+) -> SimpleMaskVAEV2:
+    dim = 384
+    latent_dim = 128
+    num_queries = 8
+    beta_kl = 1e-4
+
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    mask_encoder = MaskEncoderLite(dim=dim)
+    model = SimpleMaskVAEV2(
+        image_encoder=image_encoder,
+        mask_encoder=mask_encoder,
+        dim=dim,
+        latent_dim=latent_dim,
+        num_queries=num_queries,
+        beta_kl=beta_kl,
+        num_heads=4,
+        device=device,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        print(f"Loaded SimpleMaskVAEV2 checkpoint from {checkpoint_path}")
+
+    return model.to(device)
+
+
+def build_simple_mask_latent_dit(
+    checkpoint_path: Optional[str] = None,
+    device: str = 'cpu',
+) -> SimpleMaskLatentDiT:
+    model = SimpleMaskLatentDiT(
+        latent_dim=128,
+        dim=384,
+        depth=2,
+        num_heads=4,
+        num_queries=8,
+        image_dim=384,
+        cond_grid_size=8,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        print(f"Loaded SimpleMaskLatentDiT checkpoint from {checkpoint_path}")
 
     return model.to(device)
 
@@ -1534,7 +1872,12 @@ builder_map = {
     "simple_mask_vqvae": {
         "simple_mask_vqvae": build_simple_mask_vqvae,
         "simple_mask_vqvae_dim384": build_simple_mask_vqvae_dim384,
+        "simple_mask_vqvae_v3_16x16_dim384": build_simple_mask_vqvae_v3_16x16_dim384,
+        "simple_mask_vqvae_multiscale_dim384": build_simple_mask_vqvae_multiscale_dim384,
         "simple_mask_vqvae_v2_dim384": build_simple_mask_vqvae_v2_dim384,
+        "simple_mask_vqvae_v3_dim384": build_simple_mask_vqvae_v3_dim384,
+        "simple_mask_vqvae_v4_dim384": build_simple_mask_vqvae_v4_dim384,
+        "simple_mask_vqvae_shape_only_dim384": build_simple_mask_vqvae_shape_only_dim384,
     },
     "image_encoder": {
         "sam_vitb": build_sam_image_encoder,
@@ -1554,6 +1897,12 @@ builder_map = {
     "simple_mask_ar": {
         "simple_mask_ar": build_simple_mask_ar,
         "simple_query_token_ar": build_simple_query_token_ar,
+    },
+    "simple_mask_vae": {
+        "simple_mask_vae_v2_dim384": build_simple_mask_vae_v2_dim384,
+    },
+    "simple_mask_diffusion": {
+        "simple_mask_latent_dit": build_simple_mask_latent_dit,
     },
     "dataset": {
         "cocolvis": build_cocolvis_dataset,
