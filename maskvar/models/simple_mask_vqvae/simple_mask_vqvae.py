@@ -6,7 +6,7 @@ from torch import distributed as tdist
 import timm
 from einops import rearrange, repeat
 from .basic import SimpleCrossBlock
-from .mask_decoder import SimpleMaskDecoder, SimpleMaskDecoderV2
+from .mask_decoder import SimpleMaskDecoder, SimpleMaskDecoderV2, SimpleMaskDecoderV4
 from .quant import SimpleVectorQuantize
 from ..rope2d import RotaryPositionEmbedding2D
 
@@ -177,3 +177,82 @@ class SimpleMaskVqvaeV2(nn.Module):
         if return_usage:
             return mask, vq_loss, vq_usage
         return mask, vq_loss 
+
+
+class SimpleMaskVqvaeV3(SimpleMaskVqvaeV2):
+    """
+    V2 architecture with a dedicated segmentation token prepended before decode.
+
+    The query tokens are still compacted and quantized exactly like V2. The
+    additional seg token is continuous and only participates inside the decoder;
+    SimpleMaskDecoderV2 then uses this prepended token for mask logits.
+    """
+
+    def __init__(self, image_encoder, mask_encoder, dim=256, num_queries=8, vocab_size=4096, beta=0.25, h=64, w=64, enable_vq=True, device='cuda'):
+        super().__init__(
+            image_encoder=image_encoder,
+            mask_encoder=mask_encoder,
+            dim=dim,
+            num_queries=num_queries,
+            vocab_size=vocab_size,
+            beta=beta,
+            h=h,
+            w=w,
+            enable_vq=enable_vq,
+            device=device,
+        )
+        self.seg_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.mask_decoder = SimpleMaskDecoderV2(rope=self.rope, dim=dim, num_heads=4, num_queries=num_queries + 1)
+
+    def forward(self, mask_normalized: torch.Tensor, image: torch.Tensor, return_usage: bool = False):
+        _, _, H, W = mask_normalized.shape
+
+        mask_tokens = self.mask_encoder(mask_normalized)
+        image_tokens = self.image_encoder(image)
+
+        mask_tokens = rearrange(mask_tokens, 'b c h w -> b h w c')
+        image_tokens = rearrange(image_tokens, 'b c h w -> b h w c')
+
+        queries_tokens = self.mask_feature_compactor(mask_tokens)
+
+        if self.enable_vq:
+            if return_usage:
+                queries_tokens, vq_loss, vq_usage = self.quant(queries_tokens, return_usage=True)
+            else:
+                queries_tokens, vq_loss = self.quant(queries_tokens)
+                vq_usage = None
+        else:
+            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
+            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
+
+        seg_token = repeat(self.seg_token, '1 l c -> b l c', b=queries_tokens.shape[0])
+        decoder_tokens = torch.cat([seg_token, queries_tokens], dim=1)
+        mask = self.mask_decoder(decoder_tokens, image_tokens)
+
+        if mask.shape[-2:] != (H, W):
+            mask = F.interpolate(mask, size=(H, W), mode='bilinear', align_corners=False)
+
+        if return_usage:
+            return mask, vq_loss, vq_usage
+        return mask, vq_loss
+
+
+class SimpleMaskVqvaeV4(SimpleMaskVqvaeV2):
+    """
+    V2 architecture with all query tokens contributing to the final mask logits.
+    """
+
+    def __init__(self, image_encoder, mask_encoder, dim=256, num_queries=8, vocab_size=4096, beta=0.25, h=64, w=64, enable_vq=True, device='cuda'):
+        super().__init__(
+            image_encoder=image_encoder,
+            mask_encoder=mask_encoder,
+            dim=dim,
+            num_queries=num_queries,
+            vocab_size=vocab_size,
+            beta=beta,
+            h=h,
+            w=w,
+            enable_vq=enable_vq,
+            device=device,
+        )
+        self.mask_decoder = SimpleMaskDecoderV4(rope=self.rope, dim=dim, num_heads=4, num_queries=num_queries)

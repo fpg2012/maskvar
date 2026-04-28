@@ -32,3 +32,16 @@ class MaskEncoderLite(nn.Module):
         mask_tokens = mask_tokens + self.mlp(self.layer_norm(mask_tokens))
         
         return rearrange(mask_tokens, 'b h w c -> b c h w')
+
+
+class MaskEncoderLite16x16(MaskEncoderLite):
+    """
+    Mask encoder variant that emits a 16x16 latent grid for 1024x1024 masks.
+
+    This keeps the same lightweight patch-embedding design as MaskEncoderLite,
+    but uses 64x64 patches instead of 16x16 patches. The resulting 256 mask
+    tokens are a direct fit for faster AR experiments.
+    """
+
+    def __init__(self, dim, image_size=1024):
+        super().__init__(dim=dim, patch_size=image_size // 16, image_size=image_size)

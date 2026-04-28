@@ -1043,6 +1043,12 @@ def main():
     if vqvae_image_encoder_config is not None:
         vqvae_builder_kwargs['image_encoder_config_name'] = vqvae_image_encoder_config
 
+    if 'shape_only' in args.vqvae_config:
+        raise ValueError(
+            f"VQVAE config '{args.vqvae_config}' is shape-only and is not compatible with the current "
+            "simple_mask_ar/simple_query_token_ar training pipeline, which requires image tokens."
+        )
+
     vqvae_model = builder_map['simple_mask_vqvae'][args.vqvae_config](
         **vqvae_builder_kwargs,
     )

@@ -125,6 +125,31 @@ class SimpleMaskDecoderV2(nn.Module):
         return masks.contiguous()
 
 
+class SimpleMaskDecoderV4(SimpleMaskDecoderV2):
+    """
+    V2 decoder variant where every query token contributes to mask logits.
+
+    SimpleMaskDecoderV2 only uses query_tokens[:, 0] after the two-way blocks.
+    This variant runs the same hyper-network for all query tokens and sums the
+    resulting per-token logits.
+    """
+
+    def forward(self, query_tokens: torch.Tensor, image_tokens: torch.Tensor):
+        for blk in self.two_way_blocks:
+            query_tokens, image_tokens = blk(query_tokens, image_tokens)
+
+        image_feature_map = rearrange(image_tokens, 'b h w c -> b c h w')
+        up_query_tokens = self.hyper_in(query_tokens)
+        up_image_map = self.output_upscaling(image_feature_map)
+
+        up_query_tokens = self.layer_norm_post_query(up_query_tokens)
+        up_image_map = self.layer_norm_post_image(rearrange(up_image_map, 'b c h w -> b h w c'))
+
+        masks = torch.einsum('blc,bhwc->blhw', up_query_tokens, up_image_map).sum(dim=1, keepdim=True)
+
+        return masks.contiguous()
+
+
 class MaskDecoderWithSAM(SimpleMaskDecoder):
     
     def __init__(self, sam_mask_decoder: SamMaskDecoder):
@@ -158,4 +183,3 @@ class MaskDecoderWithSAM(SimpleMaskDecoder):
         masks = torch.einsum('bchw,bchw->bhw', upscaled_embedding, upscaled_token_map)
         
         return masks
-
