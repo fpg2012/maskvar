@@ -27,3 +27,7 @@ __pycache__/
 .vscode/
 data/
 maskvar.egg-info
+profiles/
+result-*.json
+notebooks/attention_outputs/
+.codex
