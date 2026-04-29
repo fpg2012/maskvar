@@ -56,6 +56,17 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
         self.fuse_norm = nn.LayerNorm(dim)
 
     def _extract_multiscale_tokens(self, mask_normalized: torch.Tensor):
+        """
+        Encode a normalized mask into one token sequence per scale.
+
+        Args:
+            mask_normalized: Float mask tensor of shape [B, 1, H, W].
+
+        Returns:
+            list[Tensor]: For each scale S in self.scales, a tensor of shape
+                [B, S*S, C], where C == self.dim. The scale embedding has
+                already been added to each token.
+        """
         mask_feature = self.mask_encoder(mask_normalized)
         tokens_by_scale = []
         for scale_idx, scale in enumerate(self.scales):
@@ -66,6 +77,19 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
         return tokens_by_scale
 
     def _quantize_multiscale(self, tokens_by_scale, return_usage=False):
+        """
+        Quantize all scale tokens with the shared VQ codebook.
+
+        Args:
+            tokens_by_scale: list of tensors with shapes [B, S_i*S_i, C].
+            return_usage: Whether to return codebook usage statistics.
+
+        Returns:
+            tokens_q_by_scale: list of quantized tensors matching the input
+                shapes [B, S_i*S_i, C].
+            vq_loss: Scalar tensor from the vector quantizer.
+            vq_usage: Usage tensor/statistic when requested, otherwise None.
+        """
         lengths = [tokens.shape[1] for tokens in tokens_by_scale]
         all_tokens = torch.cat(tokens_by_scale, dim=1)
         if return_usage:
@@ -77,6 +101,17 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
         return tokens_q_by_scale, vq_loss, vq_usage
 
     def _fuse_multiscale_tokens(self, tokens_by_scale):
+        """
+        Upsample scale token maps to the decoder grid and fuse them.
+
+        Args:
+            tokens_by_scale: list of tensors with shapes [B, S_i*S_i, C],
+                one per scale in self.scales.
+
+        Returns:
+            Tensor of shape [B, self.h, self.w, C]. This is the fused mask
+            token grid consumed by SimpleMaskDecoder.
+        """
         fused = None
         for scale_idx, (scale, tokens) in enumerate(zip(self.scales, tokens_by_scale)):
             feat = rearrange(tokens, "b (h w) c -> b c h w", h=scale, w=scale)
@@ -89,11 +124,36 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
         return self.fuse_norm(fused)
 
     def encode_to_multiscale_token_ids(self, mask_normalized: torch.Tensor):
+        """
+        Convert a mask into discrete token ids for every scale.
+
+        Args:
+            mask_normalized: Float mask tensor of shape [B, 1, H, W].
+
+        Returns:
+            list[Tensor]: For each scale S, token ids of shape [B, S*S].
+        """
         tokens_by_scale = self._extract_multiscale_tokens(mask_normalized)
         token_ids_by_scale = [self.quant.x_to_idx(tokens.float()) for tokens in tokens_by_scale]
         return token_ids_by_scale
 
     def decode_from_multiscale_token_ids(self, token_ids_by_scale, image=None, image_tokens=None, output_size=None):
+        """
+        Decode multiscale token ids back into mask logits.
+
+        Args:
+            token_ids_by_scale: list of integer tensors with shapes [B, S_i*S_i],
+                one per scale in self.scales.
+            image: Optional image tensor passed to image_encoder, typically
+                [B, 3, H_img, W_img]. Required when image_tokens is None.
+            image_tokens: Optional encoded image features. Accepted shapes are
+                [B, C, H_img', W_img'] or [B, H_img'*W_img', C].
+            output_size: Optional target spatial size (H_out, W_out).
+
+        Returns:
+            Tensor of mask logits with shape [B, 1, H_out, W_out] when
+            output_size is provided, otherwise the decoder's native mask size.
+        """
         if len(token_ids_by_scale) != len(self.scales):
             raise ValueError(f"Expected {len(self.scales)} scales, got {len(token_ids_by_scale)}")
         tokens_by_scale = [self.quant.idx_to_x(token_ids) for token_ids in token_ids_by_scale]
@@ -115,6 +175,23 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
         return mask
 
     def forward(self, mask_normalized: torch.Tensor, image: torch.Tensor, return_usage: bool = False):
+        """
+        Train/evaluate the multiscale mask tokenizer end to end.
+
+        Args:
+            mask_normalized: Float mask tensor of shape [B, 1, H, W].
+            image: Image tensor consumed by image_encoder, typically
+                [B, 3, H_img, W_img].
+            return_usage: Whether to return codebook usage statistics.
+
+        Returns:
+            If return_usage is False:
+                (mask, vq_loss), where mask has shape [B, 1, H, W] and
+                vq_loss is a scalar tensor.
+            If return_usage is True:
+                (mask, vq_loss, vq_usage), with the same mask shape and the
+                quantizer usage statistic as the third value.
+        """
         _, _, H, W = mask_normalized.shape
         tokens_by_scale = self._extract_multiscale_tokens(mask_normalized)
         image_tokens = self.image_encoder(image)

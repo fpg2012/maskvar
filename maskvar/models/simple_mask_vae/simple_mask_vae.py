@@ -11,6 +11,16 @@ from maskvar.models.simple_mask_vqvae.simple_mask_vqvae import MaskFeatureCompac
 
 
 def diagonal_gaussian_kl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the mean KL divergence from N(mu, exp(logvar)) to N(0, I).
+
+    Args:
+        mu: Gaussian mean tensor of shape [..., latent_dim].
+        logvar: Gaussian log-variance tensor with the same shape as mu.
+
+    Returns:
+        Scalar tensor containing the mean KL over all elements.
+    """
     kl = 0.5 * (mu.float().pow(2) + logvar.float().exp() - 1.0 - logvar.float())
     return kl.mean()
 
@@ -69,12 +79,34 @@ class SimpleMaskVAEV2(nn.Module):
         )
 
     def encode(self, mask_normalized: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode a normalized mask into Gaussian query latents.
+
+        Args:
+            mask_normalized: Float mask tensor of shape [B, 1, H, W].
+
+        Returns:
+            mu: Mean tensor of shape [B, num_queries, latent_dim].
+            logvar: Clamped log-variance tensor of shape
+                [B, num_queries, latent_dim].
+        """
         mask_tokens = self.mask_encoder(mask_normalized)
         mask_tokens = rearrange(mask_tokens, "b c h w -> b h w c")
         query_tokens = self.mask_feature_compactor(mask_tokens)
         return self.to_mu(query_tokens), self.to_logvar(query_tokens).clamp(-20.0, 10.0)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor, sample: bool = True) -> torch.Tensor:
+        """
+        Draw or return latent samples from the encoded diagonal Gaussian.
+
+        Args:
+            mu: Mean tensor of shape [B, num_queries, latent_dim].
+            logvar: Log-variance tensor with the same shape as mu.
+            sample: If False, return mu directly for deterministic decoding.
+
+        Returns:
+            Latent tensor z of shape [B, num_queries, latent_dim].
+        """
         if not sample:
             return mu
         std = torch.exp(0.5 * logvar)
@@ -87,6 +119,21 @@ class SimpleMaskVAEV2(nn.Module):
         image_tokens: torch.Tensor | None = None,
         output_size=None,
     ) -> torch.Tensor:
+        """
+        Decode continuous query latents into mask logits conditioned on image features.
+
+        Args:
+            z: Latent tensor of shape [B, num_queries, latent_dim].
+            image: Optional image tensor passed to image_encoder, typically
+                [B, 3, H_img, W_img]. Required when image_tokens is None.
+            image_tokens: Optional encoded image features. Accepted shapes are
+                [B, L, C], [B, C, H_img', W_img'], or [B, H_img', W_img', C].
+            output_size: Optional target spatial size (H_out, W_out).
+
+        Returns:
+            Mask-logit tensor of shape [B, 1, H_out, W_out] when output_size is
+            provided, otherwise the decoder's native mask size.
+        """
         if image_tokens is None:
             if image is None:
                 raise ValueError("Either image or image_tokens must be provided.")
@@ -108,6 +155,26 @@ class SimpleMaskVAEV2(nn.Module):
         return mask_logits
 
     def forward(self, mask_normalized: torch.Tensor, image: torch.Tensor, sample: bool | None = None):
+        """
+        Run the full VAE reconstruction path and return losses/intermediates.
+
+        Args:
+            mask_normalized: Float mask tensor of shape [B, 1, H, W].
+            image: Image tensor consumed by image_encoder, typically
+                [B, 3, H_img, W_img].
+            sample: Whether to sample z from the posterior. Defaults to
+                self.training when None.
+
+        Returns:
+            dict with:
+                mask_logits: [B, 1, H, W] reconstruction logits.
+                kl_loss: Scalar mean KL tensor.
+                vae_loss: Scalar beta_kl-weighted KL tensor.
+                z: [B, num_queries, latent_dim] sampled/deterministic latents.
+                mu: [B, num_queries, latent_dim] posterior means.
+                logvar: [B, num_queries, latent_dim] posterior log-variances.
+                image_tokens: Encoded image features returned by image_encoder.
+        """
         if sample is None:
             sample = self.training
 
@@ -129,6 +196,18 @@ class SimpleMaskVAEV2(nn.Module):
 
     @torch.no_grad()
     def encode_mask_to_latents(self, mask_normalized: torch.Tensor, sample: bool = False):
+        """
+        Encode a mask for downstream latent diffusion training or sampling.
+
+        Args:
+            mask_normalized: Float mask tensor of shape [B, 1, H, W].
+            sample: Whether to sample z instead of returning the posterior mean.
+
+        Returns:
+            z: Latent tensor of shape [B, num_queries, latent_dim].
+            mu: Mean tensor of shape [B, num_queries, latent_dim].
+            logvar: Log-variance tensor of shape [B, num_queries, latent_dim].
+        """
         mu, logvar = self.encode(mask_normalized)
         z = self.reparameterize(mu, logvar, sample=sample)
         return z, mu, logvar
