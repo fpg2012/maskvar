@@ -29,12 +29,12 @@ if [ $N_NODE -eq 0 ]; then
     --no_compile \
     --train_subset_index data/subset/coconut_hf_train-25_percent.npy
 else
-    torchrun --nproc_per_node=$N_NODE train_scripts/train_simple_mask_vae.py \
+    torchrun --nproc_per_node=$N_NODE --master_port=$MASTER_PORT train_scripts/train_simple_mask_vae.py \
     --out_dir $OUTDIR \
     --outer_iters 10 \
     --inner_iters 0 \
     --val_iters 0 \
-    --batch_size 16 \
+    --batch_size 32 \
     --learning_rate 2e-4 \
     --accumulate_steps 1 \
     --num_workers 8 \
@@ -48,7 +48,7 @@ else
     --kl_weight 1e-4 \
     --kl_warmup_iters 10000 \
     --freeze_image_encoder \
-    --no_compile \
     --log_interval 64 \
-    --train_subset_index data/subset/coconut_hf_train-25_percent.npy
+    --train_subset_index data/subset/coconut_hf_train-25_percent.npy \
+    --disable_find_unused_parameters
 fi

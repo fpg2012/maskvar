@@ -191,6 +191,7 @@ class SimpleMaskVAETrainer:
                 device_ids=[self.local_rank],
                 find_unused_parameters=find_unused_parameters,
                 gradient_as_bucket_view=False,
+                broadcast_buffers=False,
             )
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, betas=(0.9, 0.999), weight_decay=0.01)
