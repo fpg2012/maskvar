@@ -2,28 +2,33 @@ import torch
 from torch import nn
 from einops import rearrange
 
-from .basic import RotaryPositionEmbedding, SimpleCrossBlock, SimpleSelfBlock
+from .basic import RotaryPositionEmbedding, SimpleClickCrossBlock, SimpleCrossBlock, SimpleSelfBlock
 
 
 class SimpleMaskARBlock(nn.Module):
 
-    def __init__(self, rope: RotaryPositionEmbedding, dim, num_heads):
+    def __init__(self, rope: RotaryPositionEmbedding, dim, num_heads, enable_click: bool = False):
         super().__init__()
+        self.enable_click = enable_click
+        if enable_click:
+            self.click_cross_block = SimpleClickCrossBlock(rope, dim, num_heads)
         self.cross_block = SimpleCrossBlock(rope, dim, num_heads)
         self.self_block = SimpleSelfBlock(rope, dim, num_heads)
 
-    def forward(self, x, image_tokens, block_mask=None):
+    def forward(self, x, image_tokens, click_tokens=None, click_coords=None, click_labels=None, block_mask=None):
         """
         Training forward with spatial format.
 
         x: (b, h, w, c) - spatial format
         image_tokens: (b, h, w, c) - spatial format
         """
+        if self.enable_click and click_tokens is not None:
+            x = self.click_cross_block(x, click_tokens, click_coords, click_labels)
         x = self.cross_block(x, kv=image_tokens)
         x = self.self_block(x, attn_mask=block_mask)
         return x
 
-    def forward_seq(self, x_seq, image_tokens, coords):
+    def forward_seq(self, x_seq, image_tokens, coords, click_tokens=None, click_coords=None, click_labels=None):
         """
         Inference forward with sequence format.
 
@@ -33,6 +38,15 @@ class SimpleMaskARBlock(nn.Module):
             coords: (l, 2) - coordinates for each position in sequence
         """
         _, h, w, _ = image_tokens.shape
+        if self.enable_click and click_tokens is not None:
+            x_seq = self.click_cross_block.forward_seq(
+                x_seq,
+                click_tokens,
+                click_coords,
+                click_labels,
+                coords,
+                spatial_shape=(h, w),
+            )
         x_seq = self.cross_block.forward_seq(x_seq, image_tokens, coords)
         x_seq = self.self_block.forward_seq(x_seq, coords, block_mask=None, spatial_shape=(h, w))
         return x_seq
@@ -40,7 +54,12 @@ class SimpleMaskARBlock(nn.Module):
     def precompute_cross_kv(self, image_tokens):
         return self.cross_block.precompute_kv(image_tokens)
 
-    def forward_step(self, x_step, cross_cache, self_cache, coord):
+    def precompute_click_kv(self, click_tokens, click_coords, click_labels, h, w):
+        if not self.enable_click or click_tokens is None:
+            return None
+        return self.click_cross_block.precompute_kv(click_tokens, click_coords, click_labels, h, w)
+
+    def forward_step(self, x_step, cross_cache, self_cache, coord, click_cache=None):
         """
         Incremental autoregressive step for a single token.
 
@@ -53,6 +72,9 @@ class SimpleMaskARBlock(nn.Module):
         cached_k, cached_v, h, w = cross_cache
         cache_k, cache_v = (self_cache if self_cache is not None else (None, None))
 
+        if self.enable_click and click_cache is not None:
+            click_k, click_v, click_h, click_w = click_cache
+            x_step = self.click_cross_block.forward_step(x_step, click_k, click_v, coord, click_h, click_w)
         x_step = self.cross_block.forward_step(x_step, cached_k, cached_v, coord, h, w)
         x_step, new_k, new_v = self.self_block.forward_step(
             x_step,
@@ -66,7 +88,7 @@ class SimpleMaskARBlock(nn.Module):
 
 class SimpleMaskAR(nn.Module):
 
-    def __init__(self, dim=256, depth=2, vocab_size=4096, h=64, w=64, num_heads=8):
+    def __init__(self, dim=256, depth=2, vocab_size=4096, h=64, w=64, num_heads=8, enable_click: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -74,6 +96,7 @@ class SimpleMaskAR(nn.Module):
         self.w = w
         self.num_heads = num_heads
         self.max_len = h * w
+        self.enable_click = enable_click
 
         self.embed = nn.Embedding(self.vocab_size, dim)
         self.cls = nn.Linear(dim, self.vocab_size)
@@ -81,9 +104,12 @@ class SimpleMaskAR(nn.Module):
         self.rope = RotaryPositionEmbedding(h=h, w=w)
 
         self.sos = nn.Parameter(torch.randn(dim))
+        if enable_click:
+            self.positive_click = nn.Parameter(torch.randn(dim))
+            self.padding_click = nn.Parameter(torch.randn(dim))
 
         self.blocks = nn.ModuleList([
-            SimpleMaskARBlock(rope=self.rope, dim=dim, num_heads=num_heads) for _ in range(depth)
+            SimpleMaskARBlock(rope=self.rope, dim=dim, num_heads=num_heads, enable_click=enable_click) for _ in range(depth)
         ])
 
     def get_device(self):
@@ -128,7 +154,30 @@ class SimpleMaskAR(nn.Module):
             raise ValueError(f"Expected image token length {self.max_len}, got {L}")
         return image_tokens.view(B, self.h, self.w, C)
 
-    def forward(self, x: torch.Tensor, image_tokens: torch.Tensor):
+    def encode_clicks(self, click_coords: torch.Tensor | None, click_labels: torch.Tensor | None):
+        """
+        Build click condition tokens.
+
+        click_coords: (B, N, 2), row/col coordinates in AR token-grid units
+        click_labels: (B, N), 1 for positive clicks and -1 for padding
+        """
+        if not self.enable_click:
+            return None, None, None
+        if click_coords is None or click_labels is None:
+            raise ValueError("click_coords and click_labels are required when enable_click=True")
+
+        click_coords = click_coords.to(device=self.positive_click.device, dtype=torch.float32)
+        click_labels = click_labels.to(device=self.positive_click.device)
+        B, N, _ = click_coords.shape
+        pos = self.positive_click.view(1, 1, self.dim).expand(B, N, -1)
+        pad = self.padding_click.view(1, 1, self.dim).expand(B, N, -1)
+        click_tokens = torch.where((click_labels == 1).unsqueeze(-1), pos, pad)
+
+        pos_rope = self.rope.apply_2d_rope_with_batched_coords(click_tokens, click_coords, self.h, self.w)
+        click_tokens = torch.where((click_labels == 1).unsqueeze(-1), pos_rope, click_tokens)
+        return click_tokens, click_coords, click_labels
+
+    def forward(self, x: torch.Tensor, image_tokens: torch.Tensor, click_coords: torch.Tensor | None = None, click_labels: torch.Tensor | None = None):
         """
         Training forward.
         x: (B, L) - token indices in row-major order
@@ -139,9 +188,17 @@ class SimpleMaskAR(nn.Module):
         """
         x = self.preprocess(x)  # (B, H, W, C)
         image_tokens = self._image_tokens_to_spatial(image_tokens)
+        click_tokens, click_coords, click_labels = self.encode_clicks(click_coords, click_labels)
 
         for block in self.blocks:
-            x = block(x, image_tokens, block_mask=None)
+            x = block(
+                x,
+                image_tokens,
+                click_tokens=click_tokens,
+                click_coords=click_coords,
+                click_labels=click_labels,
+                block_mask=None,
+            )
 
         # Classify to get logits
         logits = self.cls(x)  # (B, H, W, vocab_size)
@@ -187,6 +244,8 @@ class SimpleMaskAR(nn.Module):
     def autoregressive_infer(
         self,
         image_tokens: torch.Tensor,
+        click_coords: torch.Tensor | None = None,
+        click_labels: torch.Tensor | None = None,
         temperature=1.0,
         top_k=None,
         num_samples: int = 1,
@@ -209,6 +268,7 @@ class SimpleMaskAR(nn.Module):
             raise ValueError(f"num_samples must be >= 1, got {num_samples}")
 
         image_tokens_spatial = self._image_tokens_to_spatial(image_tokens)
+        click_tokens, click_coords, click_labels = self.encode_clicks(click_coords, click_labels)
         B, _, C = image_tokens.shape
         H, W = self.h, self.w
         device = image_tokens.device
@@ -223,12 +283,23 @@ class SimpleMaskAR(nn.Module):
         # Initialize step input with sos embedding and per-block caches.
         x_step = self.sos.view(1, 1, self.dim).expand(batch_size, 1, -1)  # (B * num_samples, 1, C)
         cross_caches = []
+        click_caches = []
         for block in self.blocks:
             cached_k, cached_v, h, w = block.precompute_cross_kv(image_tokens_spatial)
             if num_samples > 1:
                 cached_k = cached_k.repeat_interleave(num_samples, dim=0)
                 cached_v = cached_v.repeat_interleave(num_samples, dim=0)
             cross_caches.append((cached_k, cached_v, h, w))
+            click_cache = block.precompute_click_kv(click_tokens, click_coords, click_labels, H, W)
+            if click_cache is not None and num_samples > 1:
+                click_k, click_v, click_h, click_w = click_cache
+                click_cache = (
+                    click_k.repeat_interleave(num_samples, dim=0),
+                    click_v.repeat_interleave(num_samples, dim=0),
+                    click_h,
+                    click_w,
+                )
+            click_caches.append(click_cache)
         self_caches = [None for _ in self.blocks]
 
         generated_ids = []
@@ -243,6 +314,7 @@ class SimpleMaskAR(nn.Module):
                     cross_caches[block_idx],
                     self_caches[block_idx],
                     curr_coord,
+                    click_cache=click_caches[block_idx],
                 )
 
             # Get logits for the current (last) position

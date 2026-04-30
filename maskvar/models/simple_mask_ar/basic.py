@@ -85,6 +85,37 @@ class RotaryPositionEmbedding(nn.Module):
 
         return torch.cat([x_h, x_w], dim=-1)
 
+    def apply_2d_rope_with_batched_coords(self, x: torch.Tensor, coords: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """
+        Apply 2D RoPE with per-sample coordinates.
+
+        Args:
+            x: (B, L, C)
+            coords: (B, L, 2), row/col coordinates. Float coordinates are allowed.
+            h: full height used for RoPE scaling
+            w: full width used for RoPE scaling
+        """
+        B, L, C = x.shape
+        assert C % 2 == 0, "C must be even for 2D RoPE"
+        assert coords.shape == (B, L, 2), f"coords shape {coords.shape} != ({B}, {L}, 2)"
+
+        scale_h, scale_w = self.h / h, self.w / w
+
+        x_h, x_w = x.chunk(2, dim=-1)
+        dim = C // 2
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=x.device).float() / dim))
+
+        rows = (coords[..., 0].float() + 0.5) * scale_h
+        cols = (coords[..., 1].float() + 0.5) * scale_w
+
+        h_freqs = rows.unsqueeze(-1) * inv_freq.view(1, 1, -1)
+        w_freqs = cols.unsqueeze(-1) * inv_freq.view(1, 1, -1)
+
+        x_h = self._apply_rotary_seq(x_h, h_freqs.cos(), h_freqs.sin())
+        x_w = self._apply_rotary_seq(x_w, w_freqs.cos(), w_freqs.sin())
+
+        return torch.cat([x_h, x_w], dim=-1)
+
     def _apply_rotary_seq(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         """Apply rotary to sequence format (B, L, D)"""
         # x: (B, L, D)   D = C//2
@@ -135,29 +166,22 @@ class SimpleCrossBlock(nn.Module):
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         self.dim_head = dim // num_heads
 
-    
     def forward(self, q, kv):
         """
         q: (b, h, w, c)
         k: (b, h, w, c)
         """
         b, h, w, c = kv.shape
-        # print(f"[DEBUG] CrossBlock input - q: {q.shape}, kv: {kv.shape}, expected dim: {self.dim}")
-
         q_input = q
 
         q = self.linear_q(q)
-        # print(f"[DEBUG] After linear_q - q: {q.shape}")
         kv = self.linear_kv(kv)
-        # print(f"[DEBUG] After linear_kv - kv: {kv.shape}")
         k, v = kv.chunk(2, dim=-1)
-        # print(f"[DEBUG] After chunk - k: {k.shape}, v: {v.shape}")
-        
+
         q = rearrange(q, 'b h w (nh c_head) -> b nh h w c_head', nh=self.num_heads, c_head=self.dim_head)
         k = rearrange(k, 'b h w (nh c_head) -> b nh h w c_head', nh=self.num_heads, c_head=self.dim_head)
         v = rearrange(v, 'b h w (nh c_head) -> b nh (h w) c_head', nh=self.num_heads, c_head=self.dim_head)
 
-        # apply RoPE
         k = rearrange(k, 'b nh h w c_head -> (b nh) h w c_head')
         q = rearrange(q, 'b nh h w c_head -> (b nh) h w c_head')
 
@@ -169,7 +193,6 @@ class SimpleCrossBlock(nn.Module):
         k = rearrange(k, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
         q = rearrange(q, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
 
-        # out = flex_attention(q, k, v, attn_mask=None)
         out = F.scaled_dot_product_attention(q, k, v)
         out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
         out = rearrange(out, 'b (h w) c -> b h w c', h=h, w=w)
@@ -259,6 +282,125 @@ class SimpleCrossBlock(nn.Module):
             coord: (1, 2)
             h, w: full spatial shape for RoPE scaling
         """
+        b, _, _ = q_step.shape
+        q_input = q_step
+
+        q = self.linear_q(q_step)
+        q = rearrange(q, 'b l (nh c_head) -> b nh l c_head', nh=self.num_heads, c_head=self.dim_head)
+        q = rearrange(q, 'b nh l c_head -> (b nh) l c_head')
+        q = self.rope.apply_2d_rope_with_coords(q, coord, h, w)
+        q = q.to(cached_v.dtype)
+        q = rearrange(q, '(b nh) l c_head -> b nh l c_head', b=b, nh=self.num_heads)
+
+        out = F.scaled_dot_product_attention(q, cached_k, cached_v)
+        out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
+        out = q_input + self.out_proj(out)
+        out = out + self.ffn(self.layernorm(out))
+
+        return out
+
+
+class SimpleClickCrossBlock(nn.Module):
+
+    def __init__(self, rope: RotaryPositionEmbedding, dim, num_heads):
+        super().__init__()
+        self.rope: RotaryPositionEmbedding = rope
+        self.dim = dim
+        self.linear_q = nn.Linear(dim, dim)
+        self.linear_kv = nn.Linear(dim, dim * 2)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+        self.out_proj = nn.Linear(dim, dim)
+        self.num_heads = num_heads
+        self.layernorm = nn.LayerNorm(dim)
+
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.dim_head = dim // num_heads
+
+    def _apply_click_rope(self, k, click_coords, click_labels, h, w):
+        b = click_coords.shape[0]
+        k_seq = rearrange(k, 'b nh n c_head -> (b nh) n c_head')
+        batched_coords = click_coords[:, None].expand(-1, self.num_heads, -1, -1)
+        batched_coords = rearrange(batched_coords, 'b nh n xy -> (b nh) n xy')
+        k_rope = self.rope.apply_2d_rope_with_batched_coords(k_seq, batched_coords, h, w)
+
+        valid = (click_labels[:, None, :, None] == 1).expand(-1, self.num_heads, -1, self.dim_head)
+        valid = rearrange(valid, 'b nh n c_head -> (b nh) n c_head')
+        k_seq = torch.where(valid, k_rope, k_seq)
+        return rearrange(k_seq, '(b nh) n c_head -> b nh n c_head', b=b, nh=self.num_heads)
+
+    def forward(self, q, click_tokens, click_coords, click_labels):
+        """
+        q: (b, h, w, c)
+        click_tokens: (b, n, c)
+        click_coords: (b, n, 2), row/col coordinates in token-grid units
+        click_labels: (b, n), 1 for positive clicks and -1 for padding
+        """
+        b, h, w, _ = q.shape
+        q_input = q
+
+        q = self.linear_q(q)
+        kv = self.linear_kv(click_tokens)
+        k, v = kv.chunk(2, dim=-1)
+
+        q = rearrange(q, 'b h w (nh c_head) -> b nh h w c_head', nh=self.num_heads, c_head=self.dim_head)
+        k = rearrange(k, 'b n (nh c_head) -> b nh n c_head', nh=self.num_heads, c_head=self.dim_head)
+        v = rearrange(v, 'b n (nh c_head) -> b nh n c_head', nh=self.num_heads, c_head=self.dim_head)
+
+        q = rearrange(q, 'b nh h w c_head -> (b nh) h w c_head')
+        q = self.rope.apply_2d_rope(q)
+        q = q.to(v.dtype)
+        q = rearrange(q, '(b nh) h w c_head -> b nh (h w) c_head', b=b, nh=self.num_heads)
+
+        k = self._apply_click_rope(k, click_coords, click_labels, h, w).to(v.dtype)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
+        out = rearrange(out, 'b (h w) c -> b h w c', h=h, w=w)
+        out = q_input + self.out_proj(out)
+        out = out + self.ffn(self.layernorm(out))
+
+        return out
+
+    def forward_seq(self, q_seq, click_tokens, click_coords, click_labels, q_coords, spatial_shape):
+        b, _, _ = q_seq.shape
+        h, w = spatial_shape
+        q_input = q_seq
+
+        q = self.linear_q(q_seq)
+        kv = self.linear_kv(click_tokens)
+        k, v = kv.chunk(2, dim=-1)
+
+        q = rearrange(q, 'b l (nh c_head) -> b nh l c_head', nh=self.num_heads, c_head=self.dim_head)
+        k = rearrange(k, 'b n (nh c_head) -> b nh n c_head', nh=self.num_heads, c_head=self.dim_head)
+        v = rearrange(v, 'b n (nh c_head) -> b nh n c_head', nh=self.num_heads, c_head=self.dim_head)
+
+        q = rearrange(q, 'b nh l c_head -> (b nh) l c_head')
+        q = self.rope.apply_2d_rope_with_coords(q, q_coords, h, w)
+        q = q.to(v.dtype)
+        q = rearrange(q, '(b nh) l c_head -> b nh l c_head', b=b, nh=self.num_heads)
+
+        k = self._apply_click_rope(k, click_coords, click_labels, h, w).to(v.dtype)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = rearrange(out, 'b nh l c_head -> b l (nh c_head)')
+        out = q_input + self.out_proj(out)
+        out = out + self.ffn(self.layernorm(out))
+
+        return out
+
+    def precompute_kv(self, click_tokens, click_coords, click_labels, h, w):
+        kv = self.linear_kv(click_tokens)
+        k, v = kv.chunk(2, dim=-1)
+        k = rearrange(k, 'b n (nh c_head) -> b nh n c_head', nh=self.num_heads, c_head=self.dim_head)
+        v = rearrange(v, 'b n (nh c_head) -> b nh n c_head', nh=self.num_heads, c_head=self.dim_head)
+        k = self._apply_click_rope(k, click_coords, click_labels, h, w).to(v.dtype)
+        return k, v, h, w
+
+    def forward_step(self, q_step, cached_k, cached_v, coord, h, w):
         b, _, _ = q_step.shape
         q_input = q_step
 

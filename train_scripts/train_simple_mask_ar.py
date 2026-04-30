@@ -25,6 +25,7 @@ import torch.distributed as tdist
 import torch.profiler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, IterableDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib
@@ -45,8 +46,74 @@ from maskvar.models.simple_mask_ar.simple_mask_ar import SimpleMaskAR
 from maskvar.models.simple_mask_vqvae.simple_mask_vqvae import SimpleMaskVqvae
 from maskvar.utils.metrics import calc_iou
 from maskvar.utils import restore_normalized_image
+from maskvar.utils.clicker_v2 import init_clicks, to_sam_format
 
 torch.set_float32_matmul_precision('high')
+
+
+def sample_click_condition(single_mask: torch.Tensor, ar_h: int, ar_w: int, max_clicks: int = 2):
+    """
+    Sample click condition for one mask sample.
+
+    Returns:
+        click_coords: (max_clicks, 2), row/col in AR token-grid coordinates
+        click_labels: (max_clicks,), 1 for positive clicks and -1 for padding
+    """
+    mask_np = single_mask[0].detach().cpu().numpy() > 0
+    num_clicks = int(np.random.randint(1, max_clicks + 1))
+    click_list, _, _ = init_clicks(mask_np, num_random_clicks=num_clicks, random_sample=True)
+    coords_xy, labels = to_sam_format(click_list, pad_size=max_clicks)
+
+    H, W = single_mask.shape[-2:]
+    click_coords = torch.empty_like(coords_xy, dtype=torch.float32)
+    click_coords[..., 0] = coords_xy[..., 1] * (ar_h / H)
+    click_coords[..., 1] = coords_xy[..., 0] * (ar_w / W)
+    click_coords = click_coords.clamp_min(0)
+    click_coords[..., 0].clamp_(max=ar_h - 1)
+    click_coords[..., 1].clamp_(max=ar_w - 1)
+
+    return click_coords, labels.long()
+
+
+class ClickConditionDataset(Dataset):
+    """Map-style dataset wrapper that samples click conditions in DataLoader workers."""
+
+    def __init__(self, dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
+        self.dataset = dataset
+        self.ar_h = ar_h
+        self.ar_w = ar_w
+        self.max_clicks = max_clicks
+        self.is_dummy = getattr(dataset, 'is_dummy', False)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        image, image_embed_sam, single_mask_normalized, single_mask = self.dataset[index]
+        click_coords, click_labels = sample_click_condition(single_mask, self.ar_h, self.ar_w, self.max_clicks)
+        return image, image_embed_sam, single_mask_normalized, single_mask, click_coords, click_labels
+
+
+class ClickConditionIterableDataset(IterableDataset):
+    """Iterable dataset wrapper that samples click conditions in DataLoader workers."""
+
+    def __init__(self, dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
+        self.dataset = dataset
+        self.ar_h = ar_h
+        self.ar_w = ar_w
+        self.max_clicks = max_clicks
+        self.is_dummy = getattr(dataset, 'is_dummy', False)
+
+    def __iter__(self):
+        for image, image_embed_sam, single_mask_normalized, single_mask in self.dataset:
+            click_coords, click_labels = sample_click_condition(single_mask, self.ar_h, self.ar_w, self.max_clicks)
+            yield image, image_embed_sam, single_mask_normalized, single_mask, click_coords, click_labels
+
+
+def wrap_click_condition_dataset(dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
+    if isinstance(dataset, IterableDataset):
+        return ClickConditionIterableDataset(dataset, ar_h=ar_h, ar_w=ar_w, max_clicks=max_clicks)
+    return ClickConditionDataset(dataset, ar_h=ar_h, ar_w=ar_w, max_clicks=max_clicks)
 
 
 def setup_distributed():
@@ -116,6 +183,7 @@ class SimpleMaskARTrainer:
         profiler=None,
         infer_val_batches: int = 4,
         enable_infer_iou: bool = False,
+        enable_click: bool = False,
     ):
         self.model = model
         self.vqvae_model = vqvae_model
@@ -128,6 +196,7 @@ class SimpleMaskARTrainer:
         self.profiler = profiler
         self.infer_val_batches = infer_val_batches
         self.enable_infer_iou = enable_infer_iou
+        self.enable_click = enable_click
 
         # Distributed training setup
         if tdist.is_initialized():
@@ -302,7 +371,7 @@ class SimpleMaskARTrainer:
         )
 
     @torch.no_grad()
-    def compute_mask_predictions(self, token_ids, logits, image_tokens, gt_mask, compute_infer: bool = False):
+    def compute_mask_predictions(self, token_ids, logits, image_tokens, gt_mask, compute_infer: bool = False, click_coords=None, click_labels=None):
         """Compute GT-token reconstruction, teacher predictions and optional pure-autoregressive predictions plus IoU."""
         gt_token_mask_logits = self.decode_token_ids_to_mask_logits(
             token_ids,
@@ -324,7 +393,11 @@ class SimpleMaskARTrainer:
         infer_iou = None
 
         if compute_infer:
-            infer_token_ids = self._get_ar_model().autoregressive_infer(image_tokens)
+            infer_token_ids = self._get_ar_model().autoregressive_infer(
+                image_tokens,
+                click_coords=click_coords,
+                click_labels=click_labels,
+            )
             infer_mask_logits = self.decode_token_ids_to_mask_logits(
                 infer_token_ids,
                 image_tokens,
@@ -511,7 +584,14 @@ class SimpleMaskARTrainer:
                     data_time_ms = (time.perf_counter() - data_wait_start) * 1000.0
 
                 # Unpack batch
-                image, _, single_mask_normalized, single_mask = batch
+                if self.enable_click:
+                    image, _, single_mask_normalized, single_mask, click_coords, click_labels = batch
+                    click_coords = click_coords.to(self.device, non_blocking=True)
+                    click_labels = click_labels.to(self.device, non_blocking=True)
+                else:
+                    image, _, single_mask_normalized, single_mask = batch
+                    click_coords = None
+                    click_labels = None
                 image = image.to(self.device, non_blocking=True)
                 single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
                 single_mask = single_mask.to(self.device, non_blocking=True)
@@ -528,7 +608,12 @@ class SimpleMaskARTrainer:
                 step_timer = self._new_timer()
                 self._timer_start(step_timer)
                 with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
-                    logits = self.model(token_ids, image_tokens)  # (B, L, vocab_size)
+                    logits = self.model(
+                        token_ids,
+                        image_tokens,
+                        click_coords=click_coords,
+                        click_labels=click_labels,
+                    )  # (B, L, vocab_size)
 
                     # Compute loss against the original token ids.
                     # The model internally prepends sos and drops the last input token.
@@ -583,6 +668,8 @@ class SimpleMaskARTrainer:
                                 image_tokens,
                                 single_mask,
                                 compute_infer=False,
+                                click_coords=click_coords,
+                                click_labels=click_labels,
                             )
                             pred_ids = logits.argmax(dim=-1)  # (B, L)
                             correct = (pred_ids == token_ids).float().mean()
@@ -684,7 +771,14 @@ class SimpleMaskARTrainer:
             if iters_count >= num_val_iters:
                 break
 
-            image, _, single_mask_normalized, single_mask = batch
+            if self.enable_click:
+                image, _, single_mask_normalized, single_mask, click_coords, click_labels = batch
+                click_coords = click_coords.to(self.device, non_blocking=True)
+                click_labels = click_labels.to(self.device, non_blocking=True)
+            else:
+                image, _, single_mask_normalized, single_mask = batch
+                click_coords = None
+                click_labels = None
             image = image.to(self.device, non_blocking=True)
             single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
             single_mask = single_mask.to(self.device, non_blocking=True)
@@ -693,7 +787,12 @@ class SimpleMaskARTrainer:
             token_ids, image_tokens = self.encode_mask_to_tokens(single_mask_normalized, image)
 
             with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
-                logits = self.model(token_ids, image_tokens)
+                logits = self.model(
+                    token_ids,
+                    image_tokens,
+                    click_coords=click_coords,
+                    click_labels=click_labels,
+                )
                 B, L, vocab_size = logits.shape
 
                 logits_flat = rearrange(logits, 'b l vocab -> (b l) vocab')
@@ -712,6 +811,8 @@ class SimpleMaskARTrainer:
                 image_tokens,
                 single_mask,
                 compute_infer=compute_infer,
+                click_coords=click_coords,
+                click_labels=click_labels,
             )
             teacher_iou = vis_outputs['teacher_iou']
             infer_iou = vis_outputs['infer_iou']
@@ -824,8 +925,14 @@ class SimpleMaskARTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
 
         model = self.model.module if isinstance(self.model, DDP) else self.model
-        model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'], strict=not self.enable_click)
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except ValueError as e:
+            if not self.enable_click:
+                raise
+            if self.rank == 0:
+                print(f"Skipped optimizer state load after enabling click parameters: {e}")
         self.global_step = checkpoint.get('global_step', 0)
 
         start_iter = checkpoint.get('step', 0)
@@ -897,6 +1004,8 @@ def main():
                         help='Number of validation batches to run pure inference IoU and visualization on')
     parser.add_argument('--enable_infer_iou', action='store_true',
                         help='Enable pure autoregressive inference IoU. Default is disabled.')
+    parser.add_argument('--enable_click', action='store_true',
+                        help='Enable positive click conditioning for SimpleMaskAR')
     parser.add_argument('--profile', action='store_true', help='Enable short torch profiler trace at startup')
     parser.add_argument('--profile_wait', type=int, default=1, help='Profiler wait steps')
     parser.add_argument('--profile_warmup', type=int, default=1, help='Profiler warmup steps')
@@ -1059,10 +1168,16 @@ def main():
     model = builder_map['simple_mask_ar'][args.config](
         checkpoint_path=checkpoint_to_use if checkpoint_to_use and os.path.exists(checkpoint_to_use) else None,
         device=device,
+        enable_click=args.enable_click,
     )
+    if args.enable_click:
+        train_set = wrap_click_condition_dataset(train_set, ar_h=model.h, ar_w=model.w, max_clicks=2)
+        val_set = wrap_click_condition_dataset(val_set, ar_h=model.h, ar_w=model.w, max_clicks=2)
     if rank == 0:
         print(f"Using config: {args.config}")
         print(f"Using VQVAE config: {args.vqvae_config}")
+        if args.enable_click:
+            print("Click conditioning: enabled in DataLoader workers")
         if vqvae_image_encoder_config is not None:
             print(f"Using VQVAE image encoder config: {vqvae_image_encoder_config}")
         if vqvae_image_encoder_checkpoint is not None:
@@ -1124,6 +1239,7 @@ def main():
         profiler=profiler,
         infer_val_batches=args.val_infer_batches,
         enable_infer_iou=args.enable_infer_iou,
+        enable_click=args.enable_click,
     )
 
     # Resume from checkpoint
