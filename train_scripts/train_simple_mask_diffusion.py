@@ -227,13 +227,14 @@ class SimpleMaskDiffusionTrainer:
             for batch in self.train_loader:
                 if iters_count >= num_iters:
                     break
-                image, _, mask_normalized, _ = batch
+                image, _, mask_normalized, mask = batch
                 image = image.to(self.device, non_blocking=True)
                 mask_normalized = mask_normalized.to(self.device, non_blocking=True)
+                mask = mask.to(self.device, non_blocking=True)
                 z0, image_tokens = self.encode_batch(mask_normalized, image)
 
                 with torch.autocast(device_type="cuda", dtype=self.dtype, enabled=self.device.startswith("cuda") and self.dtype != torch.float32):
-                    loss, pred_noise, noise, timesteps = self.model.diffusion_loss(z0, image_tokens)
+                    loss, pred_noise, noise, timesteps = self.model(z0, image_tokens)
                     loss = loss / self.accumulate_steps
                 loss.backward()
 
@@ -252,6 +253,8 @@ class SimpleMaskDiffusionTrainer:
                         pbar.set_postfix({"loss": f"{loss_val:.4f}", "t": f"{timesteps.float().mean().item():.1f}"})
                         self.writer.add_scalar("train/loss", loss_val, global_iters)
                         self.writer.add_scalar("train/timestep_mean", timesteps.float().mean().item(), global_iters)
+                        if global_iters % (log_interval * 5) == 0:
+                            self._visualize_train_samples(image, mask, z0, image_tokens)
 
         if self.rank == 0:
             pbar.close()
@@ -283,7 +286,7 @@ class SimpleMaskDiffusionTrainer:
             mask_normalized = mask_normalized.to(self.device, non_blocking=True)
             mask = mask.to(self.device, non_blocking=True)
             z0, image_tokens = self.encode_batch(mask_normalized, image)
-            loss, _, _, _ = self._get_model().diffusion_loss(z0, image_tokens)
+            loss, _, _, _ = self.model(z0, image_tokens)
             total_loss += loss.item()
 
             sample_logits = None
@@ -332,7 +335,7 @@ class SimpleMaskDiffusionTrainer:
         self.model.train()
         return {"loss": avg_loss, "sample_iou": avg_sample_iou}
 
-    def _visualize(self, image, gt_mask, teacher_logits, teacher_iou, sample_logits, sample_iou, save_name=None, num_samples=4):
+    def _visualize(self, image, gt_mask, teacher_logits, teacher_iou, sample_logits, sample_iou, tag="val/visualization", save_name=None, num_samples=4):
         if self.writer is None:
             return
         n = min(num_samples, image.shape[0])
@@ -352,10 +355,41 @@ class SimpleMaskDiffusionTrainer:
             axes[r, 4].imshow(teacher_logits[r, 0].float().cpu().numpy(), cmap="RdBu_r"); axes[r, 4].set_title("VAE Logits"); axes[r, 4].axis("off")
             axes[r, 5].imshow(sample_logits[r, 0].float().cpu().numpy(), cmap="RdBu_r"); axes[r, 5].set_title("Sample Logits"); axes[r, 5].axis("off")
         plt.tight_layout()
-        self.writer.add_figure("val/visualization", fig, self.global_step)
+        self.writer.add_figure(tag, fig, self.global_step)
         if save_name is not None:
             fig.savefig(self.out_dir / "visualizations" / save_name, dpi=150, bbox_inches="tight")
         plt.close(fig)
+
+    @torch.no_grad()
+    def _visualize_train_samples(self, image, gt_mask, z0, image_tokens, num_samples=2):
+        if self.writer is None:
+            return
+
+        n = min(num_samples, image.shape[0])
+        image_vis = image[:n].detach()
+        gt_vis = gt_mask[:n].detach()
+        z0_vis = z0[:n].detach()
+        image_tokens_vis = image_tokens[:n].detach()
+
+        teacher_logits = self.decode_latents(z0_vis, image_tokens_vis, gt_vis.shape[-2:])
+        teacher_iou = calc_iou(teacher_logits, gt_vis)
+        z_sample = self._get_model().sample(image_tokens_vis, shape=z0_vis.shape, num_steps=self.sample_steps)
+        sample_logits = self.decode_latents(z_sample, image_tokens_vis, gt_vis.shape[-2:])
+        sample_iou = calc_iou(sample_logits, gt_vis)
+
+        self.writer.add_scalar("train/teacher_iou", teacher_iou.mean().item(), self.global_step)
+        self.writer.add_scalar("train/sample_iou", sample_iou.mean().item(), self.global_step)
+        self._visualize(
+            image_vis,
+            gt_vis,
+            teacher_logits.detach(),
+            teacher_iou.detach(),
+            sample_logits.detach(),
+            sample_iou.detach(),
+            tag="train/visualization",
+            save_name=f"iter_{self.global_step}_train_vis.png",
+            num_samples=n,
+        )
 
     def save_checkpoint(self, step):
         if self.rank != 0:

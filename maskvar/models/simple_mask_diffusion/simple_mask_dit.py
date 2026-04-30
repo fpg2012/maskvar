@@ -169,7 +169,7 @@ class SimpleMaskLatentDiT(nn.Module):
         sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1).to(z0.dtype)
         return sqrt_alpha * z0 + sqrt_one_minus * noise, noise
 
-    def forward(self, z_t: torch.Tensor, timesteps: torch.Tensor, image_tokens: torch.Tensor):
+    def predict_noise(self, z_t: torch.Tensor, timesteps: torch.Tensor, image_tokens: torch.Tensor):
         """
         Predict diffusion noise for noised VAE latents.
 
@@ -190,7 +190,7 @@ class SimpleMaskLatentDiT(nn.Module):
             x = block(x, cond, time_emb)
         return self.latent_out(self.final_norm(x))
 
-    def diffusion_loss(self, z0: torch.Tensor, image_tokens: torch.Tensor, timesteps: torch.Tensor | None = None):
+    def forward(self, z0: torch.Tensor, image_tokens: torch.Tensor, timesteps: torch.Tensor | None = None):
         """
         Compute the denoising objective for clean VAE latents.
 
@@ -211,8 +211,12 @@ class SimpleMaskLatentDiT(nn.Module):
         if timesteps is None:
             timesteps = torch.randint(0, self.num_train_timesteps, (b,), device=z0.device)
         z_t, noise = self.q_sample(z0, timesteps)
-        pred_noise = self(z_t, timesteps, image_tokens)
+        pred_noise = self.predict_noise(z_t, timesteps, image_tokens)
         return F.mse_loss(pred_noise.float(), noise.float()), pred_noise, noise, timesteps
+
+    def diffusion_loss(self, z0: torch.Tensor, image_tokens: torch.Tensor, timesteps: torch.Tensor | None = None):
+        """Backward-compatible alias for the training forward."""
+        return self(z0, image_tokens, timesteps)
 
     @torch.no_grad()
     def sample(self, image_tokens: torch.Tensor, shape: tuple[int, int, int] | None = None, num_steps: int = 50):
@@ -239,7 +243,7 @@ class SimpleMaskLatentDiT(nn.Module):
 
         for i, t in enumerate(step_indices):
             t_batch = torch.full((b,), int(t.item()), device=image_tokens.device, dtype=torch.long)
-            pred_noise = self(z, t_batch, image_tokens)
+            pred_noise = self.predict_noise(z, t_batch, image_tokens)
             alpha_t = self.alphas[t].to(z.dtype)
             alpha_bar_t = self.alphas_cumprod[t].to(z.dtype)
             beta_t = self.betas[t].to(z.dtype)
