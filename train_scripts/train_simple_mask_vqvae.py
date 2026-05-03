@@ -424,8 +424,9 @@ class SimpleMaskVqvaeTrainer:
 
                 # Forward pass
                 with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
+                    target_mask = (single_mask > 0.5).float()
                     rec_mask, vq_loss, vq_usage = self.model(single_mask_normalized, image, return_usage=True)
-                    recon_loss = self.criterion(rec_mask, (single_mask > 0.5).float()).mean()
+                    recon_loss = self.criterion(rec_mask, target_mask).mean()
                     loss = (recon_loss + self.vq_loss_weight * vq_loss) / self.accumulate_steps
 
                 # Backward pass
@@ -537,13 +538,13 @@ class SimpleMaskVqvaeTrainer:
             single_mask = single_mask.to(self.device, non_blocking=True)
 
             with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
+                target_mask = (single_mask > 0.5).float()
                 rec_mask, vq_loss = self.model(
                     single_mask_normalized,
                     image,
                 )
-
-                recon_loss = self.criterion(rec_mask, single_mask_normalized)
-                loss = recon_loss + vq_loss
+                recon_loss = self.criterion(rec_mask, target_mask)
+                loss = recon_loss + self.vq_loss_weight * vq_loss
             loss = loss.mean()
             recon_loss = recon_loss.mean()
 
@@ -1113,6 +1114,7 @@ def main():
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         loss=args.loss,
+        vq_loss_weight=args.vq_loss_weight,
         dtype=dtype,
         find_unused_parameters=not args.disable_find_unused_parameters,
     )

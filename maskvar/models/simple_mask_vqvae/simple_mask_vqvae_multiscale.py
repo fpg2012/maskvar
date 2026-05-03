@@ -4,7 +4,7 @@ from torch.nn import functional as F
 from einops import rearrange
 
 from .mask_decoder import SimpleMaskDecoder
-from .quant import SimpleVectorQuantize
+from .quant import SimpleVectorQuantize, MultiscaleVectorQuantize
 from ..rope2d import RotaryPositionEmbedding2D
 
 
@@ -123,6 +123,24 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
         fused = rearrange(fused, "b c h w -> b h w c")
         return self.fuse_norm(fused)
 
+    def _zero_tokens_like(self, tokens_by_scale, scale_idx):
+        return torch.zeros_like(tokens_by_scale[scale_idx])
+
+    def _decode_tokens_by_scale(self, tokens_by_scale, image_tokens, output_size=None):
+        mask_tokens = self._fuse_multiscale_tokens(tokens_by_scale)
+        mask = self.mask_decoder(mask_tokens, image_tokens)
+        if output_size is not None and mask.shape[-2:] != output_size:
+            mask = F.interpolate(mask, size=output_size, mode="bilinear", align_corners=False)
+        return mask
+
+    def _image_tokens_to_grid(self, image_tokens):
+        if image_tokens.dim() == 4 and image_tokens.shape[1] == self.dim:
+            return rearrange(image_tokens, "b c h w -> b h w c")
+        if image_tokens.dim() == 3:
+            h = w = int(image_tokens.shape[1] ** 0.5)
+            return rearrange(image_tokens, "b (h w) c -> b h w c", h=h, w=w)
+        return image_tokens
+
     def encode_to_multiscale_token_ids(self, mask_normalized: torch.Tensor):
         """
         Convert a mask into discrete token ids for every scale.
@@ -154,8 +172,10 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
             Tensor of mask logits with shape [B, 1, H_out, W_out] when
             output_size is provided, otherwise the decoder's native mask size.
         """
-        if len(token_ids_by_scale) != len(self.scales):
-            raise ValueError(f"Expected {len(self.scales)} scales, got {len(token_ids_by_scale)}")
+        if len(token_ids_by_scale) == 0:
+            return []
+        if len(token_ids_by_scale) > len(self.scales):
+            raise ValueError(f"Expected at most {len(self.scales)} scales, got {len(token_ids_by_scale)}")
         tokens_by_scale = [self.quant.idx_to_x(token_ids) for token_ids in token_ids_by_scale]
         mask_tokens = self._fuse_multiscale_tokens(tokens_by_scale)
 
@@ -211,3 +231,153 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
         if return_usage:
             return mask, vq_loss, vq_usage
         return mask, vq_loss
+
+
+class SimpleMaskVqvaeMultiScaleResidual(SimpleMaskVqvaeMultiScale):
+    """
+    VAR-style residual multi-scale quantizer for SimpleMaskVqvae.
+
+    This follows the residual quantization recipe used by VAR:
+
+        f = E(mask)
+        for scale in scales:
+            z_k = Q(interpolate(f, scale))
+            f = f - phi_k(upsample(z_k, full_resolution))
+
+    At decode time, the full 64x64 latent is reconstructed by summing the same
+    projected quantized features. Compared with the v1 parallel pooling path,
+    the finest scale now quantizes only the residual that earlier scales failed
+    to explain.
+    """
+
+    def __init__(
+        self,
+        image_encoder,
+        mask_encoder,
+        dim=384,
+        vocab_size=4096,
+        beta=0.25,
+        scales=(1, 2, 4, 8, 16, 32, 64),
+        h=64,
+        w=64,
+        enable_vq=True,
+        device="cuda",
+    ):
+        nn.Module.__init__(self)
+        self.dim = dim
+        self.vocab_size = vocab_size
+        self.beta = beta
+        self.scales = tuple(scales)
+        self.h = h
+        self.w = w
+        self.enable_vq = enable_vq
+
+        self.image_encoder = image_encoder
+        self.mask_encoder = mask_encoder
+        self.rope = RotaryPositionEmbedding2D(h=h, w=w)
+        self.mask_decoder = SimpleMaskDecoder(rope=self.rope, dim=dim)
+        self.quant = MultiscaleVectorQuantize(
+            dim=dim,
+            vocab_size=vocab_size,
+            beta=beta,
+            scales=scales,
+            h=h,
+            w=w,
+            using_znorm=False,
+        )
+        self.device = device
+
+    def forward(self, mask_normalized: torch.Tensor, image: torch.Tensor, return_usage: bool = False):
+        """
+        Same data flow as SimpleMaskVqvae.forward(), with only the quantizer
+        swapped from SimpleVectorQuantize to MultiscaleVectorQuantize.
+        """
+        _, _, H, W = mask_normalized.shape
+
+        mask_tokens = self.mask_encoder(mask_normalized)
+        image_tokens = self.image_encoder(image)
+
+        _, _, h, w = mask_tokens.shape
+        mask_tokens = rearrange(mask_tokens, "b c h w -> b (h w) c")
+        image_tokens = rearrange(image_tokens, "b c h w -> b h w c")
+
+        if self.enable_vq:
+            if return_usage:
+                mask_tokens, vq_loss, vq_usage = self.quant(mask_tokens, return_usage=True)
+            else:
+                mask_tokens, vq_loss = self.quant(mask_tokens)
+                vq_usage = None
+        else:
+            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
+            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
+
+        mask_tokens = rearrange(mask_tokens, "b (h w) c -> b h w c", h=h, w=w)
+        mask = self.mask_decoder(mask_tokens, image_tokens)
+        if mask.shape[-2:] != (H, W):
+            mask = F.interpolate(mask, size=(H, W), mode="bilinear", align_corners=False)
+
+        if return_usage:
+            return mask, vq_loss, vq_usage
+        return mask, vq_loss
+
+    def encode_to_multiscale_token_ids(self, mask_normalized: torch.Tensor):
+        mask_tokens = self.mask_encoder(mask_normalized)
+        _, _, h, w = mask_tokens.shape
+        if h != self.h or w != self.w:
+            raise ValueError(f"Expected mask encoder grid {self.h}x{self.w}, got {h}x{w}")
+        mask_tokens = rearrange(mask_tokens, "b c h w -> b (h w) c")
+        return self.quant.x_to_idx_multiscale(mask_tokens.float())
+
+    def to_var_input(self, token_ids_by_scale):
+        """
+        Convert multiscale V2 token ids to SimpleMaskVAR teacher-forcing inputs.
+
+        This mirrors VAR's idxBl_to_var_input: after each known scale is
+        projected into the cumulative full-resolution f_hat, f_hat is area
+        downsampled to the next scale and appended as BLC. With all GT scales
+        this returns inputs for scales 1..K-1, concatenated along L.
+        """
+        if len(token_ids_by_scale) > len(self.scales):
+            raise ValueError(f"Expected at most {len(self.scales)} scales, got {len(token_ids_by_scale)}")
+        if len(token_ids_by_scale) == 0:
+            return None
+
+        B = token_ids_by_scale[0].shape[0]
+        device = token_ids_by_scale[0].device
+        f_hat = self.quant.embedding.weight.new_zeros(B, self.h * self.w, self.dim).to(device=device)
+        next_inputs = []
+
+        for scale_idx, token_ids in enumerate(token_ids_by_scale):
+            if scale_idx >= len(self.scales) - 1:
+                break
+
+            tokens = self.quant.idx_to_x(token_ids)
+            projected = self.quant._project_tokens_to_full(tokens, scale_idx)
+            f_hat = f_hat + rearrange(projected, "b c h w -> b (h w) c")
+
+            next_scale = self.scales[scale_idx + 1]
+            next_input = rearrange(f_hat, "b (h w) c -> b c h w", h=self.h, w=self.w)
+            if next_scale != self.h or next_scale != self.w:
+                next_input = F.interpolate(next_input, size=(next_scale, next_scale), mode="area")
+            next_inputs.append(rearrange(next_input, "b c h w -> b (h w) c"))
+
+        return torch.cat(next_inputs, dim=1) if next_inputs else None
+
+    def decode_from_multiscale_token_ids(self, token_ids_by_scale, image=None, image_tokens=None, output_size=None):
+        mask_tokens = self.quant.idxBl_to_full_tokens(token_ids_by_scale)
+        mask_tokens = rearrange(mask_tokens, "b (h w) c -> b h w c", h=self.h, w=self.w)
+
+        if image_tokens is None:
+            if image is None:
+                raise ValueError("Either image or image_tokens must be provided.")
+            image_tokens = self.image_encoder(image)
+        if image_tokens.dim() == 4 and image_tokens.shape[1] == self.dim:
+            image_tokens = rearrange(image_tokens, "b c h w -> b h w c")
+        elif image_tokens.dim() == 3:
+            h = w = int(image_tokens.shape[1] ** 0.5)
+            image_tokens = rearrange(image_tokens, "b (h w) c -> b h w c", h=h, w=w)
+
+        mask = self.mask_decoder(mask_tokens, image_tokens)
+        if output_size is not None and mask.shape[-2:] != output_size:
+            mask = F.interpolate(mask, size=output_size, mode="bilinear", align_corners=False)
+        return mask
