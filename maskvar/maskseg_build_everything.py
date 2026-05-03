@@ -24,8 +24,9 @@ from .models.simple_mask_vqvae import (
     SimpleMaskVqvaeV2, SimpleMaskVqvaeV3, SimpleMaskVqvaeV4,
     SimpleMaskVqvaeShapeOnly,
     SimpleMaskVqvaeMultiScale,
+    SimpleMaskVqvaeMultiScaleResidual,
 )
-from .models.simple_mask_ar import SimpleMaskAR
+from .models.simple_mask_ar import SimpleMaskAR, SimpleMaskVAR
 from .models.simple_mask_ar import SimpleQueryTokenAR
 from .models.simple_mask_vae import SimpleMaskVAEV2
 from .models.simple_mask_diffusion import SimpleMaskLatentDiT
@@ -1297,6 +1298,68 @@ def build_simple_mask_vqvae_multiscale_dim384(
     return simple_mask_vqvae.to(device)
 
 
+def build_simple_mask_vqvae_multiscale_v2_dim384(
+    simple_mask_vqvae_checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    enable_vq=False,
+    kmeans_centroids_path: Optional[str] = None,
+) -> SimpleMaskVqvaeMultiScaleResidual:
+    """
+    Build SimpleMaskVqvae with VAR-style multi-scale residual quantization.
+
+    The model intentionally keeps the SimpleMaskVqvae encoder/decoder layout
+    and only swaps SimpleVectorQuantize for MultiscaleVectorQuantize, so a
+    trained SimpleMaskVqvae checkpoint can initialize encoder, decoder, and the
+    shared codebook.
+    """
+    vocab_size = 4096
+    dim = 384
+    beta = 0.25
+
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    mask_encoder = MaskEncoderLite(dim=dim)
+
+    simple_mask_vqvae = SimpleMaskVqvaeMultiScaleResidual(
+        image_encoder=image_encoder,
+        mask_encoder=mask_encoder,
+        dim=dim,
+        vocab_size=vocab_size,
+        beta=beta,
+        scales=(1, 2, 4, 8, 16, 32, 64),
+        device=device,
+        enable_vq=enable_vq,
+    )
+
+    if simple_mask_vqvae_checkpoint_path is not None:
+        checkpoint = torch.load(simple_mask_vqvae_checkpoint_path, map_location='cpu', weights_only=True)
+
+        if 'model_state_dict' in checkpoint:
+            simple_mask_vqvae_state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            simple_mask_vqvae_state_dict = checkpoint
+
+        if any(key.startswith('_orig_mod.') for key in simple_mask_vqvae_state_dict.keys()):
+            simple_mask_vqvae_state_dict = {
+                key.replace('_orig_mod.', ''): value
+                for key, value in simple_mask_vqvae_state_dict.items()
+            }
+
+        missing_keys, unexpected_keys = simple_mask_vqvae.load_state_dict(simple_mask_vqvae_state_dict, strict=False)
+        print(f"Loaded SimpleMaskVqvaeMultiScaleResidual checkpoint from {simple_mask_vqvae_checkpoint_path}")
+        if missing_keys:
+            print(f"  Missing keys initialized from scratch: {missing_keys}")
+        if unexpected_keys:
+            print(f"  Unexpected checkpoint keys ignored: {unexpected_keys}")
+
+    if kmeans_centroids_path is not None:
+        _initialize_codebook_from_kmeans(simple_mask_vqvae, kmeans_centroids_path)
+
+    return simple_mask_vqvae.to(device)
+
+
 def build_simple_mask_vqvae_v2_dim384(
     simple_mask_vqvae_checkpoint_path: Optional[str] = None,
     image_encoder_checkpoint: Optional[str] = None,
@@ -1568,6 +1631,39 @@ def build_simple_mask_ar(
 
         model.load_state_dict(state_dict, strict=not enable_click)
         print(f"Loaded SimpleMaskAR checkpoint from {checkpoint_path}")
+
+    return model.to(device)
+
+
+def build_simple_mask_var(
+    checkpoint_path: Optional[str] = None,
+    device: str = 'cpu',
+    enable_click: bool = False,
+) -> SimpleMaskVAR:
+    if enable_click:
+        raise ValueError("SimpleMaskVAR does not implement click conditioning yet.")
+
+    model = SimpleMaskVAR(
+        dim=384,
+        depth=2,
+        vocab_size=4096,
+        scales=(1, 2, 4, 8, 16, 32, 64),
+        h=64,
+        w=64,
+        num_heads=4,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        print(f"Loaded SimpleMaskVAR checkpoint from {checkpoint_path}")
 
     return model.to(device)
 
@@ -1876,6 +1972,7 @@ builder_map = {
         "simple_mask_vqvae_dim384": build_simple_mask_vqvae_dim384,
         "simple_mask_vqvae_v3_16x16_dim384": build_simple_mask_vqvae_v3_16x16_dim384,
         "simple_mask_vqvae_multiscale_dim384": build_simple_mask_vqvae_multiscale_dim384,
+        "simple_mask_vqvae_multiscale_v2_dim384": build_simple_mask_vqvae_multiscale_v2_dim384,
         "simple_mask_vqvae_v2_dim384": build_simple_mask_vqvae_v2_dim384,
         "simple_mask_vqvae_v3_dim384": build_simple_mask_vqvae_v3_dim384,
         "simple_mask_vqvae_v4_dim384": build_simple_mask_vqvae_v4_dim384,
@@ -1898,6 +1995,7 @@ builder_map = {
     },
     "simple_mask_ar": {
         "simple_mask_ar": build_simple_mask_ar,
+        "simple_mask_var": build_simple_mask_var,
         "simple_query_token_ar": build_simple_query_token_ar,
     },
     "simple_mask_vae": {
