@@ -62,8 +62,8 @@ class SimpleMaskVqvae(nn.Module):
                 vq_usage = None
         else:
             # skip quant
-            vq_loss = torch.tensor(0.0)
-            vq_usage = torch.tensor(0.0)
+            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
+            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
         
         mask_tokens = rearrange(mask_tokens, 'b (h w) c -> b h w c', h=h, w=w)
 
@@ -162,8 +162,8 @@ class SimpleMaskVqvaeV2(nn.Module):
                 vq_usage = None
         else:
             # skip quant
-            vq_loss = torch.tensor(0.0)
-            vq_usage = torch.tensor(0.0)
+            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
+            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
 
         # 3. decode
         mask = self.mask_decoder(queries_tokens, image_tokens)
@@ -222,8 +222,8 @@ class SimpleMaskVqvaeV3(SimpleMaskVqvaeV2):
                 queries_tokens, vq_loss = self.quant(queries_tokens)
                 vq_usage = None
         else:
-            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
-            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
+            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
+            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
 
         seg_token = repeat(self.seg_token, '1 l c -> b l c', b=queries_tokens.shape[0])
         decoder_tokens = torch.cat([seg_token, queries_tokens], dim=1)

@@ -299,11 +299,9 @@ class SimpleMaskVARTrainer:
         scale_accs = {}
         scale_weights = {}
 
-        raw_weights = [1.0 / max(token_ids.shape[1], 1) for token_ids in token_ids_by_scale]
-        weight_norm = sum(raw_weights)
-        weights = [w / weight_norm for w in raw_weights]
+        total_target_tokens = sum(token_ids.numel() for token_ids in token_ids_by_scale)
 
-        for scale_idx, (logits, token_ids, weight) in enumerate(zip(logits_by_scale, token_ids_by_scale, weights)):
+        for scale_idx, (logits, token_ids) in enumerate(zip(logits_by_scale, token_ids_by_scale)):
             scale = self._get_var_model().scales[scale_idx]
             loss = F.cross_entropy(
                 rearrange(logits, 'b l vocab -> (b l) vocab'),
@@ -314,6 +312,7 @@ class SimpleMaskVARTrainer:
             correct_count = (pred_ids == token_ids).float().sum()
             acc = correct_count / token_ids.numel()
 
+            weight = token_ids.numel() / total_target_tokens
             weighted_loss = loss * weight
             total_loss = weighted_loss if total_loss is None else total_loss + weighted_loss
             total_correct = total_correct + correct_count
@@ -334,7 +333,17 @@ class SimpleMaskVARTrainer:
         )
 
     @torch.no_grad()
-    def compute_mask_predictions(self, token_ids, logits, image_tokens, gt_mask, compute_infer: bool = False, click_coords=None, click_labels=None):
+    def compute_mask_predictions(
+        self,
+        token_ids,
+        logits,
+        image_tokens,
+        gt_mask,
+        compute_infer: bool = False,
+        compute_multiscale: bool = False,
+        click_coords=None,
+        click_labels=None,
+    ):
         """Compute GT-token reconstruction, teacher predictions and optional pure-autoregressive predictions plus IoU."""
         gt_token_mask_logits = self.decode_token_ids_to_mask_logits(
             token_ids,
@@ -350,10 +359,14 @@ class SimpleMaskVARTrainer:
             output_size=gt_mask.shape[-2:],
         )
         teacher_iou = calc_iou(teacher_mask_logits, gt_mask)
+        teacher_cumulative_logits = None
+        teacher_cumulative_iou = None
 
         infer_token_ids = None
         infer_mask_logits = None
         infer_iou = None
+        infer_cumulative_logits = None
+        infer_cumulative_iou = None
 
         if compute_infer:
             infer_token_ids = self._get_var_model().autoregressive_infer(
@@ -366,6 +379,30 @@ class SimpleMaskVARTrainer:
             )
             infer_iou = calc_iou(infer_mask_logits, gt_mask)
 
+        if compute_multiscale:
+            teacher_cumulative_logits = []
+            teacher_cumulative_iou = []
+            for scale_idx in range(len(teacher_token_ids)):
+                cumulative_logits = self.decode_token_ids_to_mask_logits(
+                    teacher_token_ids[: scale_idx + 1],
+                    image_tokens,
+                    output_size=gt_mask.shape[-2:],
+                )
+                teacher_cumulative_logits.append(cumulative_logits)
+                teacher_cumulative_iou.append(calc_iou(cumulative_logits, gt_mask))
+
+            if infer_token_ids is not None:
+                infer_cumulative_logits = []
+                infer_cumulative_iou = []
+                for scale_idx in range(len(infer_token_ids)):
+                    cumulative_logits = self.decode_token_ids_to_mask_logits(
+                        infer_token_ids[: scale_idx + 1],
+                        image_tokens,
+                        output_size=gt_mask.shape[-2:],
+                    )
+                    infer_cumulative_logits.append(cumulative_logits)
+                    infer_cumulative_iou.append(calc_iou(cumulative_logits, gt_mask))
+
         return {
             'gt_token_mask_logits': gt_token_mask_logits,
             'gt_token_iou': gt_token_iou,
@@ -375,7 +412,19 @@ class SimpleMaskVARTrainer:
             'infer_mask_logits': infer_mask_logits,
             'teacher_iou': teacher_iou,
             'infer_iou': infer_iou,
+            'teacher_cumulative_logits': teacher_cumulative_logits,
+            'teacher_cumulative_iou': teacher_cumulative_iou,
+            'infer_cumulative_logits': infer_cumulative_logits,
+            'infer_cumulative_iou': infer_cumulative_iou,
         }
+
+    def _robust_logit_limits(self, array):
+        finite = np.asarray(array)[np.isfinite(array)]
+        if finite.size == 0:
+            return -1.0, 1.0
+        lo, hi = np.percentile(finite, [1, 99])
+        vmax = max(abs(float(lo)), abs(float(hi)), 1e-6)
+        return -vmax, vmax
 
     def _visualize_prediction_samples(
         self,
@@ -1024,7 +1073,7 @@ def main():
             with_image_embed=False,
             mask_filter_thresh=0.1,
             seed=42 + rank,
-            count=20,
+            count=8,
             image_size_encoder=1024,
             image_size_mask=1024,
         )

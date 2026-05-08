@@ -220,8 +220,8 @@ class SimpleMaskVqvaeMultiScale(nn.Module):
         if self.enable_vq:
             tokens_by_scale, vq_loss, vq_usage = self._quantize_multiscale(tokens_by_scale, return_usage=return_usage)
         else:
-            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
-            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
+            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
+            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
 
         mask_tokens = self._fuse_multiscale_tokens(tokens_by_scale)
         mask = self.mask_decoder(mask_tokens, image_tokens)
@@ -308,8 +308,8 @@ class SimpleMaskVqvaeMultiScaleResidual(SimpleMaskVqvaeMultiScale):
                 mask_tokens, vq_loss = self.quant(mask_tokens)
                 vq_usage = None
         else:
-            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
-            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=mask_normalized.dtype)
+            vq_loss = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
+            vq_usage = torch.tensor(0.0, device=mask_normalized.device, dtype=torch.float32)
 
         mask_tokens = rearrange(mask_tokens, "b (h w) c -> b h w c", h=h, w=w)
         mask = self.mask_decoder(mask_tokens, image_tokens)

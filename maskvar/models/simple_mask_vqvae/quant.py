@@ -48,36 +48,41 @@ class SimpleVectorQuantize(nn.Module):
         return_usage: 是否返回词表利用率
         returns: z_q (same shape as input, BHWC), vq_loss, (optional) usage_percent
         """
+        output_dtype = z.dtype
+        if z.dtype != torch.float32:
+            z = z.float()
         B, L, C = z.shape
         z_orig = z
 
-        z_flat = rearrange(z, 'b l c -> (b l) c')
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            z_flat = rearrange(z, 'b l c -> (b l) c')
 
-        distances = self._compute_distances(z_flat)
-        indices = torch.argmin(distances, dim=1)
+            distances = self._compute_distances(z_flat)
+            indices = torch.argmin(distances, dim=1)
 
-        # 统计词表使用情况
-        if self.training:
-            hit_count = indices.bincount(minlength=self.vocab_size).float()
-            if tdist.is_initialized():
-                tdist.all_reduce(hit_count)
+            # 统计词表使用情况
+            if self.training:
+                hit_count = indices.bincount(minlength=self.vocab_size).float()
+                if tdist.is_initialized():
+                    tdist.all_reduce(hit_count)
 
-            # Use a boolean flag instead of item() to avoid graph break
-            is_first_hit = self.record_hit == 0
-            if is_first_hit:
-                self.ema_vocab_hit.copy_(hit_count)
-            else:
-                self.ema_vocab_hit.mul_(self.ema_decay).add_(hit_count, alpha=1 - self.ema_decay)
-            self.record_hit.add_(1)
+                # Use a boolean flag instead of item() to avoid graph break
+                is_first_hit = self.record_hit == 0
+                if is_first_hit:
+                    self.ema_vocab_hit.copy_(hit_count)
+                else:
+                    self.ema_vocab_hit.mul_(self.ema_decay).add_(hit_count, alpha=1 - self.ema_decay)
+                self.record_hit.add_(1)
 
-        z_q = self.embedding(indices)
-        z_q = rearrange(z_q, '(b l) c -> b l c', b=B, l=L)
+            z_q = self.embedding(indices)
+            z_q = rearrange(z_q, '(b l) c -> b l c', b=B, l=L)
 
-        commitment_loss = F.mse_loss(z_q.detach(), z_orig)
-        codebook_loss = F.mse_loss(z_q, z_orig.detach())
-        loss = codebook_loss + self.beta * commitment_loss
+            commitment_loss = F.mse_loss(z_q.detach(), z_orig)
+            codebook_loss = F.mse_loss(z_q, z_orig.detach())
+            loss = codebook_loss + self.beta * commitment_loss
 
-        z_q = z_orig + (z_q - z_orig).detach()
+            z_q = z_orig + (z_q - z_orig).detach()
+            z_q = z_q.to(output_dtype)
 
         if return_usage:
             world_size = tdist.get_world_size() if tdist.is_initialized() else 1
@@ -95,11 +100,14 @@ class SimpleVectorQuantize(nn.Module):
         x: (B, L, C) - always in BLC format
         returns: indices (B, L)
         """
+        if x.dtype != torch.float32:
+            x = x.float()
         B, L, C = x.shape
-        x_flat = rearrange(x, 'b l c -> (b l) c')
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            x_flat = rearrange(x, 'b l c -> (b l) c')
 
-        distances = self._compute_distances(x_flat)
-        indices = torch.argmin(distances, dim=1)
+            distances = self._compute_distances(x_flat)
+            indices = torch.argmin(distances, dim=1)
 
         return indices.view(B, L).contiguous()
 

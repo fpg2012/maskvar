@@ -947,7 +947,9 @@ def main():
 
     # Device and dtype
     device = f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'
-    dtype = getattr(torch, args.dtype)
+    requested_dtype = args.dtype
+    args.dtype = 'float32'
+    dtype = torch.float32
 
     # Output directory
     out_dir = Path(args.out_dir)
@@ -963,6 +965,11 @@ def main():
         print(f"Training configuration:")
         for k, v in vars(args).items():
             print(f"  {k}: {v}")
+        if requested_dtype != args.dtype:
+            print(
+                f"SimpleMaskVqvae follows VQVAE_Single precision: fp32 tensors "
+                f"with torch matmul precision='high'; ignoring requested --dtype {requested_dtype}."
+            )
         print(f"World size: {world_size}, Rank: {rank}")
 
     # Build dataset
