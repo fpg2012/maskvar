@@ -1,14 +1,14 @@
 """
-Training script for SimpleMaskAR.
+Training script for SimpleMaskMaskGIT.
 
 Example usage:
     # Single GPU
-    python train_scripts/train_simple_mask_ar.py --out_dir out_simple_mask_ar_v0 \
+    python train_scripts/train_simple_mask_maskgit.py --out_dir out_simple_mask_maskgit_v0 \
         --vqvae_checkpoint checkpoints/simple_mask_vqvae.pth
 
     # Multi-GPU DDP
     torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=11134 \
-        train_scripts/train_simple_mask_ar.py --out_dir out_simple_mask_ar_v0 \
+        train_scripts/train_simple_mask_maskgit.py --out_dir out_simple_mask_maskgit_v0 \
         --vqvae_checkpoint checkpoints/simple_mask_vqvae.pth
 """
 
@@ -42,7 +42,7 @@ from maskvar.datasets.mask_level_dataset import MaskLevelDatasetDummy
 from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset, MaskLevelFlatSubsetDataset
 
 # Model imports (for direct use if needed)
-from maskvar.models.simple_mask_ar.simple_mask_ar import SimpleMaskAR
+from maskvar.models.simple_mask_ar.simple_mask_maskgit import SimpleMaskMaskGIT
 from maskvar.models.simple_mask_vqvae.simple_mask_vqvae import SimpleMaskVqvae
 from maskvar.utils.metrics import calc_iou
 from maskvar.utils import restore_normalized_image
@@ -56,7 +56,7 @@ def sample_click_condition(single_mask: torch.Tensor, ar_h: int, ar_w: int, max_
     Sample click condition for one mask sample.
 
     Returns:
-        click_coords: (max_clicks, 2), row/col in AR token-grid coordinates
+        click_coords: (max_clicks, 2), row/col in MaskGIT token-grid coordinates
         click_labels: (max_clicks,), 1 for positive clicks and -1 for padding
     """
     mask_np = single_mask[0].detach().cpu().numpy() > 0
@@ -151,9 +151,9 @@ def load_vqvae_config_overrides(vqvae_checkpoint_path: str) -> dict:
         return json.load(f)
 
 
-class SimpleMaskARTrainer:
+class SimpleMaskMaskGITTrainer:
     """
-    Trainer for SimpleMaskAR.
+    Trainer for SimpleMaskMaskGIT.
 
     Supports:
     - Distributed Data Parallel (DDP)
@@ -190,6 +190,9 @@ class SimpleMaskARTrainer:
         cfg_guidance_scale: float = 1.0,
         cfg_drop_click: bool = True,
         cfg_drop_image: bool = False,
+        mask_min_ratio: float = 0.1,
+        mask_max_ratio: float = 1.0,
+        maskgit_num_steps: int = 12,
     ):
         self.model = model
         self.vqvae_model = vqvae_model
@@ -209,6 +212,9 @@ class SimpleMaskARTrainer:
         self.cfg_guidance_scale = cfg_guidance_scale if enable_cfg else 1.0
         self.cfg_drop_click = cfg_drop_click
         self.cfg_drop_image = cfg_drop_image
+        self.mask_min_ratio = mask_min_ratio
+        self.mask_max_ratio = mask_max_ratio
+        self.maskgit_num_steps = maskgit_num_steps
 
         # Distributed training setup
         if tdist.is_initialized():
@@ -361,7 +367,7 @@ class SimpleMaskARTrainer:
                 dtype=self.dtype,
                 enabled=(self.device.startswith('cuda') and self.dtype != torch.float32),
             ):
-                token_ids, image_tokens = self._get_ar_model().encode_mask_to_token_ids(
+                token_ids, image_tokens = self._get_maskgit_model().encode_mask_to_token_ids(
                     self.vqvae_model,
                     mask_normalized,
                     image,
@@ -369,13 +375,24 @@ class SimpleMaskARTrainer:
 
         return token_ids, image_tokens
 
-    def _get_ar_model(self):
+    def _get_maskgit_model(self):
         return self.model.module if isinstance(self.model, DDP) else self.model
+
+    def sample_mask_positions(self, token_ids):
+        B, L = token_ids.shape
+        min_ratio = max(0.0, min(self.mask_min_ratio, 1.0))
+        max_ratio = max(min_ratio, min(self.mask_max_ratio, 1.0))
+        ratios = torch.empty(B, device=token_ids.device).uniform_(min_ratio, max_ratio)
+        counts = (ratios * L).round().long().clamp_(min=1, max=L)
+        order = torch.rand(B, L, device=token_ids.device).argsort(dim=1)
+        mask_positions = torch.zeros(B, L, dtype=torch.bool, device=token_ids.device)
+        mask_positions.scatter_(1, order < counts[:, None], True)
+        return mask_positions
 
     @torch.no_grad()
     def decode_token_ids_to_mask_logits(self, token_ids, image_tokens, output_size):
         """Decode VQ token ids back to mask logits using the frozen VQVAE decoder."""
-        return self._get_ar_model().decode_token_ids_to_mask_logits(
+        return self._get_maskgit_model().decode_token_ids_to_mask_logits(
             self.vqvae_model,
             token_ids,
             image_tokens,
@@ -383,8 +400,8 @@ class SimpleMaskARTrainer:
         )
 
     @torch.no_grad()
-    def compute_mask_predictions(self, token_ids, logits, image_tokens, gt_mask, compute_infer: bool = False, click_coords=None, click_labels=None):
-        """Compute GT-token reconstruction, teacher predictions and optional pure-autoregressive predictions plus IoU."""
+    def compute_mask_predictions(self, token_ids, logits, image_tokens, gt_mask, compute_infer: bool = False, click_coords=None, click_labels=None, mask_positions=None):
+        """Compute GT-token reconstruction, masked-token predictions and optional MaskGIT inference plus IoU."""
         gt_token_mask_logits = self.decode_token_ids_to_mask_logits(
             token_ids,
             image_tokens,
@@ -393,6 +410,8 @@ class SimpleMaskARTrainer:
         gt_token_iou = calc_iou(gt_token_mask_logits, gt_mask)
 
         teacher_token_ids = logits.argmax(dim=-1)
+        if mask_positions is not None:
+            teacher_token_ids = torch.where(mask_positions, teacher_token_ids, token_ids)
         teacher_mask_logits = self.decode_token_ids_to_mask_logits(
             teacher_token_ids,
             image_tokens,
@@ -405,10 +424,11 @@ class SimpleMaskARTrainer:
         infer_iou = None
 
         if compute_infer:
-            infer_token_ids = self._get_ar_model().autoregressive_infer(
+            infer_token_ids = self._get_maskgit_model().maskgit_infer(
                 image_tokens,
                 click_coords=click_coords,
                 click_labels=click_labels,
+                num_steps=self.maskgit_num_steps,
                 cfg_guidance_scale=self.cfg_guidance_scale,
                 cfg_drop_click=self.cfg_drop_click,
                 cfg_drop_image=self.cfg_drop_image,
@@ -438,7 +458,7 @@ class SimpleMaskARTrainer:
         save_name: str | None = None,
         include_infer: bool = False,
     ):
-        """Visualize GT mask, GT-token reconstruction, teacher prediction and optional pure autoregressive prediction."""
+        """Visualize GT mask, GT-token reconstruction, masked prediction and optional MaskGIT inference."""
         if self.writer is None or not vis_samples:
             return
 
@@ -622,29 +642,22 @@ class SimpleMaskARTrainer:
                 # Forward pass
                 step_timer = self._new_timer()
                 self._timer_start(step_timer)
+                mask_positions = self.sample_mask_positions(token_ids)
                 with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
                     logits = self.model(
                         token_ids,
                         image_tokens,
+                        mask_positions=mask_positions,
                         click_coords=click_coords,
                         click_labels=click_labels,
                         cfg_drop_click_prob=self.cfg_drop_click_prob,
                         cfg_drop_image_prob=self.cfg_drop_image_prob,
                     )  # (B, L, vocab_size)
 
-                    # Compute loss against the original token ids.
-                    # The model internally prepends sos and drops the last input token.
                     B, L, vocab_size = logits.shape
 
-                    # Flatten logits and targets
-                    logits_flat = rearrange(logits, 'b l vocab -> (b l) vocab')
-                    token_ids_flat = rearrange(token_ids, 'b l -> (b l)')
-
-                    # No explicit target shift is needed here because preprocess aligns
-                    # [sos, t0, ..., t(L-2)] with targets [t0, ..., t(L-1)].
-                    targets = token_ids_flat
-
-                    # Compute cross-entropy loss
+                    logits_flat = logits[mask_positions]
+                    targets = token_ids[mask_positions]
                     loss = F.cross_entropy(logits_flat, targets, reduction='mean')
                     loss = loss / self.accumulate_steps
 
@@ -687,9 +700,10 @@ class SimpleMaskARTrainer:
                                 compute_infer=False,
                                 click_coords=click_coords,
                                 click_labels=click_labels,
+                                mask_positions=mask_positions,
                             )
                             pred_ids = logits.argmax(dim=-1)  # (B, L)
-                            correct = (pred_ids == token_ids).float().mean()
+                            correct = (pred_ids[mask_positions] == token_ids[mask_positions]).float().mean()
                             teacher_iou_mean = vis_outputs['teacher_iou'].mean().item()
 
                         pbar.set_postfix({
@@ -802,11 +816,13 @@ class SimpleMaskARTrainer:
 
             # Encode to tokens
             token_ids, image_tokens = self.encode_mask_to_tokens(single_mask_normalized, image)
+            mask_positions = self.sample_mask_positions(token_ids)
 
             with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
                 logits = self.model(
                     token_ids,
                     image_tokens,
+                    mask_positions=mask_positions,
                     click_coords=click_coords,
                     click_labels=click_labels,
                     cfg_drop_click_prob=0.0,
@@ -814,15 +830,13 @@ class SimpleMaskARTrainer:
                 )
                 B, L, vocab_size = logits.shape
 
-                logits_flat = rearrange(logits, 'b l vocab -> (b l) vocab')
-                token_ids_flat = rearrange(token_ids, 'b l -> (b l)')
-                targets = token_ids_flat
-
+                logits_flat = logits[mask_positions]
+                targets = token_ids[mask_positions]
                 loss = F.cross_entropy(logits_flat, targets, reduction='mean')
 
             # Calculate accuracy
             pred_ids = logits.argmax(dim=-1)
-            correct = (pred_ids == token_ids).float().mean()
+            correct = (pred_ids[mask_positions] == token_ids[mask_positions]).float().mean()
             compute_infer = self.enable_infer_iou and (iters_count < infer_val_batches)
             vis_outputs = self.compute_mask_predictions(
                 token_ids,
@@ -832,6 +846,7 @@ class SimpleMaskARTrainer:
                 compute_infer=compute_infer,
                 click_coords=click_coords,
                 click_labels=click_labels,
+                mask_positions=mask_positions,
             )
             teacher_iou = vis_outputs['teacher_iou']
             infer_iou = vis_outputs['infer_iou']
@@ -963,7 +978,7 @@ class SimpleMaskARTrainer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train SimpleMaskAR')
+    parser = argparse.ArgumentParser(description='Train SimpleMaskMaskGIT')
 
     parser.add_argument('--out_dir', type=str, required=True, help='Output directory')
 
@@ -989,7 +1004,7 @@ def main():
                         help='Training dtype')
 
     # Model config
-    parser.add_argument('--config', type=str, default='simple_mask_ar',
+    parser.add_argument('--config', type=str, default='simple_mask_maskgit',
                         help='Model config name in builder_map')
     parser.add_argument(
         '--vqvae_config',
@@ -1022,9 +1037,9 @@ def main():
     parser.add_argument('--val_infer_batches', type=int, default=4,
                         help='Number of validation batches to run pure inference IoU and visualization on')
     parser.add_argument('--enable_infer_iou', action='store_true',
-                        help='Enable pure autoregressive inference IoU. Default is disabled.')
+                        help='Enable iterative MaskGIT inference IoU. Default is disabled.')
     parser.add_argument('--enable_click', action='store_true',
-                        help='Enable positive click conditioning for SimpleMaskAR')
+                        help='Enable positive click conditioning for SimpleMaskMaskGIT')
     parser.add_argument('--enable_cfg', action='store_true',
                         help='Enable classifier-free guidance training/inference hooks. Default is disabled.')
     parser.add_argument('--cfg_drop_click_prob', type=float, default=0.1,
@@ -1037,6 +1052,12 @@ def main():
                         help='Use image-token dropping for CFG inference. Click dropping is used by default.')
     parser.add_argument('--cfg_keep_click', action='store_true',
                         help='Do not drop click condition for CFG inference')
+    parser.add_argument('--mask_min_ratio', type=float, default=0.1,
+                        help='Minimum random token mask ratio for MaskGIT training')
+    parser.add_argument('--mask_max_ratio', type=float, default=1.0,
+                        help='Maximum random token mask ratio for MaskGIT training')
+    parser.add_argument('--maskgit_num_steps', type=int, default=12,
+                        help='Number of iterative refinement steps for MaskGIT inference')
     parser.add_argument('--profile', action='store_true', help='Enable short torch profiler trace at startup')
     parser.add_argument('--profile_wait', type=int, default=1, help='Profiler wait steps')
     parser.add_argument('--profile_warmup', type=int, default=1, help='Profiler warmup steps')
@@ -1186,7 +1207,7 @@ def main():
     if 'shape_only' in args.vqvae_config:
         raise ValueError(
             f"VQVAE config '{args.vqvae_config}' is shape-only and is not compatible with the current "
-            "simple_mask_ar/simple_query_token_ar training pipeline, which requires image tokens."
+            "simple_mask_maskgit training pipeline, which requires image tokens."
         )
 
     vqvae_model = builder_map['simple_mask_vqvae'][args.vqvae_config](
@@ -1194,9 +1215,9 @@ def main():
     )
     vqvae_model.eval()
 
-    # Build AR model using builder (hyperparameters are fixed in builder)
+    # Build MaskGIT model using builder (hyperparameters are fixed in builder)
     checkpoint_to_use = args.checkpoint or args.resume_from
-    model = builder_map['simple_mask_ar'][args.config](
+    model = builder_map['simple_mask_maskgit'][args.config](
         checkpoint_path=checkpoint_to_use if checkpoint_to_use and os.path.exists(checkpoint_to_use) else None,
         device=device,
         enable_click=args.enable_click,
@@ -1218,6 +1239,7 @@ def main():
                 f"infer_drop_click={not args.cfg_keep_click}, "
                 f"infer_drop_image={args.cfg_drop_image})"
             )
+        print(f"MaskGIT mask ratio: [{args.mask_min_ratio}, {args.mask_max_ratio}]")
         if vqvae_image_encoder_config is not None:
             print(f"Using VQVAE image encoder config: {vqvae_image_encoder_config}")
         if vqvae_image_encoder_checkpoint is not None:
@@ -1260,7 +1282,7 @@ def main():
         if rank == 0:
             print(f"Profiler enabled. Traces will be written to {profile_dir}")
 
-    trainer = SimpleMaskARTrainer(
+    trainer = SimpleMaskMaskGITTrainer(
         model=model,
         vqvae_model=vqvae_model,
         train_dataset=train_set,
@@ -1286,6 +1308,9 @@ def main():
         cfg_guidance_scale=args.cfg_guidance_scale,
         cfg_drop_click=not args.cfg_keep_click,
         cfg_drop_image=args.cfg_drop_image,
+        mask_min_ratio=args.mask_min_ratio,
+        mask_max_ratio=args.mask_max_ratio,
+        maskgit_num_steps=args.maskgit_num_steps,
     )
 
     # Resume from checkpoint

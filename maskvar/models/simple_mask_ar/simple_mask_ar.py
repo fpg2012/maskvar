@@ -5,6 +5,39 @@ from einops import rearrange
 from .basic import RotaryPositionEmbedding, SimpleClickCrossBlock, SimpleCrossBlock, SimpleSelfBlock
 
 
+def drop_click_condition(click_labels: torch.Tensor | None, drop_prob: float, training: bool):
+    if click_labels is None or drop_prob <= 0 or not training:
+        return click_labels
+    B = click_labels.shape[0]
+    drop = torch.rand(B, device=click_labels.device) < drop_prob
+    return torch.where(drop[:, None], torch.full_like(click_labels, -1), click_labels)
+
+
+def drop_image_condition(image_tokens: torch.Tensor, drop_prob: float, training: bool):
+    if drop_prob <= 0 or not training:
+        return image_tokens
+    B = image_tokens.shape[0]
+    drop = torch.rand(B, device=image_tokens.device) < drop_prob
+    view_shape = (B,) + (1,) * (image_tokens.dim() - 1)
+    return torch.where(drop.view(view_shape), torch.zeros_like(image_tokens), image_tokens)
+
+
+def make_uncond_click_labels(click_labels: torch.Tensor | None):
+    if click_labels is None:
+        return None
+    return torch.full_like(click_labels, -1)
+
+
+def sample_from_logits(logits: torch.Tensor, temperature=1.0, top_k=None):
+    if temperature == 0:
+        return logits.argmax(dim=-1)
+    if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits = logits.masked_fill(logits < v[:, [-1]], -float('inf'))
+    probs = torch.softmax(logits / temperature, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
 class SimpleMaskARBlock(nn.Module):
 
     def __init__(self, rope: RotaryPositionEmbedding, dim, num_heads, enable_click: bool = False):
@@ -177,7 +210,15 @@ class SimpleMaskAR(nn.Module):
         click_tokens = torch.where((click_labels == 1).unsqueeze(-1), pos_rope, click_tokens)
         return click_tokens, click_coords, click_labels
 
-    def forward(self, x: torch.Tensor, image_tokens: torch.Tensor, click_coords: torch.Tensor | None = None, click_labels: torch.Tensor | None = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        image_tokens: torch.Tensor,
+        click_coords: torch.Tensor | None = None,
+        click_labels: torch.Tensor | None = None,
+        cfg_drop_click_prob: float = 0.0,
+        cfg_drop_image_prob: float = 0.0,
+    ):
         """
         Training forward.
         x: (B, L) - token indices in row-major order
@@ -187,6 +228,8 @@ class SimpleMaskAR(nn.Module):
         Note: The last position's prediction is not used in loss (no ground truth).
         """
         x = self.preprocess(x)  # (B, H, W, C)
+        click_labels = drop_click_condition(click_labels, cfg_drop_click_prob, self.training)
+        image_tokens = drop_image_condition(image_tokens, cfg_drop_image_prob, self.training)
         image_tokens = self._image_tokens_to_spatial(image_tokens)
         click_tokens, click_coords, click_labels = self.encode_clicks(click_coords, click_labels)
 
@@ -249,6 +292,9 @@ class SimpleMaskAR(nn.Module):
         temperature=1.0,
         top_k=None,
         num_samples: int = 1,
+        cfg_guidance_scale: float = 1.0,
+        cfg_drop_click: bool = True,
+        cfg_drop_image: bool = False,
     ):
         """
         Autoregressive inference in row-major order.
@@ -267,8 +313,16 @@ class SimpleMaskAR(nn.Module):
         if num_samples < 1:
             raise ValueError(f"num_samples must be >= 1, got {num_samples}")
 
+        use_cfg = cfg_guidance_scale != 1.0 and (cfg_drop_click or cfg_drop_image)
         image_tokens_spatial = self._image_tokens_to_spatial(image_tokens)
+        uncond_image_tokens_spatial = (
+            torch.zeros_like(image_tokens_spatial) if cfg_drop_image else image_tokens_spatial
+        )
         click_tokens, click_coords, click_labels = self.encode_clicks(click_coords, click_labels)
+        uncond_click_tokens = None
+        uncond_click_labels = make_uncond_click_labels(click_labels) if cfg_drop_click else click_labels
+        if use_cfg and self.enable_click and click_coords is not None and uncond_click_labels is not None:
+            uncond_click_tokens, _, uncond_click_labels = self.encode_clicks(click_coords, uncond_click_labels)
         B, _, C = image_tokens.shape
         H, W = self.h, self.w
         device = image_tokens.device
@@ -284,6 +338,8 @@ class SimpleMaskAR(nn.Module):
         x_step = self.sos.view(1, 1, self.dim).expand(batch_size, 1, -1)  # (B * num_samples, 1, C)
         cross_caches = []
         click_caches = []
+        uncond_cross_caches = []
+        uncond_click_caches = []
         for block in self.blocks:
             cached_k, cached_v, h, w = block.precompute_cross_kv(image_tokens_spatial)
             if num_samples > 1:
@@ -300,7 +356,24 @@ class SimpleMaskAR(nn.Module):
                     click_w,
                 )
             click_caches.append(click_cache)
+            if use_cfg:
+                uncached_k, uncached_v, uh, uw = block.precompute_cross_kv(uncond_image_tokens_spatial)
+                if num_samples > 1:
+                    uncached_k = uncached_k.repeat_interleave(num_samples, dim=0)
+                    uncached_v = uncached_v.repeat_interleave(num_samples, dim=0)
+                uncond_cross_caches.append((uncached_k, uncached_v, uh, uw))
+                uncond_click_cache = block.precompute_click_kv(uncond_click_tokens, click_coords, uncond_click_labels, H, W)
+                if uncond_click_cache is not None and num_samples > 1:
+                    click_k, click_v, click_h, click_w = uncond_click_cache
+                    uncond_click_cache = (
+                        click_k.repeat_interleave(num_samples, dim=0),
+                        click_v.repeat_interleave(num_samples, dim=0),
+                        click_h,
+                        click_w,
+                    )
+                uncond_click_caches.append(uncond_click_cache)
         self_caches = [None for _ in self.blocks]
+        uncond_self_caches = [None for _ in self.blocks] if use_cfg else None
 
         generated_ids = []
 
@@ -319,16 +392,21 @@ class SimpleMaskAR(nn.Module):
 
             # Get logits for the current (last) position
             logits = self.cls(x_out[:, 0, :])  # (B * num_samples, vocab_size)
+            if use_cfg:
+                x_uncond = x_step
+                for block_idx, block in enumerate(self.blocks):
+                    x_uncond, uncond_self_caches[block_idx] = block.forward_step(
+                        x_uncond,
+                        uncond_cross_caches[block_idx],
+                        uncond_self_caches[block_idx],
+                        curr_coord,
+                        click_cache=uncond_click_caches[block_idx],
+                    )
+                uncond_logits = self.cls(x_uncond[:, 0, :])
+                logits = uncond_logits + cfg_guidance_scale * (logits - uncond_logits)
 
             # Sample next token
-            if temperature == 0:
-                next_token = logits.argmax(dim=-1)  # (B * num_samples,)
-            else:
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('inf')
-                probs = torch.softmax(logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B * num_samples,)
+            next_token = sample_from_logits(logits, temperature=temperature, top_k=top_k)
 
             generated_ids.append(next_token)
 

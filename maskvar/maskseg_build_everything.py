@@ -26,7 +26,7 @@ from .models.simple_mask_vqvae import (
     SimpleMaskVqvaeMultiScale,
     SimpleMaskVqvaeMultiScaleResidual,
 )
-from .models.simple_mask_ar import SimpleMaskAR, SimpleMaskVAR, SimpleMaskVARV2
+from .models.simple_mask_ar import SimpleMaskAR, SimpleMaskMaskGIT, SimpleMaskVAR, SimpleMaskVARV2
 from .models.simple_mask_ar import SimpleQueryTokenAR
 from .models.simple_mask_vae import SimpleMaskVAEV2
 from .models.simple_mask_diffusion import SimpleMaskLatentDiT
@@ -1635,6 +1635,36 @@ def build_simple_mask_ar(
     return model.to(device)
 
 
+def build_simple_mask_maskgit(
+    checkpoint_path: Optional[str] = None,
+    device: str = 'cpu',
+    enable_click: bool = False,
+) -> SimpleMaskMaskGIT:
+    model = SimpleMaskMaskGIT(
+        dim=384,
+        depth=2,
+        vocab_size=4096,
+        h=64,
+        w=64,
+        num_heads=4,
+        enable_click=enable_click,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict, strict=not enable_click)
+        print(f"Loaded SimpleMaskMaskGIT checkpoint from {checkpoint_path}")
+
+    return model.to(device)
+
+
 def build_simple_mask_var(
     checkpoint_path: Optional[str] = None,
     device: str = 'cpu',
@@ -2031,6 +2061,9 @@ builder_map = {
         "simple_mask_var": build_simple_mask_var,
         "simple_mask_var_v2": build_simple_mask_var_v2,
         "simple_query_token_ar": build_simple_query_token_ar,
+    },
+    "simple_mask_maskgit": {
+        "simple_mask_maskgit": build_simple_mask_maskgit,
     },
     "simple_mask_vae": {
         "simple_mask_vae_v2_dim384": build_simple_mask_vae_v2_dim384,
