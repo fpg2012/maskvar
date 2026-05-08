@@ -1,6 +1,7 @@
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from einops import rearrange
 
@@ -12,6 +13,30 @@ from .simple_mask_ar import (
     sample_from_logits,
 )
 from .basic import RotaryPositionEmbedding
+
+
+class SinusoidalEmbedding(nn.Module):
+    """Sinusoidal scalar embedding followed by an MLP projection."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.proj = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.SiLU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(10000) * torch.arange(half, device=x.device, dtype=torch.float32) / half
+        )
+        args = x.float().view(-1, 1) * freqs.view(1, -1)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
+        if self.dim % 2:
+            emb = F.pad(emb, (0, 1))
+        return self.proj(emb)
 
 
 class SimpleMaskMaskGIT(nn.Module):
@@ -34,6 +59,8 @@ class SimpleMaskMaskGIT(nn.Module):
         self.enable_click = enable_click
 
         self.embed = nn.Embedding(vocab_size + 1, dim)
+        self.mask_ratio_emb = SinusoidalEmbedding(dim)
+        self.norm = nn.LayerNorm(dim)
         self.cls = nn.Linear(dim, vocab_size)
         self.rope = RotaryPositionEmbedding(h=h, w=w)
 
@@ -79,6 +106,7 @@ class SimpleMaskMaskGIT(nn.Module):
         x: torch.Tensor,
         image_tokens: torch.Tensor,
         mask_positions: torch.Tensor | None = None,
+        mask_ratio: torch.Tensor | None = None,
         click_coords: torch.Tensor | None = None,
         click_labels: torch.Tensor | None = None,
         cfg_drop_click_prob: float = 0.0,
@@ -86,10 +114,16 @@ class SimpleMaskMaskGIT(nn.Module):
     ):
         if x.shape[1] != self.max_len:
             raise ValueError(f"Expected token length {self.max_len}, got {x.shape[1]}")
+        if mask_ratio is None:
+            if mask_positions is None:
+                mask_ratio = torch.zeros(x.shape[0], device=x.device, dtype=torch.float32)
+            else:
+                mask_ratio = mask_positions.float().mean(dim=1)
         if mask_positions is not None:
             x = torch.where(mask_positions, torch.full_like(x, self.mask_token_id), x)
 
         x = self.embed(x).view(x.shape[0], self.h, self.w, self.dim)
+        x = x + self.mask_ratio_emb(mask_ratio).view(x.shape[0], 1, 1, self.dim).to(x.dtype)
         click_labels = drop_click_condition(click_labels, cfg_drop_click_prob, self.training)
         image_tokens = drop_image_condition(image_tokens, cfg_drop_image_prob, self.training)
         image_tokens = self._image_tokens_to_spatial(image_tokens)
@@ -105,7 +139,7 @@ class SimpleMaskMaskGIT(nn.Module):
                 block_mask=None,
             )
 
-        logits = self.cls(x)
+        logits = self.cls(self.norm(x))
         return rearrange(logits, "b h w vocab -> b (h w) vocab")
 
     def encode_mask_to_token_ids(self, vqvae_model, mask_normalized: torch.Tensor, image: torch.Tensor):
@@ -149,6 +183,7 @@ class SimpleMaskMaskGIT(nn.Module):
         token_ids,
         image_tokens,
         masked,
+        mask_ratio,
         click_coords,
         click_labels,
         cfg_guidance_scale,
@@ -159,6 +194,7 @@ class SimpleMaskMaskGIT(nn.Module):
             token_ids,
             image_tokens,
             mask_positions=masked,
+            mask_ratio=mask_ratio,
             click_coords=click_coords,
             click_labels=click_labels,
         )
@@ -171,6 +207,7 @@ class SimpleMaskMaskGIT(nn.Module):
             token_ids,
             uncond_image_tokens,
             mask_positions=masked,
+            mask_ratio=mask_ratio,
             click_coords=click_coords,
             click_labels=uncond_click_labels,
         )
@@ -198,10 +235,12 @@ class SimpleMaskMaskGIT(nn.Module):
         masked = torch.ones((B, self.max_len), dtype=torch.bool, device=device)
 
         for step in range(num_steps):
+            mask_ratio = masked.float().mean(dim=1)
             logits = self._guided_logits(
                 token_ids,
                 image_tokens,
                 masked,
+                mask_ratio,
                 click_coords,
                 click_labels,
                 cfg_guidance_scale,
@@ -217,16 +256,19 @@ class SimpleMaskMaskGIT(nn.Module):
             if step == num_steps - 1:
                 break
 
-            next_mask_count = math.ceil(self.max_len * math.cos(0.5 * math.pi * (step + 1) / num_steps))
-            next_mask_count = max(0, min(next_mask_count, self.max_len))
+            keep_ratio = math.cos(0.5 * math.pi * (step + 1) / num_steps)
+            next_mask_count = int(self.max_len * keep_ratio)
             conf_full = torch.full((B, self.max_len), float("inf"), device=device)
             conf_full[masked] = confidence
-            if next_mask_count == 0:
+            current_mask_count = masked.sum(dim=1)
+            next_mask_count = torch.full((B,), next_mask_count, device=device, dtype=torch.long)
+            next_mask_count = torch.minimum(next_mask_count, current_mask_count - 1).clamp(min=0)
+            if next_mask_count.max().item() == 0:
                 masked = torch.zeros_like(masked)
             else:
-                _, mask_idx = torch.topk(conf_full, k=next_mask_count, dim=1, largest=False)
-                masked = torch.zeros_like(masked)
-                masked.scatter_(1, mask_idx, True)
+                order = conf_full.argsort(dim=1)
+                rank = order.argsort(dim=1)
+                masked = rank < next_mask_count[:, None]
                 token_ids[masked] = self.mask_token_id
 
         return token_ids.clamp_max(self.vocab_size - 1)

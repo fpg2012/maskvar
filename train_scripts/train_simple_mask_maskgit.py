@@ -190,7 +190,7 @@ class SimpleMaskMaskGITTrainer:
         cfg_guidance_scale: float = 1.0,
         cfg_drop_click: bool = True,
         cfg_drop_image: bool = False,
-        mask_min_ratio: float = 0.1,
+        mask_min_ratio: float = 0.0,
         mask_max_ratio: float = 1.0,
         maskgit_num_steps: int = 12,
     ):
@@ -385,9 +385,10 @@ class SimpleMaskMaskGITTrainer:
         ratios = torch.empty(B, device=token_ids.device).uniform_(min_ratio, max_ratio)
         counts = (ratios * L).round().long().clamp_(min=1, max=L)
         order = torch.rand(B, L, device=token_ids.device).argsort(dim=1)
-        mask_positions = torch.zeros(B, L, dtype=torch.bool, device=token_ids.device)
-        mask_positions.scatter_(1, order < counts[:, None], True)
-        return mask_positions
+        rank = order.argsort(dim=1)
+        mask_positions = rank < counts[:, None]
+        mask_ratio = counts.float() / L
+        return mask_positions, mask_ratio
 
     @torch.no_grad()
     def decode_token_ids_to_mask_logits(self, token_ids, image_tokens, output_size):
@@ -642,12 +643,13 @@ class SimpleMaskMaskGITTrainer:
                 # Forward pass
                 step_timer = self._new_timer()
                 self._timer_start(step_timer)
-                mask_positions = self.sample_mask_positions(token_ids)
+                mask_positions, mask_ratio = self.sample_mask_positions(token_ids)
                 with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
                     logits = self.model(
                         token_ids,
                         image_tokens,
                         mask_positions=mask_positions,
+                        mask_ratio=mask_ratio,
                         click_coords=click_coords,
                         click_labels=click_labels,
                         cfg_drop_click_prob=self.cfg_drop_click_prob,
@@ -816,13 +818,14 @@ class SimpleMaskMaskGITTrainer:
 
             # Encode to tokens
             token_ids, image_tokens = self.encode_mask_to_tokens(single_mask_normalized, image)
-            mask_positions = self.sample_mask_positions(token_ids)
+            mask_positions, mask_ratio = self.sample_mask_positions(token_ids)
 
             with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.dtype != torch.float32):
                 logits = self.model(
                     token_ids,
                     image_tokens,
                     mask_positions=mask_positions,
+                    mask_ratio=mask_ratio,
                     click_coords=click_coords,
                     click_labels=click_labels,
                     cfg_drop_click_prob=0.0,
@@ -1052,7 +1055,7 @@ def main():
                         help='Use image-token dropping for CFG inference. Click dropping is used by default.')
     parser.add_argument('--cfg_keep_click', action='store_true',
                         help='Do not drop click condition for CFG inference')
-    parser.add_argument('--mask_min_ratio', type=float, default=0.1,
+    parser.add_argument('--mask_min_ratio', type=float, default=0.0,
                         help='Minimum random token mask ratio for MaskGIT training')
     parser.add_argument('--mask_max_ratio', type=float, default=1.0,
                         help='Maximum random token mask ratio for MaskGIT training')
