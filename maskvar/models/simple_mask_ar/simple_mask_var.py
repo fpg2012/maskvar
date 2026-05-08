@@ -8,7 +8,7 @@ from .basic import RotaryPositionEmbedding, SimpleCrossBlock
 
 
 class SimpleScaleBlockedSelfBlock(nn.Module):
-    """Self-attention over a concatenated multiscale sequence with scale blocks."""
+    """Self-attention over a concatenated multiscale sequence with an optional block mask."""
 
     def __init__(self, rope: RotaryPositionEmbedding, dim: int, num_heads: int):
         super().__init__()
@@ -283,3 +283,59 @@ class SimpleMaskVAR(nn.Module):
             generated.append(next_ids)
 
         return generated
+
+
+class SimpleMaskVARV2(SimpleMaskVAR):
+    """
+    SimpleMaskVAR variant aligned with the original VAR scale-causal attention.
+
+    Unlike SimpleMaskVAR v1's block-diagonal self-attention, every token at scale
+    k can attend to all tokens from scales <= k. Inference mirrors that contract
+    by running the full generated prefix plus the current scale and returning
+    only the current scale logits.
+    """
+
+    def _get_block_mask(self, seq_len: int, device: torch.device):
+        key = (seq_len, device.type, device.index, "scale_causal")
+        if key not in self._block_mask_cache:
+            scale_ids = self.scale_ids[:seq_len].to(device=device)
+
+            def mask_mod(b, h, q_idx, k_idx):
+                return scale_ids[k_idx] <= scale_ids[q_idx]
+
+            self._block_mask_cache[key] = create_block_mask(
+                mask_mod,
+                B=None,
+                H=None,
+                Q_LEN=seq_len,
+                KV_LEN=seq_len,
+                device=device,
+            )
+        return self._block_mask_cache[key]
+
+    def forward_scale(self, scale_idx: int, var_input: torch.Tensor | None, image_tokens: torch.Tensor):
+        image_tokens_spatial = self._image_tokens_to_spatial(image_tokens)
+        x, seq_len = self._prepare_sequence(var_input, image_tokens)
+
+        end = sum(scale * scale for scale in self.scales[:scale_idx + 1])
+        if seq_len != end:
+            expected_var_len = end - self.first_len
+            actual_var_len = 0 if var_input is None else var_input.shape[1]
+            raise ValueError(
+                f"Expected prefix through scale {scale_idx} to have VAR input length "
+                f"{expected_var_len}, got {actual_var_len}"
+            )
+
+        coords = self.coords[:seq_len].to(device=x.device)
+        block_mask = self._get_block_mask(seq_len, x.device)
+        for block in self.blocks:
+            x = block(
+                x,
+                image_tokens_spatial,
+                coords=coords,
+                spatial_shape=(self.h, self.w),
+                block_mask=block_mask,
+            )
+
+        start = sum(scale * scale for scale in self.scales[:scale_idx])
+        return self.cls(x[:, start:end])
