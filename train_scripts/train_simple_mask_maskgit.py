@@ -193,6 +193,10 @@ class SimpleMaskMaskGITTrainer:
         mask_min_ratio: float = 0.0,
         mask_max_ratio: float = 1.0,
         maskgit_num_steps: int = 12,
+        maskgit_sampling_mode: str = "confidence",
+        infer_temperature: float = 1.0,
+        infer_top_k: int = 0,
+        infer_min_p: float = 0.0,
     ):
         self.model = model
         self.vqvae_model = vqvae_model
@@ -215,6 +219,10 @@ class SimpleMaskMaskGITTrainer:
         self.mask_min_ratio = mask_min_ratio
         self.mask_max_ratio = mask_max_ratio
         self.maskgit_num_steps = maskgit_num_steps
+        self.maskgit_sampling_mode = maskgit_sampling_mode
+        self.infer_temperature = infer_temperature
+        self.infer_top_k = infer_top_k if infer_top_k and infer_top_k > 0 else None
+        self.infer_min_p = infer_min_p if infer_min_p and infer_min_p > 0 else None
 
         # Distributed training setup
         if tdist.is_initialized():
@@ -430,9 +438,13 @@ class SimpleMaskMaskGITTrainer:
                 click_coords=click_coords,
                 click_labels=click_labels,
                 num_steps=self.maskgit_num_steps,
+                temperature=self.infer_temperature,
+                top_k=self.infer_top_k,
+                min_p=self.infer_min_p,
                 cfg_guidance_scale=self.cfg_guidance_scale,
                 cfg_drop_click=self.cfg_drop_click,
                 cfg_drop_image=self.cfg_drop_image,
+                sampling_mode=self.maskgit_sampling_mode,
             )
             infer_mask_logits = self.decode_token_ids_to_mask_logits(
                 infer_token_ids,
@@ -1061,6 +1073,14 @@ def main():
                         help='Maximum random token mask ratio for MaskGIT training')
     parser.add_argument('--maskgit_num_steps', type=int, default=12,
                         help='Number of iterative refinement steps for MaskGIT inference')
+    parser.add_argument('--maskgit_sampling_mode', type=str, default='confidence', choices=['confidence', 'click_expand'],
+                        help='MaskGIT inference remasking mode. click_expand grows visible tokens outward from positive clicks while preserving confidence ranking.')
+    parser.add_argument('--infer_temperature', type=float, default=1.0,
+                        help='Sampling temperature used for optional MaskGIT inference IoU')
+    parser.add_argument('--infer_top_k', type=int, default=0,
+                        help='Top-k sampling for optional MaskGIT inference IoU. 0 disables top-k.')
+    parser.add_argument('--infer_min_p', type=float, default=0.0,
+                        help='Min-p sampling for optional MaskGIT inference IoU. 0 disables min-p.')
     parser.add_argument('--profile', action='store_true', help='Enable short torch profiler trace at startup')
     parser.add_argument('--profile_wait', type=int, default=1, help='Profiler wait steps')
     parser.add_argument('--profile_warmup', type=int, default=1, help='Profiler warmup steps')
@@ -1314,6 +1334,10 @@ def main():
         mask_min_ratio=args.mask_min_ratio,
         mask_max_ratio=args.mask_max_ratio,
         maskgit_num_steps=args.maskgit_num_steps,
+        maskgit_sampling_mode=args.maskgit_sampling_mode,
+        infer_temperature=args.infer_temperature,
+        infer_top_k=args.infer_top_k,
+        infer_min_p=args.infer_min_p,
     )
 
     # Resume from checkpoint

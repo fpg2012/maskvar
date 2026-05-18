@@ -28,13 +28,19 @@ def make_uncond_click_labels(click_labels: torch.Tensor | None):
     return torch.full_like(click_labels, -1)
 
 
-def sample_from_logits(logits: torch.Tensor, temperature=1.0, top_k=None):
+def sample_from_logits(logits: torch.Tensor, temperature=1.0, top_k=None, min_p: float | None = None):
     if temperature == 0:
         return logits.argmax(dim=-1)
+    if min_p is not None and not 0 <= min_p <= 1:
+        raise ValueError(f"min_p must be in [0, 1], got {min_p}")
     if top_k is not None:
         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
         logits = logits.masked_fill(logits < v[:, [-1]], -float('inf'))
     probs = torch.softmax(logits / temperature, dim=-1)
+    if min_p is not None and min_p > 0:
+        max_probs = probs.max(dim=-1, keepdim=True).values
+        probs = probs.masked_fill(probs < max_probs * min_p, 0)
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
@@ -291,6 +297,7 @@ class SimpleMaskAR(nn.Module):
         click_labels: torch.Tensor | None = None,
         temperature=1.0,
         top_k=None,
+        min_p: float | None = None,
         num_samples: int = 1,
         cfg_guidance_scale: float = 1.0,
         cfg_drop_click: bool = True,
@@ -303,6 +310,7 @@ class SimpleMaskAR(nn.Module):
             image_tokens: (B, H, W, C)
             temperature: sampling temperature (0 for greedy)
             top_k: top-k sampling (None to disable)
+            min_p: min-p sampling threshold relative to the most likely token (None to disable)
             num_samples: number of sampled sequences per input image
 
         Returns:
@@ -406,7 +414,7 @@ class SimpleMaskAR(nn.Module):
                 logits = uncond_logits + cfg_guidance_scale * (logits - uncond_logits)
 
             # Sample next token
-            next_token = sample_from_logits(logits, temperature=temperature, top_k=top_k)
+            next_token = sample_from_logits(logits, temperature=temperature, top_k=top_k, min_p=min_p)
 
             generated_ids.append(next_token)
 

@@ -190,6 +190,9 @@ class SimpleMaskARTrainer:
         cfg_guidance_scale: float = 1.0,
         cfg_drop_click: bool = True,
         cfg_drop_image: bool = False,
+        infer_temperature: float = 1.0,
+        infer_top_k: int = 0,
+        infer_min_p: float = 0.0,
     ):
         self.model = model
         self.vqvae_model = vqvae_model
@@ -209,6 +212,9 @@ class SimpleMaskARTrainer:
         self.cfg_guidance_scale = cfg_guidance_scale if enable_cfg else 1.0
         self.cfg_drop_click = cfg_drop_click
         self.cfg_drop_image = cfg_drop_image
+        self.infer_temperature = infer_temperature
+        self.infer_top_k = infer_top_k if infer_top_k and infer_top_k > 0 else None
+        self.infer_min_p = infer_min_p if infer_min_p and infer_min_p > 0 else None
 
         # Distributed training setup
         if tdist.is_initialized():
@@ -409,6 +415,9 @@ class SimpleMaskARTrainer:
                 image_tokens,
                 click_coords=click_coords,
                 click_labels=click_labels,
+                temperature=self.infer_temperature,
+                top_k=self.infer_top_k,
+                min_p=self.infer_min_p,
                 cfg_guidance_scale=self.cfg_guidance_scale,
                 cfg_drop_click=self.cfg_drop_click,
                 cfg_drop_image=self.cfg_drop_image,
@@ -1037,6 +1046,12 @@ def main():
                         help='Use image-token dropping for CFG inference. Click dropping is used by default.')
     parser.add_argument('--cfg_keep_click', action='store_true',
                         help='Do not drop click condition for CFG inference')
+    parser.add_argument('--infer_temperature', type=float, default=1.0,
+                        help='Sampling temperature used for optional pure autoregressive inference IoU')
+    parser.add_argument('--infer_top_k', type=int, default=0,
+                        help='Top-k sampling for optional pure autoregressive inference IoU. 0 disables top-k.')
+    parser.add_argument('--infer_min_p', type=float, default=0.0,
+                        help='Min-p sampling for optional pure autoregressive inference IoU. 0 disables min-p.')
     parser.add_argument('--profile', action='store_true', help='Enable short torch profiler trace at startup')
     parser.add_argument('--profile_wait', type=int, default=1, help='Profiler wait steps')
     parser.add_argument('--profile_warmup', type=int, default=1, help='Profiler warmup steps')
@@ -1286,6 +1301,9 @@ def main():
         cfg_guidance_scale=args.cfg_guidance_scale,
         cfg_drop_click=not args.cfg_keep_click,
         cfg_drop_image=args.cfg_drop_image,
+        infer_temperature=args.infer_temperature,
+        infer_top_k=args.infer_top_k,
+        infer_min_p=args.infer_min_p,
     )
 
     # Resume from checkpoint

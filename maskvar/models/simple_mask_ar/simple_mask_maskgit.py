@@ -213,6 +213,45 @@ class SimpleMaskMaskGIT(nn.Module):
         )
         return uncond_logits + cfg_guidance_scale * (cond_logits - uncond_logits)
 
+    def _click_expand_keep_mask(
+        self,
+        confidence_full: torch.Tensor,
+        masked: torch.Tensor,
+        next_mask_count: torch.Tensor,
+        click_coords: torch.Tensor | None,
+        click_labels: torch.Tensor | None,
+        step: int,
+        num_steps: int,
+    ):
+        if click_coords is None or click_labels is None:
+            return None
+        valid_clicks = click_labels == 1
+        if not valid_clicks.any(dim=1).all():
+            return None
+
+        B = confidence_full.shape[0]
+        ys = torch.arange(self.h, device=confidence_full.device, dtype=torch.float32)
+        xs = torch.arange(self.w, device=confidence_full.device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        grid = torch.stack([grid_y, grid_x], dim=-1).view(1, self.max_len, 1, 2)
+        clicks = click_coords.to(device=confidence_full.device, dtype=torch.float32).view(B, 1, -1, 2)
+        dist = (grid - clicks).abs().sum(dim=-1)
+        dist = dist.masked_fill(~valid_clicks[:, None, :], float("inf")).min(dim=-1).values
+
+        max_dist = dist.masked_fill(~torch.isfinite(dist), 0).amax(dim=1).clamp_min(1.0)
+        allowed_radius = max_dist * float(step + 1) / float(num_steps)
+        locked_future = dist > allowed_radius[:, None]
+        rank_score = confidence_full
+        rank_score = rank_score.masked_fill(locked_future, -float("inf"))
+        rank_score = rank_score.masked_fill(~masked, float("inf"))
+
+        next_mask_count = torch.maximum(next_mask_count, locked_future.sum(dim=1))
+        if next_mask_count.max().item() == 0:
+            return torch.zeros_like(masked)
+        order = rank_score.argsort(dim=1)
+        rank = order.argsort(dim=1)
+        return rank < next_mask_count[:, None]
+
     @torch.no_grad()
     def maskgit_infer(
         self,
@@ -222,12 +261,16 @@ class SimpleMaskMaskGIT(nn.Module):
         num_steps: int = 12,
         temperature: float = 1.0,
         top_k=None,
+        min_p: float | None = None,
         cfg_guidance_scale: float = 1.0,
         cfg_drop_click: bool = True,
         cfg_drop_image: bool = False,
+        sampling_mode: str = "confidence",
     ):
         if num_steps < 1:
             raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+        if sampling_mode not in {"confidence", "click_expand"}:
+            raise ValueError(f"Unknown MaskGIT sampling_mode: {sampling_mode}")
 
         B = image_tokens.shape[0]
         device = image_tokens.device
@@ -248,7 +291,7 @@ class SimpleMaskMaskGIT(nn.Module):
                 cfg_drop_image,
             )
             masked_logits = logits[masked]
-            sampled = sample_from_logits(masked_logits, temperature=temperature, top_k=top_k)
+            sampled = sample_from_logits(masked_logits, temperature=temperature, top_k=top_k, min_p=min_p)
             probs = torch.softmax(masked_logits / max(temperature, 1e-6), dim=-1)
             confidence = probs.gather(1, sampled[:, None]).squeeze(1)
             token_ids[masked] = sampled
@@ -263,7 +306,23 @@ class SimpleMaskMaskGIT(nn.Module):
             current_mask_count = masked.sum(dim=1)
             next_mask_count = torch.full((B,), next_mask_count, device=device, dtype=torch.long)
             next_mask_count = torch.minimum(next_mask_count, current_mask_count - 1).clamp(min=0)
-            if next_mask_count.max().item() == 0:
+
+            next_masked = None
+            if sampling_mode == "click_expand":
+                next_masked = self._click_expand_keep_mask(
+                    conf_full,
+                    masked,
+                    next_mask_count,
+                    click_coords,
+                    click_labels,
+                    step,
+                    num_steps,
+                )
+
+            if next_masked is not None:
+                masked = next_masked
+                token_ids[masked] = self.mask_token_id
+            elif next_mask_count.max().item() == 0:
                 masked = torch.zeros_like(masked)
             else:
                 order = conf_full.argsort(dim=1)

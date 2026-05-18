@@ -30,6 +30,7 @@ from .models.simple_mask_ar import SimpleMaskAR, SimpleMaskMaskGIT, SimpleMaskVA
 from .models.simple_mask_ar import SimpleQueryTokenAR
 from .models.simple_mask_vae import SimpleMaskVAEV2
 from .models.simple_mask_diffusion import SimpleMaskLatentDiT
+from .models.rope_sam import RopeSAM
 from .models.dino_wrapper import DinoV3Wrapper
 
 from .datasets.mask_level_dataset import MaskLevelDataset
@@ -1665,6 +1666,51 @@ def build_simple_mask_maskgit(
     return model.to(device)
 
 
+def build_rope_sam_dim384(
+    checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    max_clicks: int = 10,
+) -> RopeSAM:
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    model = RopeSAM(
+        image_encoder=image_encoder,
+        dim=384,
+        h=64,
+        w=64,
+        num_heads=4,
+        max_clicks=max_clicks,
+        device=device,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model_state = model.state_dict()
+        compatible_state = {
+            k: v for k, v in state_dict.items()
+            if k in model_state and tuple(v.shape) == tuple(model_state[k].shape)
+        }
+        skipped = len(state_dict) - len(compatible_state)
+        missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+        print(f"Loaded RopeSAM checkpoint from {checkpoint_path}")
+        if skipped:
+            print(f"  Skipped incompatible keys: {skipped}")
+        if missing:
+            print(f"  Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"  Unexpected keys: {len(unexpected)}")
+
+    return model.to(device)
+
+
 def build_simple_mask_var(
     checkpoint_path: Optional[str] = None,
     device: str = 'cpu',
@@ -2070,6 +2116,9 @@ builder_map = {
     },
     "simple_mask_diffusion": {
         "simple_mask_latent_dit": build_simple_mask_latent_dit,
+    },
+    "rope_sam": {
+        "rope_sam_dim384": build_rope_sam_dim384,
     },
     "dataset": {
         "cocolvis": build_cocolvis_dataset,
