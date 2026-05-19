@@ -24,6 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from maskvar.datasets.image_feature_cache import ImageFeatureCache
 from maskvar.datasets.mask_level_dataset import MaskLevelDatasetDummy
 from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset, MaskLevelFlatSubsetDataset
 from maskvar.datasets.sharded_distributed_sampler import ShardedDistributedSampler
@@ -246,9 +247,14 @@ class RopeSAMTrainer:
         return torch.autocast(device_type=device_type, dtype=self.dtype, enabled=self.dtype != torch.float32)
 
     def _unpack_batch(self, batch):
-        image, _, single_mask_normalized, single_mask, click_coords, click_labels = batch
+        image, image_embedding, single_mask_normalized, single_mask, click_coords, click_labels = batch
+        if torch.is_tensor(image_embedding) and image_embedding.ndim > 1:
+            image_embedding = image_embedding.to(self.device, non_blocking=True)
+        else:
+            image_embedding = None
         return (
             image.to(self.device, non_blocking=True),
+            image_embedding,
             single_mask_normalized.to(self.device, non_blocking=True),
             single_mask.to(self.device, non_blocking=True),
             click_coords.to(self.device, non_blocking=True),
@@ -331,7 +337,7 @@ class RopeSAMTrainer:
         progress = min(1.0, float(self.global_step) / float(self.interactive_click_warmup_iters))
         return max(1, min(max_clicks, 1 + int(progress * (max_clicks - 1))))
 
-    def interactive_forward(self, image, single_mask, click_coords, click_labels):
+    def interactive_forward(self, image, image_embedding, single_mask, click_coords, click_labels):
         max_clicks = click_labels.shape[1]
         current_max_clicks = min(max_clicks, self._current_max_clicks())
         total_clicks = int(np.random.randint(1, current_max_clicks + 1))
@@ -344,6 +350,7 @@ class RopeSAMTrainer:
             with torch.no_grad():
                 prev_logits = self.model(
                     image=image,
+                    image_embedding=image_embedding,
                     click_coords=cur_coords,
                     click_labels=cur_labels,
                     prev_mask_logits=prev_logits,
@@ -354,6 +361,7 @@ class RopeSAMTrainer:
 
         logits = self.model(
             image=image,
+            image_embedding=image_embedding,
             click_coords=cur_coords,
             click_labels=cur_labels,
             prev_mask_logits=prev_logits,
@@ -378,12 +386,13 @@ class RopeSAMTrainer:
                 if iters_count >= num_iters:
                     break
 
-                image, single_mask_normalized, single_mask, click_coords, click_labels = self._unpack_batch(batch)
+                image, image_embedding, single_mask_normalized, single_mask, click_coords, click_labels = self._unpack_batch(batch)
                 target_mask = (single_mask > 0.5).float()
 
                 with self._autocast():
                     logits, click_coords_final, click_labels_final, total_clicks = self.interactive_forward(
                         image=image,
+                        image_embedding=image_embedding,
                         single_mask=single_mask,
                         click_coords=click_coords,
                         click_labels=click_labels,
@@ -458,11 +467,12 @@ class RopeSAMTrainer:
             if iters_count >= num_val_iters:
                 break
 
-            image, single_mask_normalized, single_mask, click_coords, click_labels = self._unpack_batch(batch)
+            image, image_embedding, single_mask_normalized, single_mask, click_coords, click_labels = self._unpack_batch(batch)
             target_mask = (single_mask > 0.5).float()
             with self._autocast():
                 logits, click_coords_final, click_labels_final, _ = self.interactive_forward(
                     image=image,
+                    image_embedding=image_embedding,
                     single_mask=single_mask,
                     click_coords=click_coords,
                     click_labels=click_labels,
@@ -601,10 +611,31 @@ def build_datasets(args, device: str, rank: int):
     dataset_path = args.dataset_path or dataset_path_map[args.dataset]
     train_set_base, val_set_base = builder_map["dataset"][args.dataset](dataset_path)
     index_mapping_path = Path("data/flat") / args.dataset
+    use_image_feature_cache = bool(args.image_feature_cache_dir)
+    use_val_image_feature_cache = False
+    image_feature_cache_train = None
+    image_feature_cache_val = None
+    if use_image_feature_cache:
+        cache_dir = Path(args.image_feature_cache_dir)
+        image_feature_cache_train = ImageFeatureCache(
+            cache_dir,
+            f"{args.dataset}_train",
+            args.image_encoder_config,
+            max_cache_shard=args.image_feature_cache_max_shard,
+        )
+        val_metadata_path = cache_dir / args.image_encoder_config / f"{args.dataset}_val_metadata.json"
+        if val_metadata_path.exists():
+            image_feature_cache_val = ImageFeatureCache(
+                cache_dir,
+                f"{args.dataset}_val",
+                args.image_encoder_config,
+                max_cache_shard=args.image_feature_cache_max_shard,
+            )
+            use_val_image_feature_cache = True
+        else:
+            print(f"Val image feature cache not found at {val_metadata_path}; validation will use the online image encoder.")
 
-    dataset_kwargs = {
-        "with_image_embed": False,
-        "image_feature_cache": None,
+    common_dataset_kwargs = {
         "mask_filter_thresh": 0.1,
         "dtype": torch.float32,
         "image_size_encoder": 1024,
@@ -616,12 +647,16 @@ def build_datasets(args, device: str, rank: int):
     train_kwargs = {
         "index_mapping_path": index_mapping_path / "train_index_mapping.npy",
         "dataset": train_set_base,
-        **dataset_kwargs,
+        **common_dataset_kwargs,
+        "with_image_embed": use_image_feature_cache,
+        "image_feature_cache": image_feature_cache_train,
     }
     val_kwargs = {
         "index_mapping_path": index_mapping_path / "val_index_mapping.npy",
         "dataset": val_set_base,
-        **dataset_kwargs,
+        **common_dataset_kwargs,
+        "with_image_embed": use_val_image_feature_cache,
+        "image_feature_cache": image_feature_cache_val,
     }
     if args.train_subset_index:
         train_kwargs["subset_list"] = Path(args.train_subset_index)
@@ -683,6 +718,8 @@ def main():
     parser.add_argument("--config", type=str, default="rope_sam_dim384", choices=sorted(builder_map["rope_sam"].keys()))
     parser.add_argument("--image_encoder_config", type=str, default="dino_v3_vits", choices=sorted(builder_map["image_encoder"].keys()))
     parser.add_argument("--image_encoder_checkpoint", type=str, default=None)
+    parser.add_argument("--image_feature_cache_dir", type=str, default="")
+    parser.add_argument("--image_feature_cache_max_shard", type=int, default=2)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--max_clicks", type=int, default=10)
@@ -721,6 +758,9 @@ def main():
         max_clicks=args.max_clicks,
         device=device,
     )
+
+    if args.image_feature_cache_dir:
+        args.freeze_image_encoder = True
 
     if args.freeze_image_encoder:
         for param in model.image_encoder.parameters():

@@ -34,7 +34,15 @@ class ImageFeatureCache(Dataset):
             self.metadata = json.load(f)
 
         self.internal_batch_size = self.metadata.get("batch_size", 1)
-        self.internal_dtype = getattr(torch, self.metadata.get("dtype", "float32").split('.')[1])
+        dtype_name = self.metadata.get("dtype", "float32").replace("torch.", "")
+        self.internal_dtype = getattr(torch, dtype_name)
+        self.source_index_to_cache_index = None
+        source_indices = self.metadata.get("source_indices")
+        if source_indices is not None:
+            self.source_index_to_cache_index = {
+                int(source_index): cache_index
+                for cache_index, source_index in enumerate(source_indices)
+            }
 
         self.original_batch_mode = original_batch_mode
 
@@ -46,6 +54,8 @@ class ImageFeatureCache(Dataset):
     def __len__(self):
         if self.original_batch_mode:
             return self.metadata["count"]
+        if "num_images" in self.metadata:
+            return self.metadata["num_images"]
         return self.metadata["count"] * self.internal_batch_size
 
     def _get_shard(self, shard_index: int) -> np.ndarray:
@@ -65,6 +75,12 @@ class ImageFeatureCache(Dataset):
         if self.original_batch_mode:
             image_feature = np.load(self.cache_dir / self.model_name / f'{self.dataset}/batch_{index:06d}.npy', mmap_mode='r')
             return image_feature
+
+        if self.source_index_to_cache_index is not None:
+            try:
+                index = self.source_index_to_cache_index[int(index)]
+            except KeyError as exc:
+                raise KeyError(f"Image index {index} is not available in cache {self.cache_dir / self.model_name / self.dataset}") from exc
 
         batch_index = index // self.internal_batch_size
         item_index_in_batch = index % self.internal_batch_size

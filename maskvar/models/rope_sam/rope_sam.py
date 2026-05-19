@@ -54,6 +54,11 @@ class RopeSAM(nn.Module):
             raise ValueError(f"Expected image encoder output (B, C, H, W), got {tuple(image_tokens.shape)}")
         return rearrange(image_tokens, "b c h w -> b h w c")
 
+    def encode_image_embedding(self, image_embedding: torch.Tensor) -> torch.Tensor:
+        if image_embedding.dim() != 4:
+            raise ValueError(f"Expected cached image embedding (B, C, H, W), got {tuple(image_embedding.shape)}")
+        return rearrange(image_embedding, "b c h w -> b h w c")
+
     def encode_prev_mask(self, prev_mask_logits: torch.Tensor | None, spatial_shape: tuple[int, int]) -> torch.Tensor | None:
         if prev_mask_logits is None:
             return None
@@ -77,16 +82,21 @@ class RopeSAM(nn.Module):
         click_labels: torch.Tensor,
         prev_mask_logits: torch.Tensor | None = None,
         output_size: tuple[int, int] | None = None,
+        image_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             image: (B, 3, H, W)
+            image_embedding: Optional cached image encoder output, (B, C, H, W).
             click_coords: (B, N, 2), row/col coordinates in the token grid.
             click_labels: (B, N), 1 positive, 0 negative, -1 padding.
             prev_mask_logits: Optional previous-step mask logits used as dense prompt.
             output_size: Optional mask-logit output size.
         """
-        image_tokens = self.encode_image(image)
+        if image_embedding is None:
+            image_tokens = self.encode_image(image)
+        else:
+            image_tokens = self.encode_image_embedding(image_embedding)
         prev_mask_tokens = self.encode_prev_mask(prev_mask_logits, image_tokens.shape[1:3])
         if prev_mask_tokens is not None:
             image_tokens = image_tokens + prev_mask_tokens.to(image_tokens.dtype)

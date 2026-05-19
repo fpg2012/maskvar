@@ -1,13 +1,14 @@
 #!/bin/bash
-# Train RopeSAM on COCONut HF dataset with DINO v3 image features and click prompts.
+# Train RopeSAM on COCONut HF with cached DINO v3 image embeddings.
 #
 # Usage:
-#   bash train_scripts/rope_sam/ddp_train_coconut_hf_dino_click.sh [N_NODE] [OUTDIR] [MASTER_PORT] [INIT_CKPT]
+#   bash train_scripts/rope_sam/ddp_train_coconut_hf_dino_click_cache.sh [N_NODE] [OUTDIR] [MASTER_PORT] [INIT_CKPT] [CACHE_DIR]
 
 N_NODE=${1:-4}
-OUTDIR=${2:-out/ddp_rope_sam_coconut_hf_dino_click}
+OUTDIR=${2:-out/ddp_rope_sam_coconut_hf_dino_click_cache}
 export MASTER_PORT=${3:-29500}
 INIT_CKPT=${4:-}
+CACHE_DIR=${5:-data/cache}
 export OMP_NUM_THREADS=4
 
 COMMON_ARGS=(
@@ -24,6 +25,8 @@ COMMON_ARGS=(
     --config rope_sam_dim384
     --image_encoder_config dino_v3_vits
     --image_encoder_checkpoint ckpt/dino_v3_vits.safetensors
+    --image_feature_cache_dir "$CACHE_DIR"
+    --image_feature_cache_max_shard 2
     --freeze_image_encoder
     --max_clicks 10
     --interactive_click_warmup_iters 10000
