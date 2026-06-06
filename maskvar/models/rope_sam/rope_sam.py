@@ -218,18 +218,21 @@ class PointMaskDecoder(nn.Module):
         num_heads: int = 4,
         num_two_way_blocks: int = 2,
         use_point_head: bool = False,
+        point_head_dim: int = 64,
         rope_coord_offset: float = 0.5,
     ):
         super().__init__()
         self.use_point_head = use_point_head
+        self.point_head_dim = point_head_dim
         self.two_way_blocks = nn.ModuleList([
             PointTwoWayBlock(dim=dim, num_heads=num_heads, rope_coord_offset=rope_coord_offset)
             for _ in range(num_two_way_blocks)
         ])
         if use_point_head:
-            self.hyper_in = MLP(dim, dim, dim, 3)
-            self.query_norm = nn.LayerNorm(dim)
-            self.point_norm = nn.LayerNorm(dim)
+            self.mask_head = MLP(dim, dim, point_head_dim, 3)
+            self.point_head = MLP(dim, dim, point_head_dim, 3)
+            self.query_norm = nn.LayerNorm(point_head_dim)
+            self.point_norm = nn.LayerNorm(point_head_dim)
 
     def forward(
         self,
@@ -242,8 +245,8 @@ class PointMaskDecoder(nn.Module):
 
         mask_token = query_tokens[:, 0]
         if self.use_point_head:
-            mask_token = self.query_norm(self.hyper_in(mask_token))
-            point_tokens = self.point_norm(point_tokens)
+            mask_token = self.query_norm(self.mask_head(mask_token))
+            point_tokens = self.point_norm(self.point_head(point_tokens))
         return torch.einsum("bc,bnc->bn", mask_token, point_tokens)
 
 
@@ -266,6 +269,7 @@ class PointRopeSAM(RopeSAM):
         interpolation_power: float = 2.0,
         interpolation_chunk_size: int = 1024,
         use_point_head: bool = False,
+        point_head_dim: int = 64,
         rope_coord_offset: float = 0.5,
         device: str = "cuda",
     ):
@@ -286,12 +290,14 @@ class PointRopeSAM(RopeSAM):
         self.interpolation_power = interpolation_power
         self.interpolation_chunk_size = interpolation_chunk_size
         self.use_point_head = use_point_head
+        self.point_head_dim = point_head_dim
         self.rope_coord_offset = rope_coord_offset
         self.mask_decoder = PointMaskDecoder(
             dim=dim,
             num_heads=num_heads,
             num_two_way_blocks=num_two_way_blocks,
             use_point_head=use_point_head,
+            point_head_dim=point_head_dim,
             rope_coord_offset=rope_coord_offset,
         )
         self.register_buffer("gaussian_kernel", _make_gaussian_kernel(), persistent=False)

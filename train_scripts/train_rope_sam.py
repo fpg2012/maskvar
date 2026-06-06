@@ -152,6 +152,7 @@ class RopeSAMTrainer:
         dtype: torch.dtype = torch.float32,
         find_unused_parameters: bool = True,
         interactive_click_warmup_iters: int = 10000,
+        interactive_stop_iou: float = 0.95,
     ):
         self.model = model
         self.device = device
@@ -161,6 +162,7 @@ class RopeSAMTrainer:
         self.criterion = build_loss(loss)
         self.global_step = 0
         self.interactive_click_warmup_iters = interactive_click_warmup_iters
+        self.interactive_stop_iou = interactive_stop_iou
 
         if tdist.is_initialized():
             self.rank = tdist.get_rank()
@@ -302,10 +304,17 @@ class RopeSAMTrainer:
         )
 
     @torch.no_grad()
-    def _append_next_clicks(self, click_lists, not_clicked_maps, gt_mask, pred_logits):
+    def _append_next_clicks(self, click_lists, not_clicked_maps, gt_mask, pred_logits, pred_iou=None):
         gt_cpu = (gt_mask.detach().cpu().numpy()[:, 0] > 0.5)
         pred_cpu = (pred_logits.detach().float().cpu().numpy()[:, 0] > 0.0)
+        pred_iou_cpu = pred_iou.detach().float().cpu().numpy() if pred_iou is not None else None
         for i, click_list in enumerate(click_lists):
+            if (
+                self.interactive_stop_iou > 0
+                and pred_iou_cpu is not None
+                and pred_iou_cpu[i] >= self.interactive_stop_iou
+            ):
+                continue
             fn_mask = np.logical_and(gt_cpu[i], np.logical_not(pred_cpu[i]))
             fp_mask = np.logical_and(np.logical_not(gt_cpu[i]), pred_cpu[i])
             error_mask = np.logical_and(np.logical_or(fn_mask, fp_mask), not_clicked_maps[i])
@@ -356,7 +365,10 @@ class RopeSAMTrainer:
                     prev_mask_logits=prev_logits,
                     output_size=mask_shape,
                 ).detach()
-                self._append_next_clicks(click_lists, not_clicked_maps, single_mask, prev_logits)
+                prev_iou = calc_iou(prev_logits, single_mask)
+                if self.interactive_stop_iou > 0 and bool((prev_iou >= self.interactive_stop_iou).all().item()):
+                    break
+                self._append_next_clicks(click_lists, not_clicked_maps, single_mask, prev_logits, pred_iou=prev_iou)
                 cur_coords, cur_labels = self._click_lists_to_tensors(click_lists, max_clicks, mask_shape)
 
         logits = self.model(
@@ -367,7 +379,8 @@ class RopeSAMTrainer:
             prev_mask_logits=prev_logits,
             output_size=mask_shape,
         )
-        return logits, cur_coords, cur_labels, total_clicks
+        actual_clicks = int((cur_labels >= 0).sum(dim=1).max().item())
+        return logits, cur_coords, cur_labels, actual_clicks
 
     def train(self, num_iters: int, outer_iter: int = 0, resume_iters: int = 0, val_iters: int = 0, log_interval: int = 10):
         if num_iters <= 0:
@@ -726,6 +739,7 @@ def main():
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--max_clicks", type=int, default=10)
     parser.add_argument("--interactive_click_warmup_iters", type=int, default=10000)
+    parser.add_argument("--interactive_stop_iou", type=float, default=0.95)
 
     parser.add_argument("--freeze_image_encoder", action="store_true")
     parser.add_argument("--no_compile", action="store_true")
@@ -795,6 +809,7 @@ def main():
         dtype=dtype,
         find_unused_parameters=not args.disable_find_unused_parameters,
         interactive_click_warmup_iters=args.interactive_click_warmup_iters,
+        interactive_stop_iou=args.interactive_stop_iou,
     )
 
     resume_iters = 0

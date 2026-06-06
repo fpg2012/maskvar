@@ -27,6 +27,7 @@ COMMON_ARGS=(
     --freeze_image_encoder
     --max_clicks 10
     --interactive_click_warmup_iters 3000
+    --interactive_stop_iou 0.95
     --loss nfl
     --dtype bfloat16
     --image_size_encoder 1024
