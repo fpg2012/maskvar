@@ -30,7 +30,7 @@ from .models.simple_mask_ar import SimpleMaskAR, SimpleMaskMaskGIT, SimpleMaskVA
 from .models.simple_mask_ar import SimpleQueryTokenAR
 from .models.simple_mask_vae import SimpleMaskVAEV2
 from .models.simple_mask_diffusion import SimpleMaskLatentDiT
-from .models.rope_sam import RopeSAM
+from .models.rope_sam import PointRopeSAM, RopeSAM
 from .models.dino_wrapper import DinoV3Wrapper
 
 from .datasets.mask_level_dataset import MaskLevelDataset
@@ -1711,6 +1711,122 @@ def build_rope_sam_dim384(
     return model.to(device)
 
 
+def build_rope_sam_point_dim384(
+    checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    max_clicks: int = 10,
+    freeze_loaded_rope_sam: bool = True,
+    use_point_head: bool = False,
+) -> PointRopeSAM:
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    model = PointRopeSAM(
+        image_encoder=image_encoder,
+        dim=384,
+        h=64,
+        w=64,
+        num_heads=4,
+        max_clicks=max_clicks,
+        num_points=64 * 64,
+        use_point_head=use_point_head,
+        device=device,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        state_dict = _remap_rope_sam_to_point_rope_sam_state_dict(state_dict)
+        model_state = model.state_dict()
+        compatible_state = {
+            k: v for k, v in state_dict.items()
+            if k in model_state and tuple(v.shape) == tuple(model_state[k].shape)
+        }
+        skipped = len(state_dict) - len(compatible_state)
+        model.load_state_dict(compatible_state, strict=False)
+        print(f"Loaded PointRopeSAM checkpoint from {checkpoint_path}")
+        if skipped:
+            print(f"  Skipped incompatible keys: {skipped}")
+        if freeze_loaded_rope_sam:
+            freeze_keys = _rope_sam_origin_parameter_keys(compatible_state.keys())
+            _freeze_loaded_parameters(model, freeze_keys)
+            frozen = sum(
+                p.numel() for name, p in model.named_parameters()
+                if name in freeze_keys and not p.requires_grad
+            )
+            print(f"  Frozen loaded RopeSAM parameters: {frozen:,}")
+
+    return model.to(device)
+
+
+def build_rope_sam_point_head_dim384(
+    checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    max_clicks: int = 10,
+) -> PointRopeSAM:
+    return build_rope_sam_point_dim384(
+        checkpoint_path=checkpoint_path,
+        image_encoder_checkpoint=image_encoder_checkpoint,
+        image_encoder_config_name=image_encoder_config_name,
+        device=device,
+        max_clicks=max_clicks,
+        freeze_loaded_rope_sam=True,
+        use_point_head=True,
+    )
+
+
+def _remap_rope_sam_to_point_rope_sam_state_dict(state_dict):
+    remapped = dict(state_dict)
+    for key, value in state_dict.items():
+        if not key.startswith('mask_decoder.two_way_blocks.'):
+            continue
+        parts = key.split('.')
+        if len(parts) < 5:
+            continue
+        block_name = parts[3]
+        suffix = '.'.join(parts[4:])
+        if block_name == 'block1':
+            new_key = '.'.join(parts[:3] + ['query_to_points'] + [suffix])
+        elif block_name == 'reverse_block1':
+            new_key = '.'.join(parts[:3] + ['points_to_query'] + [suffix])
+        else:
+            continue
+        remapped.setdefault(new_key, value)
+    return remapped
+
+
+def _freeze_loaded_parameters(model, loaded_keys):
+    parameters = dict(model.named_parameters())
+    for key in loaded_keys:
+        if key in parameters:
+            parameters[key].requires_grad = False
+
+
+def _rope_sam_origin_parameter_keys(keys):
+    frozen_prefixes = (
+        'image_encoder.',
+        'click_encoder.',
+        'prev_mask_encoder.',
+        'seg_token',
+    )
+    frozen_substrings = (
+        '.query_to_points.',
+        '.points_to_query.',
+    )
+    return {
+        key for key in keys
+        if key.startswith(frozen_prefixes) or any(substring in key for substring in frozen_substrings)
+    }
+
+
 def build_simple_mask_var(
     checkpoint_path: Optional[str] = None,
     device: str = 'cpu',
@@ -2119,6 +2235,8 @@ builder_map = {
     },
     "rope_sam": {
         "rope_sam_dim384": build_rope_sam_dim384,
+        "rope_sam_point_dim384": build_rope_sam_point_dim384,
+        "rope_sam_point_head_dim384": build_rope_sam_point_head_dim384,
     },
     "dataset": {
         "cocolvis": build_cocolvis_dataset,

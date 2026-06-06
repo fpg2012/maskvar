@@ -638,8 +638,8 @@ def build_datasets(args, device: str, rank: int):
     common_dataset_kwargs = {
         "mask_filter_thresh": 0.1,
         "dtype": torch.float32,
-        "image_size_encoder": 1024,
-        "image_size_mask": 1024,
+        "image_size_encoder": args.image_size_encoder,
+        "image_size_mask": args.image_size_mask,
     }
 
     train_cls = MaskLevelFlatSubsetDataset if args.train_subset_index else MaskLevelFlatDataset
@@ -674,8 +674,8 @@ def build_datasets(args, device: str, rank: int):
             mask_filter_thresh=0.1,
             seed=42 + rank,
             count=20,
-            image_size_encoder=1024,
-            image_size_mask=1024,
+            image_size_encoder=args.image_size_encoder,
+            image_size_mask=args.image_size_mask,
         )
         val_set = MaskLevelDatasetDummy(
             dataset=val_set_base,
@@ -684,8 +684,8 @@ def build_datasets(args, device: str, rank: int):
             mask_filter_thresh=0.1,
             seed=100 + rank,
             count=5,
-            image_size_encoder=1024,
-            image_size_mask=1024,
+            image_size_encoder=args.image_size_encoder,
+            image_size_mask=args.image_size_mask,
         )
         train_set.is_dummy = True
         val_set.is_dummy = True
@@ -714,6 +714,8 @@ def main():
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--loss", default="nfl", type=str)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float16", "float32", "bfloat16"])
+    parser.add_argument("--image_size_encoder", type=int, default=1024)
+    parser.add_argument("--image_size_mask", type=int, default=1024)
 
     parser.add_argument("--config", type=str, default="rope_sam_dim384", choices=sorted(builder_map["rope_sam"].keys()))
     parser.add_argument("--image_encoder_config", type=str, default="dino_v3_vits", choices=sorted(builder_map["image_encoder"].keys()))

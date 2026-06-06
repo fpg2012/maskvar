@@ -1,4 +1,4 @@
 from .click_encoder import RopeClickEncoder
-from .rope_sam import RopeSAM
+from .rope_sam import PointRopeSAM, RopeSAM
 
-__all__ = ["RopeClickEncoder", "RopeSAM"]
+__all__ = ["PointRopeSAM", "RopeClickEncoder", "RopeSAM"]
