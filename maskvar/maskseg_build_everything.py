@@ -1719,6 +1719,13 @@ def build_rope_sam_point_dim384(
     max_clicks: int = 10,
     freeze_loaded_rope_sam: bool = True,
     use_point_head: bool = False,
+    num_points: Optional[int] = None,
+    point_rend_coarse_size: int = 16,
+    point_rend_max_size: int = 256,
+    point_sampling_space: str = "feature",
+    click_point_radius: float = 2.0,
+    click_point_grid_size: int = 5,
+    ignore_padding_in_sampling: bool = True,
 ) -> PointRopeSAM:
     image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
     model = PointRopeSAM(
@@ -1728,7 +1735,13 @@ def build_rope_sam_point_dim384(
         w=64,
         num_heads=4,
         max_clicks=max_clicks,
-        num_points=64 * 64,
+        num_points=num_points or 64 * 64,
+        point_rend_coarse_size=point_rend_coarse_size,
+        point_rend_max_size=point_rend_max_size,
+        point_sampling_space=point_sampling_space,
+        click_point_radius=click_point_radius,
+        click_point_grid_size=click_point_grid_size,
+        ignore_padding_in_sampling=ignore_padding_in_sampling,
         use_point_head=use_point_head,
         device=device,
     )
@@ -1771,6 +1784,13 @@ def build_rope_sam_point_head_dim384(
     image_encoder_config_name: Optional[str] = 'dino_v3_vits',
     device: str = 'cpu',
     max_clicks: int = 10,
+    num_points: Optional[int] = None,
+    point_rend_coarse_size: int = 16,
+    point_rend_max_size: int = 256,
+    point_sampling_space: str = "feature",
+    click_point_radius: float = 2.0,
+    click_point_grid_size: int = 5,
+    ignore_padding_in_sampling: bool = True,
 ) -> PointRopeSAM:
     return build_rope_sam_point_dim384(
         checkpoint_path=checkpoint_path,
@@ -1780,6 +1800,13 @@ def build_rope_sam_point_head_dim384(
         max_clicks=max_clicks,
         freeze_loaded_rope_sam=True,
         use_point_head=True,
+        num_points=num_points,
+        point_rend_coarse_size=point_rend_coarse_size,
+        point_rend_max_size=point_rend_max_size,
+        point_sampling_space=point_sampling_space,
+        click_point_radius=click_point_radius,
+        click_point_grid_size=click_point_grid_size,
+        ignore_padding_in_sampling=ignore_padding_in_sampling,
     )
 
 
@@ -1817,13 +1844,9 @@ def _rope_sam_origin_parameter_keys(keys):
         'prev_mask_encoder.',
         'seg_token',
     )
-    frozen_substrings = (
-        '.query_to_points.',
-        '.points_to_query.',
-    )
     return {
         key for key in keys
-        if key.startswith(frozen_prefixes) or any(substring in key for substring in frozen_substrings)
+        if key.startswith(frozen_prefixes)
     }
 
 

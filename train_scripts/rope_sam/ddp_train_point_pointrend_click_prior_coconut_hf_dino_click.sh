@@ -1,13 +1,15 @@
 #!/bin/bash
-# Train PointRopeSAM on COCONut HF dataset with DINO v3 image features and click prompts.
+# Fine-tune PointRopeSAM with PointRend-style point sampling and click-neighborhood priors.
+#
+# Defaults to the 1-epoch uniform-grid PointRopeSAM checkpoint.
 #
 # Usage:
-#   bash train_scripts/rope_sam/ddp_train_point_coconut_hf_dino_click.sh [N_NODE] [OUTDIR] [MASTER_PORT] [INIT_CKPT]
+#   bash train_scripts/rope_sam/ddp_train_point_pointrend_click_prior_coconut_hf_dino_click.sh [N_NODE] [OUTDIR] [MASTER_PORT] [INIT_CKPT]
 
 N_NODE=${1:-4}
-OUTDIR=${2:-out/ddp_rope_sam_point_coconut_hf_dino_click}
+OUTDIR=${2:-out/ddp_rope_sam_point_pointrend_click_prior_coconut_hf_dino_click}
 export MASTER_PORT=${3:-29500}
-INIT_CKPT=${4:-}
+INIT_CKPT=${4:-out/ddp_rope_sam_point_head_uniform_coconut_hf_dino_click/checkpoints/latest.pth}
 export OMP_NUM_THREADS=4
 
 COMMON_ARGS=(
@@ -52,5 +54,6 @@ if [ "$N_NODE" -eq 0 ]; then
     python train_scripts/train_rope_sam.py "${COMMON_ARGS[@]}" --no_compile
 else
     torchrun --nproc_per_node="$N_NODE" train_scripts/train_rope_sam.py \
-        "${COMMON_ARGS[@]}"
+        "${COMMON_ARGS[@]}" \
+        --no_compile
 fi

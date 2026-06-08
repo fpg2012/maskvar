@@ -153,6 +153,8 @@ class RopeSAMTrainer:
         find_unused_parameters: bool = True,
         interactive_click_warmup_iters: int = 10000,
         interactive_stop_iou: float = 0.95,
+        interactive_click_on_coarse_mask: bool = False,
+        click_count_bias_power: float = 1.0,
     ):
         self.model = model
         self.device = device
@@ -163,6 +165,8 @@ class RopeSAMTrainer:
         self.global_step = 0
         self.interactive_click_warmup_iters = interactive_click_warmup_iters
         self.interactive_stop_iou = interactive_stop_iou
+        self.interactive_click_on_coarse_mask = interactive_click_on_coarse_mask
+        self.click_count_bias_power = click_count_bias_power
 
         if tdist.is_initialized():
             self.rank = tdist.get_rank()
@@ -263,36 +267,36 @@ class RopeSAMTrainer:
             click_labels.to(self.device, non_blocking=True),
         )
 
-    def _click_tensors_to_lists(self, click_coords, click_labels, mask_shape):
-        mask_h, mask_w = mask_shape
+    def _click_tensors_to_lists(self, click_coords, click_labels, output_shape):
+        output_h, output_w = output_shape
         coords_cpu = click_coords.detach().float().cpu().numpy()
         labels_cpu = click_labels.detach().cpu().numpy()
         click_lists = []
         not_clicked_maps = []
         for sample_coords, sample_labels in zip(coords_cpu, labels_cpu):
             click_list = []
-            not_clicked = np.ones((mask_h, mask_w), dtype=bool)
+            not_clicked = np.ones((output_h, output_w), dtype=bool)
             for coord, label in zip(sample_coords, sample_labels):
                 label = int(label)
                 if label < 0:
                     continue
-                y = int(np.clip(round(float(coord[0]) * mask_h / 64.0), 0, mask_h - 1))
-                x = int(np.clip(round(float(coord[1]) * mask_w / 64.0), 0, mask_w - 1))
+                y = int(np.clip(round(float(coord[0]) * output_h / 64.0), 0, output_h - 1))
+                x = int(np.clip(round(float(coord[1]) * output_w / 64.0), 0, output_w - 1))
                 click_list.append((y, x, label))
                 not_clicked[y, x] = False
             click_lists.append(click_list)
             not_clicked_maps.append(not_clicked)
         return click_lists, not_clicked_maps
 
-    def _click_lists_to_tensors(self, click_lists, max_clicks: int, mask_shape):
-        mask_h, mask_w = mask_shape
+    def _click_lists_to_tensors(self, click_lists, max_clicks: int, output_shape):
+        output_h, output_w = output_shape
         point_coords = []
         point_labels = []
         for click_list in click_lists:
             coords_xy, labels = to_sam_format(click_list, pad_size=max_clicks)
             click_coords = torch.empty_like(coords_xy, dtype=torch.float32)
-            click_coords[..., 0] = coords_xy[..., 1] * (64.0 / mask_h)
-            click_coords[..., 1] = coords_xy[..., 0] * (64.0 / mask_w)
+            click_coords[..., 0] = coords_xy[..., 1] * (64.0 / output_h)
+            click_coords[..., 1] = coords_xy[..., 0] * (64.0 / output_w)
             click_coords = click_coords.clamp_min(0)
             click_coords[..., 0].clamp_(max=63)
             click_coords[..., 1].clamp_(max=63)
@@ -346,10 +350,20 @@ class RopeSAMTrainer:
         progress = min(1.0, float(self.global_step) / float(self.interactive_click_warmup_iters))
         return max(1, min(max_clicks, 1 + int(progress * (max_clicks - 1))))
 
+    def _sample_total_clicks(self, current_max_clicks: int) -> int:
+        if current_max_clicks <= 1:
+            return 1
+        if self.click_count_bias_power <= 1.0:
+            return int(np.random.randint(1, current_max_clicks + 1))
+        counts = np.arange(1, current_max_clicks + 1, dtype=np.float64)
+        weights = 1.0 / np.power(counts, self.click_count_bias_power)
+        weights = weights / weights.sum()
+        return int(np.random.choice(counts.astype(np.int64), p=weights))
+
     def interactive_forward(self, image, image_embedding, single_mask, click_coords, click_labels):
         max_clicks = click_labels.shape[1]
         current_max_clicks = min(max_clicks, self._current_max_clicks())
-        total_clicks = int(np.random.randint(1, current_max_clicks + 1))
+        total_clicks = self._sample_total_clicks(current_max_clicks)
         mask_shape = single_mask.shape[-2:]
         click_lists, not_clicked_maps = self._click_tensors_to_lists(click_coords, click_labels, mask_shape)
 
@@ -357,18 +371,30 @@ class RopeSAMTrainer:
         cur_coords, cur_labels = click_coords, click_labels
         for _ in range(1, total_clicks):
             with torch.no_grad():
-                prev_logits = self.model(
-                    image=image,
-                    image_embedding=image_embedding,
-                    click_coords=cur_coords,
-                    click_labels=cur_labels,
-                    prev_mask_logits=prev_logits,
-                    output_size=mask_shape,
-                ).detach()
-                prev_iou = calc_iou(prev_logits, single_mask)
+                forward_kwargs = {
+                    "image": image,
+                    "image_embedding": image_embedding,
+                    "click_coords": cur_coords,
+                    "click_labels": cur_labels,
+                    "prev_mask_logits": prev_logits,
+                    "output_size": mask_shape,
+                }
+                if self.interactive_click_on_coarse_mask:
+                    forward_kwargs["return_coarse_logits"] = True
+                prev_logits = self.model(**forward_kwargs)
+                if self.interactive_click_on_coarse_mask:
+                    prev_logits, coarse_logits = prev_logits
+                    click_logits = coarse_logits.detach()
+                    prev_logits = prev_logits.detach()
+                else:
+                    prev_logits = prev_logits.detach()
+                    click_logits = prev_logits
+                if click_logits.shape[-2:] != mask_shape:
+                    click_logits = torch.nn.functional.interpolate(click_logits, size=mask_shape, mode="bilinear", align_corners=False)
+                prev_iou = calc_iou(click_logits, single_mask)
                 if self.interactive_stop_iou > 0 and bool((prev_iou >= self.interactive_stop_iou).all().item()):
                     break
-                self._append_next_clicks(click_lists, not_clicked_maps, single_mask, prev_logits, pred_iou=prev_iou)
+                self._append_next_clicks(click_lists, not_clicked_maps, single_mask, click_logits, pred_iou=prev_iou)
                 cur_coords, cur_labels = self._click_lists_to_tensors(click_lists, max_clicks, mask_shape)
 
         logits = self.model(
@@ -733,6 +759,13 @@ def main():
     parser.add_argument("--config", type=str, default="rope_sam_dim384", choices=sorted(builder_map["rope_sam"].keys()))
     parser.add_argument("--image_encoder_config", type=str, default="dino_v3_vits", choices=sorted(builder_map["image_encoder"].keys()))
     parser.add_argument("--image_encoder_checkpoint", type=str, default=None)
+    parser.add_argument("--point_sampling_strategy", type=str, default=None, choices=["uniform", "edge", "pointrend"])
+    parser.add_argument("--num_points", type=int, default=None)
+    parser.add_argument("--point_rend_coarse_size", type=int, default=16)
+    parser.add_argument("--point_rend_max_size", type=int, default=256)
+    parser.add_argument("--point_sampling_space", type=str, default="feature", choices=["feature", "output"])
+    parser.add_argument("--click_point_radius", type=float, default=2.0)
+    parser.add_argument("--click_point_grid_size", type=int, default=5)
     parser.add_argument("--image_feature_cache_dir", type=str, default="")
     parser.add_argument("--image_feature_cache_max_shard", type=int, default=2)
     parser.add_argument("--checkpoint", type=str, default=None)
@@ -740,6 +773,8 @@ def main():
     parser.add_argument("--max_clicks", type=int, default=10)
     parser.add_argument("--interactive_click_warmup_iters", type=int, default=10000)
     parser.add_argument("--interactive_stop_iou", type=float, default=0.95)
+    parser.add_argument("--interactive_click_on_coarse_mask", action="store_true")
+    parser.add_argument("--click_count_bias_power", type=float, default=1.0)
 
     parser.add_argument("--freeze_image_encoder", action="store_true")
     parser.add_argument("--no_compile", action="store_true")
@@ -767,13 +802,27 @@ def main():
     train_set, val_set = build_datasets(args, device=device, rank=rank)
 
     checkpoint_to_use = args.checkpoint or args.resume_from
-    model = builder_map["rope_sam"][args.config](
-        checkpoint_path=checkpoint_to_use if checkpoint_to_use and os.path.exists(checkpoint_to_use) else None,
-        image_encoder_checkpoint=args.image_encoder_checkpoint,
-        image_encoder_config_name=args.image_encoder_config,
-        max_clicks=args.max_clicks,
-        device=device,
-    )
+    model_kwargs = {
+        "checkpoint_path": checkpoint_to_use if checkpoint_to_use and os.path.exists(checkpoint_to_use) else None,
+        "image_encoder_checkpoint": args.image_encoder_checkpoint,
+        "image_encoder_config_name": args.image_encoder_config,
+        "max_clicks": args.max_clicks,
+        "device": device,
+    }
+    if args.config.startswith("rope_sam_point"):
+        model_kwargs.update({
+            "num_points": args.num_points,
+            "point_rend_coarse_size": args.point_rend_coarse_size,
+            "point_rend_max_size": args.point_rend_max_size,
+            "point_sampling_space": args.point_sampling_space,
+            "click_point_radius": args.click_point_radius,
+            "click_point_grid_size": args.click_point_grid_size,
+        })
+    model = builder_map["rope_sam"][args.config](**model_kwargs)
+    if args.point_sampling_strategy is not None and hasattr(model, "sampling_strategy"):
+        model.sampling_strategy = args.point_sampling_strategy
+        if rank == 0:
+            print(f"Point sampling strategy: {args.point_sampling_strategy}")
 
     if args.image_feature_cache_dir:
         args.freeze_image_encoder = True
@@ -810,6 +859,8 @@ def main():
         find_unused_parameters=not args.disable_find_unused_parameters,
         interactive_click_warmup_iters=args.interactive_click_warmup_iters,
         interactive_stop_iou=args.interactive_stop_iou,
+        interactive_click_on_coarse_mask=args.interactive_click_on_coarse_mask,
+        click_count_bias_power=args.click_count_bias_power,
     )
 
     resume_iters = 0

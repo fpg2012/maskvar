@@ -265,7 +265,13 @@ class PointRopeSAM(RopeSAM):
         num_points: int | None = None,
         density_floor: float = 0.05,
         sampling_strategy: str = "uniform",
-        interpolation_k: int = 8,
+        point_rend_coarse_size: int = 16,
+        point_rend_max_size: int = 256,
+        point_sampling_space: str = "feature",
+        click_point_radius: float = 2.0,
+        click_point_grid_size: int = 5,
+        ignore_padding_in_sampling: bool = True,
+        interpolation_k: int = 4,
         interpolation_power: float = 2.0,
         interpolation_chunk_size: int = 1024,
         use_point_head: bool = False,
@@ -286,6 +292,14 @@ class PointRopeSAM(RopeSAM):
         self.num_points = num_points or h * w
         self.density_floor = density_floor
         self.sampling_strategy = sampling_strategy
+        self.point_rend_coarse_size = point_rend_coarse_size
+        self.point_rend_max_size = point_rend_max_size
+        if point_sampling_space not in {"feature", "output"}:
+            raise ValueError(f"Unknown point sampling space: {point_sampling_space}")
+        self.point_sampling_space = point_sampling_space
+        self.click_point_radius = click_point_radius
+        self.click_point_grid_size = click_point_grid_size
+        self.ignore_padding_in_sampling = ignore_padding_in_sampling
         self.interpolation_k = interpolation_k
         self.interpolation_power = interpolation_power
         self.interpolation_chunk_size = interpolation_chunk_size
@@ -334,69 +348,526 @@ class PointRopeSAM(RopeSAM):
         output_size: tuple[int, int] | None = None,
         image_embedding: torch.Tensor | None = None,
         point_coords: torch.Tensor | None = None,
+        return_coarse_logits: bool = False,
     ) -> torch.Tensor:
         if image_embedding is None:
             image_features = self.encode_image(image)
         else:
             image_features = self.encode_image_embedding(image_embedding)
 
-        if point_coords is None:
-            point_coords = self.sample_point_coords(image)
-        else:
-            point_coords = point_coords.to(device=image_features.device, dtype=torch.float32)
-        point_tokens = sample_feature_points(image_features, point_coords, self.h, self.w)
-
         prev_mask_features = self.encode_prev_mask(prev_mask_logits, image_features.shape[-2:])
-        if prev_mask_features is not None:
-            point_tokens = point_tokens + sample_feature_points(prev_mask_features, point_coords, self.h, self.w).to(point_tokens.dtype)
-
         query_tokens = self.encode_clicks(click_coords, click_labels)
-        point_logits = self.mask_decoder(query_tokens, point_tokens, point_coords)
 
         if output_size is None:
             output_size = image.shape[-2:]
-        return knn_interpolate_point_logits(
+        point_coord_size = output_size if self.point_sampling_space == "output" else (self.h, self.w)
+        if point_coords is None and self.sampling_strategy == "pointrend":
+            if self.ignore_padding_in_sampling:
+                valid_mask = torch.ones(image.shape[0], point_coord_size[0], point_coord_size[1], device=image.device, dtype=torch.bool)
+            else:
+                valid_mask = self.valid_coord_mask(image, point_coord_size)
+            logits = self.pointrend_refine_logits(
+                image_features=image_features,
+                query_tokens=query_tokens,
+                valid_mask=valid_mask,
+                coord_size=point_coord_size,
+                output_size=output_size,
+                prev_mask_features=prev_mask_features,
+            )
+            if not return_coarse_logits:
+                return logits
+            coarse_logits = F.interpolate(logits.float(), size=(self.h, self.w), mode="bilinear", align_corners=False)
+            return logits, coarse_logits.to(dtype=logits.dtype)
+
+        if point_coords is None:
+            with torch.no_grad():
+                point_coords_for_interp = self.sample_point_coords(
+                    image=image,
+                    image_features=image_features,
+                    query_tokens=query_tokens,
+                    prev_mask_features=prev_mask_features,
+                    click_coords=click_coords,
+                    click_labels=click_labels,
+                    coord_size=point_coord_size,
+                )
+        else:
+            point_coords_for_interp = point_coords.to(device=image_features.device, dtype=torch.float32)
+        point_coords = self.scale_point_coords(point_coords_for_interp, point_coord_size, (self.h, self.w))
+        point_tokens = sample_feature_points(image_features, point_coords, self.h, self.w)
+
+        if prev_mask_features is not None:
+            point_tokens = point_tokens + sample_feature_points(prev_mask_features, point_coords, self.h, self.w).to(point_tokens.dtype)
+
+        point_logits = self.mask_decoder(query_tokens, point_tokens, point_coords)
+
+        logits = knn_interpolate_point_logits(
             point_logits=point_logits,
-            point_coords=point_coords,
+            point_coords=point_coords_for_interp,
             output_size=output_size,
-            coord_h=self.h,
-            coord_w=self.w,
+            coord_h=point_coord_size[0],
+            coord_w=point_coord_size[1],
             k=self.interpolation_k,
             power=self.interpolation_power,
             chunk_size=self.interpolation_chunk_size,
         )
+        if not return_coarse_logits:
+            return logits
+        coarse_logits = knn_interpolate_point_logits(
+            point_logits=point_logits,
+            point_coords=point_coords_for_interp,
+            output_size=(self.h, self.w),
+            coord_h=point_coord_size[0],
+            coord_w=point_coord_size[1],
+            k=self.interpolation_k,
+            power=self.interpolation_power,
+            chunk_size=self.interpolation_chunk_size,
+        )
+        return logits, coarse_logits
 
     @torch.no_grad()
-    def sample_point_coords(self, image: torch.Tensor) -> torch.Tensor:
+    def sample_point_coords(
+        self,
+        image: torch.Tensor,
+        image_features: torch.Tensor | None = None,
+        query_tokens: torch.Tensor | None = None,
+        prev_mask_features: torch.Tensor | None = None,
+        click_coords: torch.Tensor | None = None,
+        click_labels: torch.Tensor | None = None,
+        coord_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        coord_size = coord_size or (self.h, self.w)
+        if self.ignore_padding_in_sampling:
+            valid_mask = torch.ones(image.shape[0], coord_size[0], coord_size[1], device=image.device, dtype=torch.bool)
+        else:
+            valid_mask = self.valid_coord_mask(image, coord_size)
         if self.sampling_strategy == "uniform":
-            return self.uniform_point_coords(image.shape[0], image.device)
+            return self.uniform_point_coords(valid_mask)
+        if self.sampling_strategy == "pointrend":
+            if image_features is None or query_tokens is None:
+                return self.grid_coords_for_size(valid_mask, self.point_rend_coarse_size, max_points=self.num_points)
+            return self.pointrend_point_coords(
+                image_features=image_features,
+                query_tokens=query_tokens,
+                valid_mask=valid_mask,
+                prev_mask_features=prev_mask_features,
+                click_coords=click_coords,
+                click_labels=click_labels,
+                coord_size=coord_size,
+            )
         if self.sampling_strategy != "edge":
             raise ValueError(f"Unknown point sampling strategy: {self.sampling_strategy}")
         density = self.edge_density(image)
+        valid_pixel_mask = self.valid_pixel_mask(image)
+        density = density * valid_pixel_mask.to(density.dtype)
         b, _, h, w = density.shape
         probs = density.flatten(1)
+        fallback = probs.sum(dim=1, keepdim=True) <= 1e-6
+        if fallback.any():
+            probs = torch.where(fallback, valid_pixel_mask.flatten(1).to(probs.dtype), probs)
         probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-6)
         sample_count = min(self.num_points, probs.shape[1])
-        indices = torch.multinomial(probs, num_samples=sample_count, replacement=False)
+        replacement = sample_count > (probs > 0).sum(dim=1).amin().item()
+        indices = torch.multinomial(probs, num_samples=sample_count, replacement=replacement)
 
         rows = (indices // w).to(torch.float32)
         cols = (indices % w).to(torch.float32)
         if self.training:
             rows = rows + torch.rand_like(rows) - 0.5
             cols = cols + torch.rand_like(cols) - 0.5
-        rows = rows.clamp(0, h - 1) * ((self.h - 1) / max(h - 1, 1))
-        cols = cols.clamp(0, w - 1) * ((self.w - 1) / max(w - 1, 1))
+        rows = rows.clamp(0, h - 1) * ((coord_size[0] - 1) / max(h - 1, 1))
+        cols = cols.clamp(0, w - 1) * ((coord_size[1] - 1) / max(w - 1, 1))
         return torch.stack([rows, cols], dim=-1)
 
     @torch.no_grad()
-    def uniform_point_coords(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        rows = torch.arange(self.h, device=device, dtype=torch.float32)
-        cols = torch.arange(self.w, device=device, dtype=torch.float32)
+    def uniform_point_coords(self, valid_mask: torch.Tensor) -> torch.Tensor:
+        return self.select_valid_coords(valid_mask, self.num_points, mode="uniform")
+
+    @torch.no_grad()
+    def coarse_point_coords(self, valid_mask: torch.Tensor, num_points: int) -> torch.Tensor:
+        return self.select_valid_coords(valid_mask, num_points, mode="linspace")
+
+    @torch.no_grad()
+    def pointrend_point_coords(
+        self,
+        image_features: torch.Tensor,
+        query_tokens: torch.Tensor,
+        valid_mask: torch.Tensor,
+        prev_mask_features: torch.Tensor | None = None,
+        click_coords: torch.Tensor | None = None,
+        click_labels: torch.Tensor | None = None,
+        coord_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        coord_size = coord_size or (self.h, self.w)
+        max_refine_size = coord_size if self.point_sampling_space == "output" else (self.point_rend_max_size, self.point_rend_max_size)
+        coarse_size = (
+            max(1, min(self.point_rend_coarse_size, max_refine_size[0])),
+            max(1, min(self.point_rend_coarse_size, max_refine_size[1])),
+        )
+        coords = self.grid_coords_for_size(valid_mask, coarse_size, max_points=self.num_points)
+        click_coords_to_add = self.click_neighborhood_coords(click_coords, click_labels, valid_mask, coord_size=coord_size)
+        if click_coords_to_add is not None:
+            coords = self.merge_point_coords(coords, click_coords_to_add)
+            coords = coords[:, : self.num_points]
+        current_size = coarse_size
+
+        while coords.shape[1] < self.num_points and current_size != max_refine_size:
+            feature_coords = self.scale_point_coords(coords, coord_size, (self.h, self.w))
+            point_tokens = sample_feature_points(image_features, feature_coords, self.h, self.w)
+            if prev_mask_features is not None:
+                point_tokens = point_tokens + sample_feature_points(prev_mask_features, feature_coords, self.h, self.w).to(point_tokens.dtype)
+            point_logits = self.mask_decoder(query_tokens, point_tokens, feature_coords)
+            dense_logits = knn_interpolate_point_logits(
+                point_logits=point_logits,
+                point_coords=coords,
+                output_size=coord_size,
+                coord_h=coord_size[0],
+                coord_w=coord_size[1],
+                k=min(self.interpolation_k, coords.shape[1]),
+                power=self.interpolation_power,
+                chunk_size=self.interpolation_chunk_size,
+            )[:, 0]
+
+            next_size = (
+                min(current_size[0] * 2, max_refine_size[0]),
+                min(current_size[1] * 2, max_refine_size[1]),
+            )
+            candidate_coords = self.grid_coords_for_size(valid_mask, next_size)
+            add_budget = min(coords.shape[1], candidate_coords.shape[1], self.num_points - coords.shape[1])
+            new_coords = self.select_uncertain_new_coords(
+                dense_logits=dense_logits,
+                current_coords=coords,
+                candidate_coords=candidate_coords,
+                valid_mask=valid_mask,
+                count=add_budget,
+            )
+            coords = self.merge_point_coords(coords, new_coords)
+            current_size = next_size
+
+        return coords[:, : self.num_points]
+
+    def pointrend_refine_logits(
+        self,
+        image_features: torch.Tensor,
+        query_tokens: torch.Tensor,
+        valid_mask: torch.Tensor,
+        coord_size: tuple[int, int],
+        output_size: tuple[int, int],
+        prev_mask_features: torch.Tensor | None = None,
+        return_point_coords: bool = False,
+    ) -> torch.Tensor:
+        max_refine_size = coord_size if self.point_sampling_space == "output" else (self.point_rend_max_size, self.point_rend_max_size)
+        current_size = (
+            max(1, min(self.point_rend_coarse_size, max_refine_size[0])),
+            max(1, min(self.point_rend_coarse_size, max_refine_size[1])),
+        )
+        coords = self.grid_coords_for_size(valid_mask, current_size)
+        point_logits = self.decode_point_logits(
+            image_features=image_features,
+            query_tokens=query_tokens,
+            point_coords=coords,
+            coord_size=coord_size,
+            prev_mask_features=prev_mask_features,
+        )
+        if coords.shape[1] != current_size[0] * current_size[1]:
+            logits = knn_interpolate_point_logits(
+                point_logits=point_logits,
+                point_coords=coords,
+                output_size=output_size,
+                coord_h=coord_size[0],
+                coord_w=coord_size[1],
+                k=self.interpolation_k,
+                power=self.interpolation_power,
+                chunk_size=self.interpolation_chunk_size,
+            )
+            if return_point_coords:
+                return logits, coords
+            return logits
+        logit_map = point_logits.view(point_logits.shape[0], 1, current_size[0], current_size[1])
+        current_coords = coords
+        point_count = current_coords.shape[1]
+
+        while point_count < self.num_points and current_size != max_refine_size:
+            next_size = (
+                min(current_size[0] * 2, max_refine_size[0]),
+                min(current_size[1] * 2, max_refine_size[1]),
+            )
+            next_logit_map = F.interpolate(logit_map.float(), size=next_size, mode="bilinear", align_corners=False).to(logit_map.dtype)
+            candidate_coords = self.grid_coords_for_size(valid_mask, next_size)
+            add_budget = min(point_count, candidate_coords.shape[1], self.num_points - point_count)
+            with torch.no_grad():
+                dense_logits = F.interpolate(next_logit_map.detach().float(), size=coord_size, mode="bilinear", align_corners=False)[:, 0]
+                new_coords = self.select_uncertain_new_coords(
+                    dense_logits=dense_logits,
+                    current_coords=current_coords,
+                    candidate_coords=candidate_coords,
+                    valid_mask=valid_mask,
+                    count=add_budget,
+                )
+            new_logits = self.decode_point_logits(
+                image_features=image_features,
+                query_tokens=query_tokens,
+                point_coords=new_coords,
+                coord_size=coord_size,
+                prev_mask_features=prev_mask_features,
+            )
+            logit_map = self.scatter_point_logits_to_grid(next_logit_map, new_logits, new_coords, coord_size)
+            current_coords = self.merge_point_coords(current_coords, new_coords)
+            point_count = min(current_coords.shape[1], self.num_points)
+            current_size = next_size
+
+        if current_size != output_size:
+            logit_map = F.interpolate(logit_map.float(), size=output_size, mode="bilinear", align_corners=False).to(logit_map.dtype)
+        if return_point_coords:
+            return logit_map.contiguous(), current_coords[:, :point_count]
+        return logit_map.contiguous()
+
+    def decode_point_logits(
+        self,
+        image_features: torch.Tensor,
+        query_tokens: torch.Tensor,
+        point_coords: torch.Tensor,
+        coord_size: tuple[int, int],
+        prev_mask_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        feature_coords = self.scale_point_coords(point_coords, coord_size, (self.h, self.w))
+        point_tokens = sample_feature_points(image_features, feature_coords, self.h, self.w)
+        if prev_mask_features is not None:
+            point_tokens = point_tokens + sample_feature_points(prev_mask_features, feature_coords, self.h, self.w).to(point_tokens.dtype)
+        return self.mask_decoder(query_tokens, point_tokens, feature_coords)
+
+    def scatter_point_logits_to_grid(
+        self,
+        logit_map: torch.Tensor,
+        point_logits: torch.Tensor,
+        point_coords: torch.Tensor,
+        coord_size: tuple[int, int],
+    ) -> torch.Tensor:
+        b, _, grid_h, grid_w = logit_map.shape
+        rows = ((point_coords[..., 0] + 0.5) * (grid_h / coord_size[0]) - 0.5).round().long().clamp(0, grid_h - 1)
+        cols = ((point_coords[..., 1] + 0.5) * (grid_w / coord_size[1]) - 0.5).round().long().clamp(0, grid_w - 1)
+        flat_idx = rows * grid_w + cols
+        flat_logits = logit_map.flatten(2).clone()
+        for sample_idx in range(b):
+            flat_logits[sample_idx, 0, flat_idx[sample_idx]] = point_logits[sample_idx]
+        return flat_logits.view_as(logit_map)
+
+    @torch.no_grad()
+    def scale_point_coords(
+        self,
+        coords: torch.Tensor,
+        from_size: tuple[int, int],
+        to_size: tuple[int, int],
+    ) -> torch.Tensor:
+        if from_size == to_size:
+            return coords
+        scaled = coords.clone()
+        scaled[..., 0] = scaled[..., 0] * ((to_size[0] - 1) / max(from_size[0] - 1, 1))
+        scaled[..., 1] = scaled[..., 1] * ((to_size[1] - 1) / max(from_size[1] - 1, 1))
+        return scaled
+
+    @torch.no_grad()
+    def click_neighborhood_coords(
+        self,
+        click_coords: torch.Tensor | None,
+        click_labels: torch.Tensor | None,
+        valid_mask: torch.Tensor,
+        coord_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor | None:
+        if click_coords is None or click_labels is None or self.click_point_grid_size <= 0:
+            return None
+        coord_size = coord_size or (self.h, self.w)
+        click_coords = click_coords.to(device=valid_mask.device, dtype=torch.float32)
+        click_labels = click_labels.to(device=valid_mask.device)
+        click_coords = self.scale_point_coords(click_coords, (self.h, self.w), coord_size)
+        radius_scale = max(coord_size[0] / self.h, coord_size[1] / self.w)
+        offsets_1d = torch.linspace(
+            -self.click_point_radius * radius_scale,
+            self.click_point_radius * radius_scale,
+            self.click_point_grid_size,
+            device=valid_mask.device,
+            dtype=torch.float32,
+        )
+        off_r, off_c = torch.meshgrid(offsets_1d, offsets_1d, indexing="ij")
+        offsets = torch.stack([off_r.reshape(-1), off_c.reshape(-1)], dim=-1)
+        coords_by_sample = []
+        for sample_clicks, sample_labels, sample_valid in zip(click_coords, click_labels, valid_mask):
+            valid_clicks = sample_clicks[sample_labels >= 0]
+            if valid_clicks.numel() == 0:
+                coords_by_sample.append(torch.empty(0, 2, device=valid_mask.device))
+                continue
+            coords = valid_clicks[:, None, :] + offsets[None, :, :]
+            coords = coords.reshape(-1, 2)
+            coords[:, 0].clamp_(0, coord_size[0] - 1)
+            coords[:, 1].clamp_(0, coord_size[1] - 1)
+            row_idx = coords[:, 0].round().long().clamp(0, coord_size[0] - 1)
+            col_idx = coords[:, 1].round().long().clamp(0, coord_size[1] - 1)
+            coords = coords[sample_valid[row_idx, col_idx]]
+            coords_by_sample.append(coords)
+        max_len = max((coords.shape[0] for coords in coords_by_sample), default=0)
+        if max_len == 0:
+            return None
+        padded = []
+        for coords in coords_by_sample:
+            if coords.shape[0] == 0:
+                coords = coords_by_sample[0][:1].clone() if coords_by_sample[0].shape[0] > 0 else torch.zeros(1, 2, device=valid_mask.device)
+            if coords.shape[0] < max_len:
+                coords = coords.repeat((max_len + coords.shape[0] - 1) // coords.shape[0], 1)[:max_len]
+            padded.append(coords[:max_len])
+        return torch.stack(padded, dim=0)
+
+    @torch.no_grad()
+    def merge_point_coords(self, coords: torch.Tensor, new_coords: torch.Tensor, quant: float = 4.0) -> torch.Tensor:
+        merged = []
+        for sample_coords, sample_new in zip(coords, new_coords):
+            combined = torch.cat([sample_coords, sample_new], dim=0)
+            keys = torch.round(combined * quant).to(torch.long)
+            seen = set()
+            keep = []
+            for idx, key in enumerate(keys.detach().cpu().tolist()):
+                key_tuple = tuple(key)
+                if key_tuple in seen:
+                    continue
+                seen.add(key_tuple)
+                keep.append(idx)
+            unique_idx = torch.tensor(keep, device=combined.device, dtype=torch.long)
+            merged.append(combined[unique_idx])
+        max_len = max(x.shape[0] for x in merged)
+        padded = []
+        for sample_coords in merged:
+            if sample_coords.shape[0] < max_len:
+                repeat = sample_coords.repeat((max_len + sample_coords.shape[0] - 1) // sample_coords.shape[0], 1)
+                sample_coords = repeat[:max_len]
+            padded.append(sample_coords)
+        return torch.stack(padded, dim=0)
+
+    @torch.no_grad()
+    def grid_coords_for_size(
+        self,
+        valid_mask: torch.Tensor,
+        grid_size: int | tuple[int, int],
+        max_points: int | None = None,
+    ) -> torch.Tensor:
+        if isinstance(grid_size, int):
+            grid_h, grid_w = grid_size, grid_size
+        else:
+            grid_h, grid_w = grid_size
+        coord_h, coord_w = valid_mask.shape[-2:]
+        row_step = coord_h / grid_h
+        col_step = coord_w / grid_w
+        rows = (torch.arange(grid_h, device=valid_mask.device, dtype=torch.float32) + 0.5) * row_step - 0.5
+        cols = (torch.arange(grid_w, device=valid_mask.device, dtype=torch.float32) + 0.5) * col_step - 0.5
+        rows = rows.clamp(0, coord_h - 1)
+        cols = cols.clamp(0, coord_w - 1)
         grid_rows, grid_cols = torch.meshgrid(rows, cols, indexing="ij")
-        coords = torch.stack([grid_rows.reshape(-1), grid_cols.reshape(-1)], dim=-1)
-        if coords.shape[0] > self.num_points:
-            coords = coords[: self.num_points]
-        return coords.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+        base_coords = torch.stack([grid_rows.reshape(-1), grid_cols.reshape(-1)], dim=-1)
+        grid_valid_mask = self.valid_mask_for_grid_size(valid_mask, grid_size)
+        coords_by_sample = []
+        for sample_valid in grid_valid_mask:
+            keep = sample_valid.flatten()
+            coords = base_coords[keep]
+            if coords.numel() == 0:
+                coords = base_coords
+            if max_points is not None and coords.shape[0] > max_points:
+                coords = coords[:max_points]
+            coords_by_sample.append(coords)
+
+        max_len = max(coords.shape[0] for coords in coords_by_sample)
+        if max_points is not None:
+            max_len = min(max_len, max_points)
+        padded = []
+        for coords in coords_by_sample:
+            coords = coords[:max_len]
+            if coords.shape[0] < max_len:
+                repeat = coords.repeat((max_len + coords.shape[0] - 1) // coords.shape[0], 1)
+                coords = repeat[:max_len]
+            padded.append(coords)
+        return torch.stack(padded, dim=0)
+
+    @torch.no_grad()
+    def valid_mask_for_grid_size(self, valid_mask: torch.Tensor, grid_size: int) -> torch.Tensor:
+        if isinstance(grid_size, int):
+            grid_size = (grid_size, grid_size)
+        valid = valid_mask.unsqueeze(1).to(torch.float32)
+        return F.interpolate(valid, size=grid_size, mode="nearest")[:, 0].bool()
+
+    @torch.no_grad()
+    def valid_coord_mask(self, image: torch.Tensor, coord_size: tuple[int, int]) -> torch.Tensor:
+        valid = self.valid_pixel_mask(image).to(torch.float32)
+        token_valid = F.interpolate(valid, size=coord_size, mode="area") > 0.01
+        return token_valid[:, 0]
+
+    @torch.no_grad()
+    def select_uncertain_new_coords(
+        self,
+        dense_logits: torch.Tensor,
+        current_coords: torch.Tensor,
+        candidate_coords: torch.Tensor,
+        valid_mask: torch.Tensor,
+        count: int,
+    ) -> torch.Tensor:
+        selected_by_sample = []
+        uncertainty = -dense_logits.abs()
+        for sample_uncertainty, sample_current, sample_candidates, sample_valid in zip(
+            uncertainty, current_coords, candidate_coords, valid_mask
+        ):
+            coord_h, coord_w = sample_valid.shape
+            candidate_rows = sample_candidates[:, 0].round().long().clamp(0, coord_h - 1)
+            candidate_cols = sample_candidates[:, 1].round().long().clamp(0, coord_w - 1)
+            candidate_valid = sample_valid[candidate_rows, candidate_cols]
+
+            occupied = torch.zeros(coord_h, coord_w, device=sample_uncertainty.device, dtype=torch.bool)
+            current_rows = sample_current[:, 0].round().long().clamp(0, coord_h - 1)
+            current_cols = sample_current[:, 1].round().long().clamp(0, coord_w - 1)
+            occupied[current_rows, current_cols] = True
+            candidate_new = ~occupied[candidate_rows, candidate_cols]
+
+            scores = sample_grid_values(sample_uncertainty.unsqueeze(0).unsqueeze(0), sample_candidates.unsqueeze(0), coord_h, coord_w)[0, :, 0]
+            scores = scores.masked_fill(~candidate_valid | ~candidate_new, -torch.inf)
+            if not torch.isfinite(scores).any():
+                scores = torch.zeros_like(scores).masked_fill(~candidate_valid, -torch.inf)
+            top_idx = torch.topk(scores, k=min(count, scores.numel()), largest=True).indices
+            coords = sample_candidates[top_idx]
+            if coords.shape[0] < count:
+                repeat = coords.repeat((count + coords.shape[0] - 1) // coords.shape[0], 1)
+                coords = repeat[:count]
+            selected_by_sample.append(coords)
+        return torch.stack(selected_by_sample, dim=0)
+
+    @torch.no_grad()
+    def valid_pixel_mask(self, image: torch.Tensor) -> torch.Tensor:
+        valid = image.float().abs().sum(dim=1, keepdim=True) > 1e-6
+        if not valid.flatten(1).any(dim=1).all():
+            valid = torch.ones_like(valid)
+        return valid
+
+    @torch.no_grad()
+    def valid_token_mask(self, image: torch.Tensor) -> torch.Tensor:
+        valid = self.valid_pixel_mask(image).to(torch.float32)
+        token_valid = F.interpolate(valid, size=(self.h, self.w), mode="area") > 0.01
+        return token_valid[:, 0]
+
+    @torch.no_grad()
+    def select_valid_coords(self, valid_mask: torch.Tensor, num_points: int, mode: str = "uniform") -> torch.Tensor:
+        coords_by_sample = []
+        coord_h, coord_w = valid_mask.shape[-2:]
+        target_count = min(num_points, coord_h * coord_w)
+        for sample_valid in valid_mask:
+            valid_indices = sample_valid.flatten().nonzero(as_tuple=False).flatten()
+            if valid_indices.numel() == 0:
+                valid_indices = torch.arange(coord_h * coord_w, device=valid_mask.device)
+            if valid_indices.numel() >= target_count:
+                if mode == "linspace" and target_count > 1:
+                    pick = torch.linspace(0, valid_indices.numel() - 1, target_count, device=valid_mask.device).round().long()
+                    selected = valid_indices[pick]
+                else:
+                    selected = valid_indices[:target_count]
+            else:
+                repeats = valid_indices.repeat((target_count + valid_indices.numel() - 1) // valid_indices.numel())
+                selected = repeats[:target_count]
+            rows = (selected // coord_w).to(torch.float32)
+            cols = (selected % coord_w).to(torch.float32)
+            coords_by_sample.append(torch.stack([rows, cols], dim=-1))
+        return torch.stack(coords_by_sample, dim=0)
 
     @torch.no_grad()
     def edge_density(self, image: torch.Tensor) -> torch.Tensor:
@@ -446,6 +917,10 @@ def _apply_rotary_points(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) 
 
 
 def sample_feature_points(features: torch.Tensor, coords: torch.Tensor, coord_h: int, coord_w: int) -> torch.Tensor:
+    return sample_grid_values(features, coords, coord_h, coord_w)
+
+
+def sample_grid_values(features: torch.Tensor, coords: torch.Tensor, coord_h: int, coord_w: int) -> torch.Tensor:
     rows = coords[..., 0]
     cols = coords[..., 1]
     grid_y = rows / max(coord_h - 1, 1) * 2 - 1
@@ -461,11 +936,11 @@ def knn_interpolate_point_logits(
     output_size: tuple[int, int],
     coord_h: int,
     coord_w: int,
-    k: int = 8,
+    k: int = 4,
     power: float = 2.0,
     chunk_size: int = 1024,
 ) -> torch.Tensor:
-    """Interpolate point logits to every output pixel by inverse-distance kNN weighting."""
+    """Interpolate point logits to every output pixel with adaptive Gaussian kNN weighting."""
     b, n = point_logits.shape
     out_h, out_w = output_size
     k = min(k, n)
@@ -483,7 +958,8 @@ def knn_interpolate_point_logits(
         dist2 = delta.square().sum(dim=-1)
         knn_dist2, knn_idx = dist2.topk(k=k, dim=-1, largest=False)
         knn_logits = point_logits_float.gather(1, knn_idx.reshape(b, -1)).view(b, -1, k)
-        weights = (knn_dist2 + 1e-6).pow(-0.5 * power)
+        sigma2 = knn_dist2[..., -1:].clamp_min(1e-6) * max(power, 1e-6)
+        weights = torch.exp(-0.5 * knn_dist2 / sigma2)
         chunk_logits = (knn_logits * weights).sum(dim=-1) / weights.sum(dim=-1).clamp_min(1e-6)
         output_chunks.append(chunk_logits)
 
