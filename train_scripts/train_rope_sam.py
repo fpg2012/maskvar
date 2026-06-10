@@ -771,6 +771,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--max_clicks", type=int, default=10)
+    parser.add_argument("--num_register_tokens", type=int, default=0)
     parser.add_argument("--interactive_click_warmup_iters", type=int, default=10000)
     parser.add_argument("--interactive_stop_iou", type=float, default=0.95)
     parser.add_argument("--interactive_click_on_coarse_mask", action="store_true")
@@ -818,6 +819,8 @@ def main():
             "click_point_radius": args.click_point_radius,
             "click_point_grid_size": args.click_point_grid_size,
         })
+    elif args.config == "rope_sam_no_two_way_dim384":
+        model_kwargs["num_register_tokens"] = args.num_register_tokens
     model = builder_map["rope_sam"][args.config](**model_kwargs)
     if args.point_sampling_strategy is not None and hasattr(model, "sampling_strategy"):
         model.sampling_strategy = args.point_sampling_strategy

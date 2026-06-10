@@ -112,6 +112,115 @@ class RopeSAM(nn.Module):
         return mask_logits
 
 
+class NoImageUpdateTwoWayBlock(nn.Module):
+    """Two cross-attention passes into static image tokens, with no image-token update."""
+
+    def __init__(self, rope: RotaryPositionEmbedding2D, dim: int, num_heads: int):
+        super().__init__()
+        from ..simple_mask_vqvae.basic import SimpleCrossBlock
+
+        self.dim = dim
+        self.block1 = SimpleCrossBlock(rope, dim, num_heads)
+        self.reverse_block1 = SimpleCrossBlock(rope, dim, num_heads)
+
+    def forward(self, query_tokens: torch.Tensor, image_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        query_tokens = self.block1(query_tokens, image_tokens, pe_type="rope")
+        query_tokens = self.reverse_block1(query_tokens, image_tokens, pe_type="rope")
+        return query_tokens, image_tokens
+
+
+class NoImageUpdateMaskDecoder(SimpleMaskDecoderV2):
+    """
+    Dense RopeSAM decoder ablation that preserves SimpleMaskDecoderV2 parameter
+    count but never updates image tokens inside the transformer stack.
+    """
+
+    def __init__(
+        self,
+        rope: RotaryPositionEmbedding2D,
+        dim: int,
+        num_heads: int = 4,
+        num_queries: int = 4,
+        num_two_way_blocks: int = 2,
+        num_register_tokens: int = 0,
+    ):
+        super().__init__(
+            rope=rope,
+            dim=dim,
+            num_heads=num_heads,
+            num_queries=num_queries,
+            num_two_way_blocks=num_two_way_blocks,
+        )
+        self.num_register_tokens = num_register_tokens
+        if num_register_tokens > 0:
+            self.register_tokens = nn.Parameter(torch.randn(1, num_register_tokens, dim))
+        else:
+            self.register_parameter("register_tokens", None)
+        self.two_way_blocks = nn.ModuleList([
+            NoImageUpdateTwoWayBlock(rope=self.rope, dim=dim, num_heads=num_heads)
+            for _ in range(num_two_way_blocks)
+        ])
+
+    def forward(self, query_tokens: torch.Tensor, image_tokens: torch.Tensor):
+        original_query_count = query_tokens.shape[1]
+        if self.register_tokens is not None:
+            register_tokens = self.register_tokens.expand(query_tokens.shape[0], -1, -1)
+            query_tokens = torch.cat([query_tokens, register_tokens], dim=1)
+
+        for blk in self.two_way_blocks:
+            query_tokens, image_tokens = blk(query_tokens, image_tokens)
+
+        query_tokens = query_tokens[:, :original_query_count]
+        image_feature_map = rearrange(image_tokens, 'b h w c -> b c h w')
+        up_query_token = self.hyper_in(query_tokens[:, 0, :])
+        up_image_map = self.output_upscaling(image_feature_map)
+
+        up_query_token = self.layer_norm_post_query(up_query_token)
+        up_image_map = self.layer_norm_post_image(rearrange(up_image_map, 'b c h w -> b h w c'))
+
+        masks = torch.einsum('bc,bhwc->bhw', up_query_token, up_image_map).unsqueeze(1)
+
+        return masks.contiguous()
+
+
+class NoTwoWayRopeSAM(RopeSAM):
+    """
+    RopeSAM ablation where query tokens attend to image tokens repeatedly, while
+    image tokens stay fixed throughout decoder attention.
+    """
+
+    def __init__(
+        self,
+        image_encoder: nn.Module,
+        dim: int = 384,
+        h: int = 64,
+        w: int = 64,
+        num_heads: int = 4,
+        max_clicks: int = 10,
+        num_two_way_blocks: int = 2,
+        num_register_tokens: int = 0,
+        device: str = "cuda",
+    ):
+        super().__init__(
+            image_encoder=image_encoder,
+            dim=dim,
+            h=h,
+            w=w,
+            num_heads=num_heads,
+            max_clicks=max_clicks,
+            num_two_way_blocks=num_two_way_blocks,
+            device=device,
+        )
+        self.mask_decoder = NoImageUpdateMaskDecoder(
+            rope=self.rope,
+            dim=dim,
+            num_heads=num_heads,
+            num_queries=max_clicks + 1,
+            num_two_way_blocks=num_two_way_blocks,
+            num_register_tokens=num_register_tokens,
+        )
+
+
 class PointCrossBlock(nn.Module):
     """Cross-attention from sequence queries to point tokens with continuous RoPE on point keys."""
 
