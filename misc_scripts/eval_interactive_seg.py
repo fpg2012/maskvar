@@ -127,9 +127,17 @@ class InteractiveModel:
 
 
 class SAMInteractiveModel(InteractiveModel):
-    def __init__(self, checkpoint: str, model_type: str = "vit_b"):
+    def __init__(
+        self,
+        checkpoint: str,
+        model_type: str = "vit_b",
+        multimask_first_click: bool = False,
+        multimask_all_clicks: bool = False,
+    ):
         self.name = "sam"
         self.sam = sam_model_registry[model_type](checkpoint=checkpoint)
+        self.multimask_first_click = multimask_first_click
+        self.multimask_all_clicks = multimask_all_clicks
         self.image_embedding_cache: Optional[torch.Tensor] = None
         self.image_cache_key: Optional[int] = None
 
@@ -175,13 +183,17 @@ class SAMInteractiveModel(InteractiveModel):
                 boxes=None,
                 masks=mask_prompt,
             )
-            low_res_masks, _ = self.sam.mask_decoder(
+            multimask_output = self.multimask_all_clicks or (self.multimask_first_click and len(clicks) == 1)
+            low_res_masks, iou_predictions = self.sam.mask_decoder(
                 image_embeddings=image_embeddings[i : i + 1],
                 image_pe=self.sam.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings,
                 dense_prompt_embeddings=dense_embeddings,
-                multimask_output=False,
+                multimask_output=multimask_output,
             )
+            if multimask_output:
+                best_idx = int(iou_predictions[0].argmax().item())
+                low_res_masks = low_res_masks[:, best_idx : best_idx + 1]
             masks.append(
                 F.interpolate(
                     low_res_masks,
@@ -412,6 +424,8 @@ def parse_args():
     parser.add_argument("--sam_checkpoint", type=str, default=None)
     parser.add_argument("--sam_model_type", choices=sorted(sam_model_registry.keys()), default="vit_b")
     parser.add_argument("--sam_no_prev_mask", action="store_true", help="Disable previous-mask feedback for SAM")
+    parser.add_argument("--sam_multimask_first_click", action="store_true", help="Use SAM multimask output on the first click and select by predicted IoU")
+    parser.add_argument("--sam_multimask_all_clicks", action="store_true", help="Use SAM multimask output on every click and select by predicted IoU")
 
     parser.add_argument("--rope_sam_checkpoint", type=str, default=None)
     parser.add_argument("--rope_sam_config", choices=sorted(builder_map["rope_sam"].keys()), default="rope_sam_dim384")
@@ -442,7 +456,17 @@ def main():
 
     jobs = []
     if args.model in ("sam", "both"):
-        jobs.append(("sam", SAMInteractiveModel(args.sam_checkpoint, args.sam_model_type), args.sam_cache_model_name, not args.sam_no_prev_mask))
+        jobs.append((
+            "sam",
+            SAMInteractiveModel(
+                args.sam_checkpoint,
+                args.sam_model_type,
+                multimask_first_click=args.sam_multimask_first_click,
+                multimask_all_clicks=args.sam_multimask_all_clicks,
+            ),
+            args.sam_cache_model_name,
+            not args.sam_no_prev_mask,
+        ))
     if args.model in ("rope_sam", "both"):
         rope_cache_name = args.rope_cache_model_name or args.image_encoder_config
         jobs.append(
