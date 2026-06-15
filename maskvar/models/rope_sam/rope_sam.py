@@ -5,7 +5,7 @@ from einops import rearrange
 
 from ..rope2d import RotaryPositionEmbedding2D
 from ..simple_mask_vqvae.mask_decoder import SimpleMaskDecoderV2
-from ..simple_mask_vqvae.basic import MLP
+from ..simple_mask_vqvae.basic import MLP, SimpleCrossBlock
 from .click_encoder import RopeClickEncoder
 
 
@@ -112,20 +112,54 @@ class RopeSAM(nn.Module):
         return mask_logits
 
 
-class NoImageUpdateTwoWayBlock(nn.Module):
-    """Two cross-attention passes into static image tokens, with no image-token update."""
+class QuerySelfBlock(nn.Module):
+    """Self-attention over query tokens with the same parameter shape as SimpleCrossBlock."""
 
     def __init__(self, rope: RotaryPositionEmbedding2D, dim: int, num_heads: int):
         super().__init__()
-        from ..simple_mask_vqvae.basic import SimpleCrossBlock
-
         self.dim = dim
-        self.block1 = SimpleCrossBlock(rope, dim, num_heads)
-        self.reverse_block1 = SimpleCrossBlock(rope, dim, num_heads)
+        self.linear_q = nn.Linear(dim, dim)
+        self.linear_kv = nn.Linear(dim, dim * 2)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+        self.out_proj = nn.Linear(dim, dim)
+        self.num_heads = num_heads
+        self.layernorm = nn.LayerNorm(dim)
+        if dim % num_heads != 0:
+            raise ValueError("dim must be divisible by num_heads")
+        self.dim_head = dim // num_heads
+
+    def forward(self, query_tokens: torch.Tensor) -> torch.Tensor:
+        q_input = query_tokens
+        q = self.linear_q(query_tokens)
+        kv = self.linear_kv(query_tokens)
+        k, v = kv.chunk(2, dim=-1)
+
+        q = rearrange(q, "b l (nh c) -> b nh l c", nh=self.num_heads, c=self.dim_head)
+        k = rearrange(k, "b l (nh c) -> b nh l c", nh=self.num_heads, c=self.dim_head)
+        v = rearrange(v, "b l (nh c) -> b nh l c", nh=self.num_heads, c=self.dim_head)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = rearrange(out, "b nh l c -> b l (nh c)")
+        out = q_input + self.out_proj(out)
+        out = out + self.ffn(self.layernorm(out))
+        return out
+
+
+class NoImageUpdateTwoWayBlock(nn.Module):
+    """Query self-attention plus query-to-image cross-attention with static image tokens."""
+
+    def __init__(self, rope: RotaryPositionEmbedding2D, dim: int, num_heads: int):
+        super().__init__()
+        self.dim = dim
+        self.query_self_attn = QuerySelfBlock(rope, dim, num_heads)
+        self.block2 = SimpleCrossBlock(rope, dim, num_heads)
 
     def forward(self, query_tokens: torch.Tensor, image_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        query_tokens = self.block1(query_tokens, image_tokens, pe_type="rope")
-        query_tokens = self.reverse_block1(query_tokens, image_tokens, pe_type="rope")
+        query_tokens = self.query_self_attn(query_tokens)
+        query_tokens = self.block2(query_tokens, image_tokens, pe_type="rope")
         return query_tokens, image_tokens
 
 
