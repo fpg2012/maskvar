@@ -30,7 +30,7 @@ from .models.simple_mask_ar import SimpleMaskAR, SimpleMaskMaskGIT, SimpleMaskVA
 from .models.simple_mask_ar import SimpleQueryTokenAR
 from .models.simple_mask_vae import SimpleMaskVAEV2
 from .models.simple_mask_diffusion import SimpleMaskLatentDiT
-from .models.rope_sam import NoTwoWayRopeSAM, PointRopeSAM, RopeSAM
+from .models.rope_sam import LoopRopeSAM, NoTwoWayRopeSAM, PointRopeSAM, RopeSAM
 from .models.dino_wrapper import DinoV3Wrapper
 
 from .datasets.mask_level_dataset import MaskLevelDataset
@@ -1758,6 +1758,55 @@ def build_rope_sam_no_two_way_dim384(
     return model.to(device)
 
 
+def build_rope_sam_loop_dim384(
+    checkpoint_path: Optional[str] = None,
+    image_encoder_checkpoint: Optional[str] = None,
+    image_encoder_config_name: Optional[str] = 'dino_v3_vits',
+    device: str = 'cpu',
+    max_clicks: int = 10,
+    loop_block_index: int = -1,
+    loop_iters: int = 4,
+) -> LoopRopeSAM:
+    image_encoder = builder_map['image_encoder'][image_encoder_config_name](image_encoder_checkpoint)
+    model = LoopRopeSAM(
+        image_encoder=image_encoder,
+        dim=384,
+        h=64,
+        w=64,
+        num_heads=4,
+        max_clicks=max_clicks,
+        loop_block_index=loop_block_index,
+        loop_iters=loop_iters,
+        device=device,
+    )
+
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        else:
+            state_dict = checkpoint
+        if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        model_state = model.state_dict()
+        compatible_state = {
+            k: v for k, v in state_dict.items()
+            if k in model_state and tuple(v.shape) == tuple(model_state[k].shape)
+        }
+        skipped = len(state_dict) - len(compatible_state)
+        missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+        print(f"Loaded LoopRopeSAM checkpoint from {checkpoint_path}")
+        if skipped:
+            print(f"  Skipped incompatible keys: {skipped}")
+        if missing:
+            print(f"  Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"  Unexpected keys: {len(unexpected)}")
+
+    return model.to(device)
+
+
 def build_rope_sam_point_dim384(
     checkpoint_path: Optional[str] = None,
     image_encoder_checkpoint: Optional[str] = None,
@@ -2305,6 +2354,7 @@ builder_map = {
     },
     "rope_sam": {
         "rope_sam_dim384": build_rope_sam_dim384,
+        "rope_sam_loop_dim384": build_rope_sam_loop_dim384,
         "rope_sam_no_two_way_dim384": build_rope_sam_no_two_way_dim384,
         "rope_sam_point_dim384": build_rope_sam_point_dim384,
         "rope_sam_point_head_dim384": build_rope_sam_point_head_dim384,

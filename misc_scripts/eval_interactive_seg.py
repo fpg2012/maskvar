@@ -114,6 +114,9 @@ class InteractiveModel:
     def eval(self):
         raise NotImplementedError
 
+    def reset_batch_cache(self):
+        pass
+
     @torch.no_grad()
     def predict(
         self,
@@ -148,6 +151,10 @@ class SAMInteractiveModel(InteractiveModel):
     def eval(self):
         self.sam.eval()
         return self
+
+    def reset_batch_cache(self):
+        self.image_embedding_cache = None
+        self.image_cache_key = None
 
     @torch.no_grad()
     def _encode_image(self, image: torch.Tensor, image_embedding: Optional[torch.Tensor]) -> torch.Tensor:
@@ -348,6 +355,7 @@ class InteractiveEvaluator:
             gt_mask = gt_mask.to(self.device, non_blocking=True)
             image_embedding = image_embedding.to(self.device, non_blocking=True) if torch.is_tensor(image_embedding) and image_embedding.ndim > 1 else None
             output_size = tuple(gt_mask.shape[-2:])
+            self.model.reset_batch_cache()
             gt_np, click_lists, not_clicked_maps = self._init_click_state(gt_mask, self.deterministic_clicks)
 
             prev_logits = None

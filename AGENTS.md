@@ -14,6 +14,10 @@ this file first when returning to the project.
   when they are normal Python scripts rather than `.ipynb` notebooks.
 - Documentation for design decisions lives under `docs/`.
 
+## Environment
+
+- Use the `var_v2` conda environment for this project.
+
 ## SimpleMaskVqvae Baseline
 
 The baseline `SimpleMaskVqvae` data flow is:

@@ -255,6 +255,97 @@ class NoTwoWayRopeSAM(RopeSAM):
         )
 
 
+class LoopMaskDecoder(SimpleMaskDecoderV2):
+    """
+    RopeSAM decoder variant that reuses one two-way block multiple times.
+
+    By default this loops over the final block, so checkpoints from the normal
+    RopeSAM decoder can initialize the whole module without introducing new
+    block parameters.
+    """
+
+    def __init__(
+        self,
+        rope: RotaryPositionEmbedding2D,
+        dim: int,
+        num_heads: int = 4,
+        num_queries: int = 4,
+        num_two_way_blocks: int = 2,
+        loop_block_index: int = -1,
+        loop_iters: int = 4,
+    ):
+        super().__init__(
+            rope=rope,
+            dim=dim,
+            num_heads=num_heads,
+            num_queries=num_queries,
+            num_two_way_blocks=num_two_way_blocks,
+        )
+        if loop_iters < 1:
+            raise ValueError("loop_iters must be >= 1")
+        if not -num_two_way_blocks <= loop_block_index < num_two_way_blocks:
+            raise ValueError(
+                f"loop_block_index must be in [{-num_two_way_blocks}, {num_two_way_blocks - 1}], "
+                f"got {loop_block_index}"
+            )
+        self.loop_block_index = loop_block_index % num_two_way_blocks
+        self.loop_iters = loop_iters
+
+    def forward(self, query_tokens: torch.Tensor, image_tokens: torch.Tensor):
+        for i, blk in enumerate(self.two_way_blocks):
+            repeat_count = self.loop_iters if i == self.loop_block_index else 1
+            for _ in range(repeat_count):
+                query_tokens, image_tokens = blk(query_tokens, image_tokens)
+
+        image_feature_map = rearrange(image_tokens, 'b h w c -> b c h w')
+        up_query_token = self.hyper_in(query_tokens[:, 0, :])
+        up_image_map = self.output_upscaling(image_feature_map)
+
+        up_query_token = self.layer_norm_post_query(up_query_token)
+        up_image_map = self.layer_norm_post_image(rearrange(up_image_map, 'b c h w -> b h w c'))
+
+        masks = torch.einsum('bc,bhwc->bhw', up_query_token, up_image_map).unsqueeze(1)
+
+        return masks.contiguous()
+
+
+class LoopRopeSAM(RopeSAM):
+    """RopeSAM variant whose dense decoder repeatedly applies one RoPE two-way block."""
+
+    def __init__(
+        self,
+        image_encoder: nn.Module,
+        dim: int = 384,
+        h: int = 64,
+        w: int = 64,
+        num_heads: int = 4,
+        max_clicks: int = 10,
+        num_two_way_blocks: int = 2,
+        loop_block_index: int = -1,
+        loop_iters: int = 4,
+        device: str = "cuda",
+    ):
+        super().__init__(
+            image_encoder=image_encoder,
+            dim=dim,
+            h=h,
+            w=w,
+            num_heads=num_heads,
+            max_clicks=max_clicks,
+            num_two_way_blocks=num_two_way_blocks,
+            device=device,
+        )
+        self.mask_decoder = LoopMaskDecoder(
+            rope=self.rope,
+            dim=dim,
+            num_heads=num_heads,
+            num_queries=max_clicks + 1,
+            num_two_way_blocks=num_two_way_blocks,
+            loop_block_index=loop_block_index,
+            loop_iters=loop_iters,
+        )
+
+
 class PointCrossBlock(nn.Module):
     """Cross-attention from sequence queries to point tokens with continuous RoPE on point keys."""
 

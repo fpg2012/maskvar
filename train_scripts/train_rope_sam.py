@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -479,6 +480,11 @@ class RopeSAMTrainer:
         if self.world_size > 1:
             tdist.barrier()
 
+        if val_iters < 0:
+            if self.rank == 0:
+                print(f"Skipping validation for outer_iter {outer_iter}")
+            return
+
         self.validate(num_val_iters=val_iters, outer_iter=outer_iter)
 
     @torch.no_grad()
@@ -497,6 +503,7 @@ class RopeSAMTrainer:
         total_iou = 0.0
         num_iou_samples = 0
         vis_batch = None
+        val_start_time = time.time()
 
         if self.rank == 0:
             pbar = tqdm(total=num_val_iters, desc=f"Val outer_iter {outer_iter}")
@@ -544,15 +551,23 @@ class RopeSAMTrainer:
         avg_iou = total_iou / num_iou_samples if num_iou_samples > 0 else 0.0
 
         if self.world_size > 1:
-            metrics = torch.tensor([total_loss, total_iou, num_iou_samples, iters_count], device=self.device)
+            metrics = torch.tensor(
+                [total_loss, total_iou, num_iou_samples, iters_count, time.time() - val_start_time],
+                device=self.device,
+                dtype=torch.float64,
+            )
             tdist.all_reduce(metrics, op=tdist.ReduceOp.SUM)
             avg_loss = metrics[0].item() / max(metrics[3].item(), 1.0)
             avg_iou = metrics[1].item() / max(metrics[2].item(), 1.0)
+            avg_val_time = metrics[4].item() / self.world_size
+        else:
+            avg_val_time = time.time() - val_start_time
 
         if self.rank == 0:
-            print(f"\nVal outer_iter {outer_iter}: Loss={avg_loss:.4f}, IoU={avg_iou:.4f}")
+            print(f"\nVal outer_iter {outer_iter}: Loss={avg_loss:.4f}, IoU={avg_iou:.4f}, avg_time={avg_val_time:.1f}s")
             self.writer.add_scalar("val/loss", avg_loss, global_step=self.global_step)
             self.writer.add_scalar("val/iou", avg_iou, global_step=self.global_step)
+            self.writer.add_scalar("val/time_sec", avg_val_time, global_step=self.global_step)
             if vis_batch is not None:
                 self._visualize_samples(*vis_batch, tag="val/samples")
 
@@ -740,6 +755,7 @@ def main():
     parser.add_argument("--outer_iters", type=int, default=10)
     parser.add_argument("--inner_iters", type=int, default=1000)
     parser.add_argument("--val_iters", type=int, default=100)
+    parser.add_argument("--skip_val", action="store_true")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--accumulate_steps", type=int, default=1)
@@ -772,6 +788,8 @@ def main():
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--max_clicks", type=int, default=10)
     parser.add_argument("--num_register_tokens", type=int, default=0)
+    parser.add_argument("--loop_block_index", type=int, default=-1)
+    parser.add_argument("--loop_iters", type=int, default=4)
     parser.add_argument("--interactive_click_warmup_iters", type=int, default=10000)
     parser.add_argument("--interactive_stop_iou", type=float, default=0.95)
     parser.add_argument("--interactive_click_on_coarse_mask", action="store_true")
@@ -821,6 +839,11 @@ def main():
         })
     elif args.config == "rope_sam_no_two_way_dim384":
         model_kwargs["num_register_tokens"] = args.num_register_tokens
+    elif args.config == "rope_sam_loop_dim384":
+        model_kwargs.update({
+            "loop_block_index": args.loop_block_index,
+            "loop_iters": args.loop_iters,
+        })
     model = builder_map["rope_sam"][args.config](**model_kwargs)
     if args.point_sampling_strategy is not None and hasattr(model, "sampling_strategy"):
         model.sampling_strategy = args.point_sampling_strategy
@@ -871,13 +894,14 @@ def main():
         resume_iters = trainer.load_checkpoint(args.resume_from)
 
     inner_iters = args.debug_iters if args.debug else args.inner_iters
+    val_iters = -1 if args.skip_val else args.val_iters
     try:
         for outer_iter in range(args.outer_iters):
             trainer.train(
                 num_iters=inner_iters,
                 outer_iter=outer_iter,
                 resume_iters=resume_iters,
-                val_iters=args.val_iters,
+                val_iters=val_iters,
                 log_interval=args.log_interval,
             )
         if rank == 0:
