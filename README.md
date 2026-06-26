@@ -1,5 +1,12 @@
 # maskvar
 
+> Some attempts on generative & interactive image segmentation.
+>
+> - VAR
+> - GPT-like AR
+> - MaskGIT
+> - Diffusion
+
 ## Environment Setup
 
 Change directory to the project root and then
