@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torch.distributed as tdist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -31,7 +31,7 @@ from maskvar.datasets.mask_level_dataset import MaskLevelFlatDataset, MaskLevelF
 from maskvar.datasets.sharded_distributed_sampler import ShardedDistributedSampler
 from maskvar.maskseg_build_everything import builder_map
 from maskvar.utils import restore_normalized_image
-from maskvar.utils.clicker_v2 import init_clicks, predict_next_click, to_sam_format
+from maskvar.utils.clicker_v2 import init_clicks, predict_next_click, sample_batched_click_conditions, to_sam_format
 from maskvar.utils.losses import (
     DICEBCELoss,
     DICEFocalLoss,
@@ -66,56 +66,16 @@ def cleanup_distributed():
         tdist.destroy_process_group()
 
 
-def sample_click_condition(single_mask: torch.Tensor, ar_h: int, ar_w: int, max_clicks: int = 10):
-    mask_np = single_mask[0].detach().cpu().numpy() > 0
-    click_list, _, _ = init_clicks(mask_np, num_random_clicks=1, random_sample=True)
-    coords_xy, labels = to_sam_format(click_list, pad_size=max_clicks)
-
-    h, w = single_mask.shape[-2:]
-    click_coords = torch.empty_like(coords_xy, dtype=torch.float32)
-    click_coords[..., 0] = coords_xy[..., 1] * (ar_h / h)
-    click_coords[..., 1] = coords_xy[..., 0] * (ar_w / w)
-    click_coords = click_coords.clamp_min(0)
-    click_coords[..., 0].clamp_(max=ar_h - 1)
-    click_coords[..., 1].clamp_(max=ar_w - 1)
-    return click_coords, labels.long()
-
-
-class ClickConditionDataset(Dataset):
-    def __init__(self, dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
-        self.dataset = dataset
-        self.ar_h = ar_h
-        self.ar_w = ar_w
-        self.max_clicks = max_clicks
-        self.is_dummy = getattr(dataset, "is_dummy", False)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index):
-        image, image_embed_sam, single_mask_normalized, single_mask = self.dataset[index]
-        click_coords, click_labels = sample_click_condition(single_mask, self.ar_h, self.ar_w, self.max_clicks)
-        return image, image_embed_sam, single_mask_normalized, single_mask, click_coords, click_labels
-
-
-class ClickConditionIterableDataset(IterableDataset):
-    def __init__(self, dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
-        self.dataset = dataset
-        self.ar_h = ar_h
-        self.ar_w = ar_w
-        self.max_clicks = max_clicks
-        self.is_dummy = getattr(dataset, "is_dummy", False)
-
-    def __iter__(self):
-        for image, image_embed_sam, single_mask_normalized, single_mask in self.dataset:
-            click_coords, click_labels = sample_click_condition(single_mask, self.ar_h, self.ar_w, self.max_clicks)
-            yield image, image_embed_sam, single_mask_normalized, single_mask, click_coords, click_labels
-
-
-def wrap_click_condition_dataset(dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
-    if isinstance(dataset, IterableDataset):
-        return ClickConditionIterableDataset(dataset, ar_h=ar_h, ar_w=ar_w, max_clicks=max_clicks)
-    return ClickConditionDataset(dataset, ar_h=ar_h, ar_w=ar_w, max_clicks=max_clicks)
+def sample_click_conditions(single_mask: torch.Tensor, ar_h: int, ar_w: int, max_clicks: int = 10, backend=None):
+    return sample_batched_click_conditions(
+        single_mask,
+        out_h=ar_h,
+        out_w=ar_w,
+        max_clicks=max_clicks,
+        backend=backend,
+        random_click_counts=False,
+        num_clicks=1,
+    )
 
 
 def build_loss(loss: str):
@@ -254,7 +214,7 @@ class RopeSAMTrainer:
         return torch.autocast(device_type=device_type, dtype=self.dtype, enabled=self.dtype != torch.float32)
 
     def _unpack_batch(self, batch):
-        image, image_embedding, single_mask_normalized, single_mask, click_coords, click_labels = batch
+        image, image_embedding, single_mask_normalized, single_mask = batch
         if torch.is_tensor(image_embedding) and image_embedding.ndim > 1:
             image_embedding = image_embedding.to(self.device, non_blocking=True)
         else:
@@ -264,9 +224,10 @@ class RopeSAMTrainer:
             image_embedding,
             single_mask_normalized.to(self.device, non_blocking=True),
             single_mask.to(self.device, non_blocking=True),
-            click_coords.to(self.device, non_blocking=True),
-            click_labels.to(self.device, non_blocking=True),
         )
+
+    def _sample_initial_clicks(self, single_mask, max_clicks: int):
+        return sample_click_conditions(single_mask, ar_h=64, ar_w=64, max_clicks=max_clicks)
 
     def _click_tensors_to_lists(self, click_coords, click_labels, output_shape):
         output_h, output_w = output_shape
@@ -426,7 +387,11 @@ class RopeSAMTrainer:
                 if iters_count >= num_iters:
                     break
 
-                image, image_embedding, single_mask_normalized, single_mask, click_coords, click_labels = self._unpack_batch(batch)
+                image, image_embedding, single_mask_normalized, single_mask = self._unpack_batch(batch)
+                click_coords, click_labels = self._sample_initial_clicks(
+                    single_mask,
+                    max_clicks=self._current_max_clicks(),
+                )
                 target_mask = (single_mask > 0.5).float()
 
                 with self._autocast():
@@ -513,7 +478,11 @@ class RopeSAMTrainer:
             if iters_count >= num_val_iters:
                 break
 
-            image, image_embedding, single_mask_normalized, single_mask, click_coords, click_labels = self._unpack_batch(batch)
+            image, image_embedding, single_mask_normalized, single_mask = self._unpack_batch(batch)
+            click_coords, click_labels = self._sample_initial_clicks(
+                single_mask,
+                max_clicks=self._current_max_clicks(),
+            )
             target_mask = (single_mask > 0.5).float()
             with self._autocast():
                 logits, click_coords_final, click_labels_final, _ = self.interactive_forward(
@@ -744,8 +713,6 @@ def build_datasets(args, device: str, rank: int):
         train_set.is_dummy = True
         val_set.is_dummy = True
 
-    train_set = wrap_click_condition_dataset(train_set, ar_h=64, ar_w=64, max_clicks=args.max_clicks)
-    val_set = wrap_click_condition_dataset(val_set, ar_h=64, ar_w=64, max_clicks=args.max_clicks)
     return train_set, val_set
 
 

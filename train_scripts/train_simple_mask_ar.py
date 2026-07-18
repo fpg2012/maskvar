@@ -25,7 +25,7 @@ import torch.distributed as tdist
 import torch.profiler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import IterableDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib
@@ -46,74 +46,20 @@ from maskvar.models.simple_mask_ar.simple_mask_ar import SimpleMaskAR
 from maskvar.models.simple_mask_vqvae.simple_mask_vqvae import SimpleMaskVqvae
 from maskvar.utils.metrics import calc_iou
 from maskvar.utils import restore_normalized_image
-from maskvar.utils.clicker_v2 import init_clicks, to_sam_format
+from maskvar.utils.clicker_v2 import sample_batched_click_conditions
 
 torch.set_float32_matmul_precision('high')
 
 
-def sample_click_condition(single_mask: torch.Tensor, ar_h: int, ar_w: int, max_clicks: int = 2):
-    """
-    Sample click condition for one mask sample.
-
-    Returns:
-        click_coords: (max_clicks, 2), row/col in AR token-grid coordinates
-        click_labels: (max_clicks,), 1 for positive clicks and -1 for padding
-    """
-    mask_np = single_mask[0].detach().cpu().numpy() > 0
-    num_clicks = int(np.random.randint(1, max_clicks + 1))
-    click_list, _, _ = init_clicks(mask_np, num_random_clicks=num_clicks, random_sample=True)
-    coords_xy, labels = to_sam_format(click_list, pad_size=max_clicks)
-
-    H, W = single_mask.shape[-2:]
-    click_coords = torch.empty_like(coords_xy, dtype=torch.float32)
-    click_coords[..., 0] = coords_xy[..., 1] * (ar_h / H)
-    click_coords[..., 1] = coords_xy[..., 0] * (ar_w / W)
-    click_coords = click_coords.clamp_min(0)
-    click_coords[..., 0].clamp_(max=ar_h - 1)
-    click_coords[..., 1].clamp_(max=ar_w - 1)
-
-    return click_coords, labels.long()
-
-
-class ClickConditionDataset(Dataset):
-    """Map-style dataset wrapper that samples click conditions in DataLoader workers."""
-
-    def __init__(self, dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
-        self.dataset = dataset
-        self.ar_h = ar_h
-        self.ar_w = ar_w
-        self.max_clicks = max_clicks
-        self.is_dummy = getattr(dataset, 'is_dummy', False)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index):
-        image, image_embed_sam, single_mask_normalized, single_mask = self.dataset[index]
-        click_coords, click_labels = sample_click_condition(single_mask, self.ar_h, self.ar_w, self.max_clicks)
-        return image, image_embed_sam, single_mask_normalized, single_mask, click_coords, click_labels
-
-
-class ClickConditionIterableDataset(IterableDataset):
-    """Iterable dataset wrapper that samples click conditions in DataLoader workers."""
-
-    def __init__(self, dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
-        self.dataset = dataset
-        self.ar_h = ar_h
-        self.ar_w = ar_w
-        self.max_clicks = max_clicks
-        self.is_dummy = getattr(dataset, 'is_dummy', False)
-
-    def __iter__(self):
-        for image, image_embed_sam, single_mask_normalized, single_mask in self.dataset:
-            click_coords, click_labels = sample_click_condition(single_mask, self.ar_h, self.ar_w, self.max_clicks)
-            yield image, image_embed_sam, single_mask_normalized, single_mask, click_coords, click_labels
-
-
-def wrap_click_condition_dataset(dataset, ar_h: int, ar_w: int, max_clicks: int = 2):
-    if isinstance(dataset, IterableDataset):
-        return ClickConditionIterableDataset(dataset, ar_h=ar_h, ar_w=ar_w, max_clicks=max_clicks)
-    return ClickConditionDataset(dataset, ar_h=ar_h, ar_w=ar_w, max_clicks=max_clicks)
+def sample_click_conditions(single_mask: torch.Tensor, ar_h: int, ar_w: int, max_clicks: int = 2, backend=None):
+    return sample_batched_click_conditions(
+        single_mask,
+        out_h=ar_h,
+        out_w=ar_w,
+        max_clicks=max_clicks,
+        backend=backend,
+        random_click_counts=True,
+    )
 
 
 def setup_distributed():
@@ -608,17 +554,20 @@ class SimpleMaskARTrainer:
                     data_time_ms = (time.perf_counter() - data_wait_start) * 1000.0
 
                 # Unpack batch
-                if self.enable_click:
-                    image, _, single_mask_normalized, single_mask, click_coords, click_labels = batch
-                    click_coords = click_coords.to(self.device, non_blocking=True)
-                    click_labels = click_labels.to(self.device, non_blocking=True)
-                else:
-                    image, _, single_mask_normalized, single_mask = batch
-                    click_coords = None
-                    click_labels = None
+                image, _, single_mask_normalized, single_mask = batch
                 image = image.to(self.device, non_blocking=True)
                 single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
                 single_mask = single_mask.to(self.device, non_blocking=True)
+                if self.enable_click:
+                    click_coords, click_labels = sample_click_conditions(
+                        single_mask,
+                        self._get_ar_model().h,
+                        self._get_ar_model().w,
+                        max_clicks=2,
+                    )
+                else:
+                    click_coords = None
+                    click_labels = None
 
                 # Encode to tokens using VQVAE
                 encode_timer = self._new_timer()
@@ -797,17 +746,20 @@ class SimpleMaskARTrainer:
             if iters_count >= num_val_iters:
                 break
 
-            if self.enable_click:
-                image, _, single_mask_normalized, single_mask, click_coords, click_labels = batch
-                click_coords = click_coords.to(self.device, non_blocking=True)
-                click_labels = click_labels.to(self.device, non_blocking=True)
-            else:
-                image, _, single_mask_normalized, single_mask = batch
-                click_coords = None
-                click_labels = None
+            image, _, single_mask_normalized, single_mask = batch
             image = image.to(self.device, non_blocking=True)
             single_mask_normalized = single_mask_normalized.to(self.device, non_blocking=True)
             single_mask = single_mask.to(self.device, non_blocking=True)
+            if self.enable_click:
+                click_coords, click_labels = sample_click_conditions(
+                    single_mask,
+                    self._get_ar_model().h,
+                    self._get_ar_model().w,
+                    max_clicks=2,
+                )
+            else:
+                click_coords = None
+                click_labels = None
 
             # Encode to tokens
             token_ids, image_tokens = self.encode_mask_to_tokens(single_mask_normalized, image)
@@ -1216,14 +1168,11 @@ def main():
         device=device,
         enable_click=args.enable_click,
     )
-    if args.enable_click:
-        train_set = wrap_click_condition_dataset(train_set, ar_h=model.h, ar_w=model.w, max_clicks=2)
-        val_set = wrap_click_condition_dataset(val_set, ar_h=model.h, ar_w=model.w, max_clicks=2)
     if rank == 0:
         print(f"Using config: {args.config}")
         print(f"Using VQVAE config: {args.vqvae_config}")
         if args.enable_click:
-            print("Click conditioning: enabled in DataLoader workers")
+            print("Click conditioning: enabled in trainer loop")
         if args.enable_cfg:
             print(
                 "CFG: enabled "

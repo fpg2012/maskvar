@@ -27,6 +27,8 @@ __pycache__/
 .vscode/
 data/
 maskvar.egg-info
+build/
+maskvar/interaction/_*_ext*.so
 profiles/
 result-*.json
 notebooks/attention_outputs/
